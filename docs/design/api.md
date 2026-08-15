@@ -372,3 +372,40 @@ Concrete URLs the UI can rely on:
 
 The vendor list is defined in `server/src/vendor.ts` (`VENDOR_ROUTES`, FROZEN). Adding a
 library means adding it to `web/package.json` **and** that array.
+
+---
+
+## PROPOSED ADDITIONS / CLARIFICATIONS (raised by the FRONTEND topic, 2026-08-15)
+
+Non-blocking. These are clarifications of existing endpoints, not new calls — the UI is
+built assuming the answers below. Backend: confirm or correct; no code change is expected
+unless a bullet says otherwise.
+
+1. **`SessionInput.ports[].hostPort` is optional.** `sessions/model.ts` already has
+   `hostPort: z.number().int().min(1).max(65535).optional()`. The session modal leaves the
+   host-port input blank by default and then **omits the property** (never sends `null` or
+   `0`), meaning "let Docker choose". The chosen port comes back in
+   `SessionView.runtimePorts[]` and is what the table renders.
+
+2. **"Keep the stored Portainer key" is expressed by omission.** `PUT /api/settings/backend`
+   and `POST /api/settings/backend/test` are sent **without** `portainer.apiKey` when the
+   user leaves the (always-empty) key field untouched. The UI never sends `""`.
+
+3. **Terminal `name` charset.** The UI only ever generates
+   `^[a-z0-9][a-z0-9_-]{0,39}$` (`<session>-<shell>-<n>`, e.g. `web-claude-2`) so
+   `tmuxSessionName()` is a no-op transform. The server should still validate and reject
+   `4400` on anything else.
+
+4. **`PUT /api/settings/ui` layout blob.** The UI stores
+   `{ v: 1, savedAt: <epoch ms>, root: <GoldenLayout LayoutConfig> }` and keeps it under
+   ~64 KB; it is written at most every 1.5 s (debounced). No terminal output is ever
+   included. If the server wants a size cap, `413`/`validation_error` is fine — the UI
+   swallows save failures silently.
+
+5. **Polling cadence the UI uses** (so rate limits, if any, are sized for it):
+   `GET /api/sessions` every 5 s while a browser tab is visible (30 s after three
+   consecutive failures), `GET /api/images/jobs/:id?since=` every 1 s only while a job
+   modal is open, `GET /api/sessions/:name/logs` only on demand.
+
+6. **`GET /api/settings/vendor`** is used by QA as the vendor-mount smoke test; please keep
+   `mounted:false` entries in the response rather than omitting them.

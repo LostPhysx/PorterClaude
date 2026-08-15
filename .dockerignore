@@ -1,0 +1,27 @@
+# Build context filter for the app image (docker/Dockerfile) AND for the tar that
+# deploy/deploy.sh POSTs to Portainer's /build endpoint. OWNER: O1.
+# SECURITY: deploy/.env must never enter a build context. QA asserts this.
+
+.git
+.gitattributes
+node_modules
+**/node_modules
+dist
+**/dist
+*.tsbuildinfo
+data
+deploy/.env
+deploy/.env.*
+deploy/.build
+*.log
+*.tar
+.github
+docs
+.idea
+.vscode
+.DS_Store
+Thumbs.db
+
+# TODO(O1): keep package-lock.json, web/public, docker/ and server/src in the context.
+# Do NOT add a bare `deploy` line — deploy/docker-compose.yml is harmless, the .env files
+# above are the only secrets. Re-check with: python3 deploy/lib/dockerignore.py --root .

@@ -1,0 +1,50 @@
+/* OWNER: F1. App shell, navbar, views, tables, modals, toasts.
+   Seeded by the planner: the sizing rules below are what make the Code tab (F2) able to
+   measure itself - keep #app-shell / .pc-view height-filling. Terminal/GoldenLayout rules
+   live in code.css (F2). */
+
+:root {
+  --pc-navbar-h: 48px;
+  --pc-rail-w: 220px;
+  --pc-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+}
+
+html, body { height: 100%; }
+
+.pc-body {
+  height: 100%;
+  overflow: hidden;               /* the Code tab manages its own scrolling */
+}
+
+.pc-navbar {
+  min-height: var(--pc-navbar-h);
+  padding-block: 0.15rem;
+}
+.pc-navbar .nav-link { padding-block: 0.2rem; }
+
+.pc-shell {
+  height: calc(100% - var(--pc-navbar-h));
+}
+
+.pc-view { height: 100%; }
+/* Sessions/Settings scroll internally; the Code view never does. */
+#view-sessions, #view-settings { overflow-y: auto; }
+
+.pc-logs {
+  max-height: 60vh;
+  overflow: auto;
+  font-family: var(--pc-mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* status pills reused by the sessions table and the Code rail (F2) */
+.pc-dot { display: inline-block; width: .5rem; height: .5rem; border-radius: 50%; background: var(--bs-secondary); }
+.pc-dot-running { background: var(--bs-success); }
+.pc-dot-exited  { background: var(--bs-secondary); }
+.pc-dot-error   { background: var(--bs-danger); }
+.pc-dot-pending { background: var(--bs-warning); }
+
+/* TODO(F1): sessions table density, settings sub-tabs, session modal repeatable rows
+   (.pc-kv-row), toast tweaks. */

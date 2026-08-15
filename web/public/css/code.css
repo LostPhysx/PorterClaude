@@ -1,0 +1,66 @@
+/* OWNER: F2. Code tab: rail, toolbar, GoldenLayout container and xterm panes.
+   Seeded by the planner - GoldenLayout needs a container with a real, non-zero size.
+   F1 must not edit this file. */
+
+.pc-code-wrap {
+  display: flex;
+  height: 100%;
+  min-height: 0;
+}
+
+.pc-rail {
+  width: var(--pc-rail-w);
+  flex: 0 0 var(--pc-rail-w);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--bs-tertiary-bg);
+}
+.pc-rail-list { flex: 1 1 auto; overflow-y: auto; }
+.pc-rail-item { padding: .35rem .5rem; cursor: pointer; display: flex; align-items: center; gap: .4rem; }
+.pc-rail-item:hover { background: var(--bs-secondary-bg); }
+.pc-rail-item.is-stopped { opacity: .55; }
+
+.pc-code-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.pc-code-toolbar { flex: 0 0 auto; }
+
+/* GoldenLayout mount point: must be positioned and sized, never auto-height. */
+.pc-code-root {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.pc-code-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+}
+
+/* one terminal pane inside a GoldenLayout component container */
+.pc-pane { display: flex; flex-direction: column; height: 100%; background: #0d1117; }
+.pc-pane-term { flex: 1 1 auto; min-height: 0; padding: 2px 4px; }
+.pc-pane-note {
+  flex: 0 0 auto;
+  font-size: 11px;
+  padding: 2px 6px;
+  background: var(--bs-warning-bg-subtle);
+  color: var(--bs-warning-text-emphasis);
+}
+.pc-pane .xterm { height: 100%; }
+
+/* GoldenLayout dark theme is linked in index.html; nudge it toward Bootstrap's palette.
+   TODO(F2): tab strip colours, drag proxy, splitter width, light-theme overrides under
+   [data-bs-theme="light"]. */
+.lm_goldenlayout { background: transparent; }

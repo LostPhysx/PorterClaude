@@ -22,3 +22,6 @@ Thumbs.db
 .idea/
 .vscode/*
 !.vscode/extensions.json
+
+# deploy build artifacts (context tar, rendered stack file)
+deploy/.build/

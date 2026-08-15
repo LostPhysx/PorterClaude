@@ -1,0 +1,55 @@
+# PorterClaude CI. OWNER: O2. Spec: docs/design/orchestration.md §8.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  node:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          # NOTE: do NOT enable `cache: npm` until package-lock.json is committed —
+          # setup-node fails when the lock file is missing.
+      # TODO(O2): install (npm ci when package-lock.json exists, else npm install),
+      #   then: npm run typecheck, npm run lint, npm test
+      - run: echo "TODO(O2)"
+
+  scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # TODO(O2):
+      #   shellcheck -S warning deploy/deploy.sh docker/recipes/common.sh docker/tools/*.sh
+      #   python -m compileall -q deploy/lib
+      #   cp deploy/.env.example deploy/.env.ci  (dummy key — never a real one)
+      #   bash deploy/deploy.sh --dry-run --env-file deploy/.env.ci
+      #   assert deploy/.build/context.tar and deploy/.build/stack.yml exist, and that
+      #   `tar -tf deploy/.build/context.tar` contains docker/Dockerfile but NOT deploy/.env
+      - run: echo "TODO(O2)"
+
+  compose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # TODO(O2): docker compose -f docker-compose.yml config -q
+      #   (and the rendered deploy/.build/stack.yml if the scripts job's artifacts are reused)
+      - run: echo "TODO(O2)"
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      # TODO(O2): docker/build-push-action@v6 with context: ., file: docker/Dockerfile,
+      #   platforms: linux/amd64, push: false, cache-from/to: type=gha
+      - run: echo "TODO(O2)"

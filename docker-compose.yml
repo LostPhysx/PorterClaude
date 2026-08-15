@@ -1,0 +1,38 @@
+# PorterClaude — generic compose. OWNER: O1.
+# This is the file a stranger copy-pastes: one service, both Docker backends, no host-specific
+# assumptions. The reference deployment (nginx-proxy + acme-companion) lives in deploy/.
+# See docs/DEPLOYMENT.md.
+services:
+  porterclaude:
+    image: ghcr.io/lostphysx/porterclaude:latest
+    # build:                                  # uncomment to build from this checkout instead
+    #   context: .
+    #   dockerfile: docker/Dockerfile
+    container_name: porterclaude
+    restart: unless-stopped
+    init: true
+    ports:
+      - "8080:8080"
+    environment:
+      APP_PASSWORD: ${APP_PASSWORD:-change-me}
+      # APP_SECRET: ...                       # optional; auto-generated into /data/secret.key
+      # PORTERCLAUDE_BACKEND: socket          # socket | portainer (also selectable in Settings)
+      # PORTAINER_URL: https://portainer.example.com
+      # PORTAINER_API_KEY: ...
+      # PORTAINER_ENDPOINT_ID: 2
+      # LOG_LEVEL: info
+      # TRUST_PROXY: 1
+      # COOKIE_SECURE: auto
+      # SESSION_TTL_DAYS: 30
+    volumes:
+      - porterclaude-data:/data               # MUST persist: holds secret.key + config.json
+      - /var/run/docker.sock:/var/run/docker.sock   # socket mode only; drop for Portainer mode
+    # group_add:                              # the app runs as uid 10001 and needs the docker
+    #   - "999"                               # group to use the socket: stat -c %g /var/run/docker.sock
+    # healthcheck comes from the image (HEALTHCHECK on /api/health) — no override needed
+
+volumes:
+  porterclaude-data:
+
+# TODO(O1): finish the comments (Portainer-mode block, reverse-proxy note about forwarding
+# Upgrade/Connection for terminals) and keep this file consistent with docs/DEPLOYMENT.md.

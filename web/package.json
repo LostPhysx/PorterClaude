@@ -1,0 +1,20 @@
+{
+  "name": "@porterclaude/web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "PorterClaude browser UI - plain ES modules, Bootstrap 5 + jQuery 3 + xterm.js 5 + GoldenLayout 2. No bundler.",
+  "license": "UNLICENSED",
+  "scripts": {
+    "verify": "node tools/verify-assets.mjs"
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/addon-web-links": "^0.11.0",
+    "@xterm/xterm": "^5.5.0",
+    "bootstrap": "^5.3.3",
+    "bootstrap-icons": "^1.11.3",
+    "golden-layout": "^2.6.0",
+    "jquery": "^3.7.1"
+  }
+}
