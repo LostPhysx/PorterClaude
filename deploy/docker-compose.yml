@@ -1,0 +1,33 @@
+# Reference deployment: PorterClaude behind nginx-proxy + acme-companion, socket mode.
+# Rendered by deploy/deploy.sh (env substitution) and pushed as a Portainer stack.
+services:
+  porterclaude:
+    image: ${APP_IMAGE:-ghcr.io/porterclaude/porterclaude:latest}
+    container_name: porterclaude
+    restart: unless-stopped
+    environment:
+      APP_PASSWORD: ${APP_PASSWORD}
+      VIRTUAL_HOST: ${APP_HOSTNAME}
+      LETSENCRYPT_HOST: ${APP_HOSTNAME}
+      VIRTUAL_PORT: 8080
+      PORTERCLAUDE_BACKEND: socket
+    volumes:
+      - porterclaude-data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - portainer_dmz
+      - portainer_gate
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+networks:
+  portainer_dmz:
+    external: true
+  portainer_gate:
+    external: true
+
+volumes:
+  porterclaude-data:

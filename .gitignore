@@ -1,0 +1,24 @@
+# secrets / local deploy config
+deploy/.env
+deploy/*.local
+.env
+.env.*
+!.env.example
+
+# node
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+.vite/
+
+# data
+data/
+*.log
+
+# os / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
