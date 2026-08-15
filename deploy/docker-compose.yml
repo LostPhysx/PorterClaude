@@ -2,7 +2,7 @@
 # Rendered by deploy/deploy.sh (env substitution) and pushed as a Portainer stack.
 services:
   porterclaude:
-    image: ${APP_IMAGE:-ghcr.io/porterclaude/porterclaude:latest}
+    image: ${APP_IMAGE:-ghcr.io/lostphysx/porterclaude:latest}
     container_name: porterclaude
     restart: unless-stopped
     environment:

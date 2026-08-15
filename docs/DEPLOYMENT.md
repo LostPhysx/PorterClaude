@@ -36,7 +36,7 @@ unattended installs (`PORTERCLAUDE_BACKEND`, `PORTAINER_URL`, `PORTAINER_API_KEY
 ```yaml
 services:
   porterclaude:
-    image: ghcr.io/<owner>/porterclaude:latest
+    image: ghcr.io/lostphysx/porterclaude:latest
     restart: unless-stopped
     volumes:
       - porterclaude-data:/data
@@ -57,7 +57,7 @@ If your host uses `nginxproxy/nginx-proxy` + `nginxproxy/acme-companion`, drop t
 ```yaml
 services:
   porterclaude:
-    image: ghcr.io/<owner>/porterclaude:latest
+    image: ghcr.io/lostphysx/porterclaude:latest
     restart: unless-stopped
     environment:
       APP_PASSWORD: change-me

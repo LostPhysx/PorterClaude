@@ -17,7 +17,7 @@ Status: planning / scaffolding. See [PLAN.md](PLAN.md) and [docs/](docs/).
 # docker-compose.yml
 services:
   porterclaude:
-    image: ghcr.io/<owner>/porterclaude:latest
+    image: ghcr.io/lostphysx/porterclaude:latest
     ports: ["8080:8080"]
     volumes:
       - porterclaude-data:/data
@@ -37,11 +37,11 @@ now authenticated too.
 
 | Path | What |
 |---|---|
-| `server/` | Fastify API + WebSocket terminal bridge, Docker backends (Portainer / socket) |
-| `web/` | React UI (dockview + xterm.js) |
+| `server/` | Express + ws API, WebSocket terminal bridge, Docker backends (Portainer / socket) |
+| `web/` | Bootstrap 5 + jQuery UI, GoldenLayout panes, xterm.js terminals |
 | `docker/recipes/` | Dockerfiles for the curated dev images |
 | `docker/tools/` | bootstrap for arbitrary custom images |
 | `deploy/` | operator-specific deployment (secrets gitignored) |
 | `docs/` | deployment + architecture docs |
 
-License: TBD.
+License: MIT — see [LICENSE](LICENSE).

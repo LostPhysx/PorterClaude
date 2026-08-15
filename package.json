@@ -1,0 +1,26 @@
+{
+  "name": "porterclaude",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Self-hosted web app that launches Claude Code dev containers and attaches browser terminals",
+  "license": "UNLICENSED",
+  "engines": { "node": ">=22" },
+  "workspaces": ["server", "web"],
+  "scripts": {
+    "dev": "npm run dev --workspace server",
+    "build": "npm run build --workspaces --if-present",
+    "start": "node server/dist/index.js",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "test": "npm run test --workspaces --if-present"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.17.0",
+    "@types/node": "^22.10.2",
+    "eslint": "^9.17.0",
+    "typescript": "^5.7.2",
+    "typescript-eslint": "^8.18.0"
+  }
+}
