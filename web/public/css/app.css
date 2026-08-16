@@ -79,6 +79,20 @@ html, body { height: 100%; }
 .pc-recipe-card .card-body { padding: .75rem .9rem; }
 #jobs-list .list-group-item { background: transparent; }
 
+/* A <form> wrapping header/body/footer inside .modal-content breaks Bootstrap's
+   .modal-dialog-scrollable layout (the body is no longer a flex child, so it grows past the
+   dialog and the footer gets clipped). Make the form the flex column instead. */
+.modal-dialog-scrollable .modal-content > form {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  max-height: 100%;
+}
+.modal-dialog-scrollable .modal-content > form > .modal-body {
+  overflow-y: auto;
+  min-height: 0;
+}
+
 /* -------------------------------------- session modal repeatable rows */
 .pc-kv-row .form-control,
 .pc-kv-row .form-select { font-family: var(--pc-mono); font-size: .8rem; }
