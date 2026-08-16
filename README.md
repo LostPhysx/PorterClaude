@@ -9,8 +9,9 @@ browser — tabbed, multi-pane terminals, one shared Claude login for every cont
 - **Settings** — point it at a **Portainer** endpoint (URL + API key) or the local
   **Docker socket**; everything is configured in the app, nothing hard-coded
 
-Status: in development. See [PLAN.md](PLAN.md), [docs/](docs/) and
-[docs/design/](docs/design/).
+Status: **v0.1.0 — first release.** All core flows (auth, Portainer + socket backends,
+recipe/custom-image sessions, multi-pane terminals, shared Claude login) are implemented and
+QA-verified end-to-end. See [PLAN.md](PLAN.md), [docs/](docs/) and [docs/design/](docs/design/).
 
 ## Quick start
 
