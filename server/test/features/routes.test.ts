@@ -72,7 +72,8 @@ function makeApp() {
       restart: async (name: string) => rec('restart', [name], view(name)),
       recreate: async (name: string) => rec('recreate', [name], view(name)),
       logs: async (name: string, opts: unknown) => rec('logs', [name, opts], 'hello'),
-      reconcile: async () => rec('reconcile', [], { known: 1, running: 1, orphans: [], missing: [] }),
+      reconcile: async (opts: unknown) =>
+        rec('reconcile', [opts], { known: 1, running: 1, orphans: [], adopted: ['ghost'], missing: [] }),
     },
     images: {
       listImages: async () => rec('listImages', [], []),
@@ -132,10 +133,19 @@ describe('/api/sessions', () => {
     expect(Array.isArray(res.body.error.details)).toBe(true);
   });
 
-  it('POST /reconcile is not shadowed by /:name', async () => {
+  it('POST /reconcile is not shadowed by /:name and adopts (BE-10)', async () => {
     const res = await request(makeApp()).post('/api/sessions/reconcile').expect(200);
-    expect(res.body.report).toEqual({ known: 1, running: 1, orphans: [], missing: [] });
+    expect(res.body.report).toEqual({ known: 1, running: 1, orphans: [], adopted: ['ghost'], missing: [] });
     expect(calls.map((c) => c.method)).toEqual(['reconcile']);
+    expect(calls[0]?.args[0]).toEqual({ adopt: true });
+  });
+
+  it('POST / rejects an env key that no shell could ever read back (BE-11)', async () => {
+    const res = await request(makeApp())
+      .post('/api/sessions')
+      .send({ ...body, env: { 'A B': 'x' } })
+      .expect(422);
+    expect(res.body.error.code).toBe('validation_error');
   });
 
   it('GET /:name, PUT /:name and DELETE /:name', async () => {

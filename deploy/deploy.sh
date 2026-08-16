@@ -2,7 +2,7 @@
 # PorterClaude — build + deploy to the reference Portainer host. OWNER: O2.
 # Runs under Git Bash on Windows and on Linux. Full spec: docs/design/orchestration.md §7.
 #
-# SECURITY RULES (non-negotiable):
+# SECURITY RULES (non-negotiable, implemented in deploy/lib/common.sh):
 #   * never `set -x`
 #   * never echo $PORTAINER_API_KEY, never pass it as a curl argument (it shows up in `ps`):
 #     write it into a chmod-600 curl config file inside a mktemp -d dir removed by an EXIT trap
@@ -18,10 +18,12 @@ CONTEXT_TAR="$BUILD_DIR/context.tar"
 LIB_DIR="$REPO_ROOT/deploy/lib"
 SECRET_ENV_VARS="APP_PASSWORD"     # kept literal in the stack file, passed via the Env array
 
-DRY_RUN=0; DO_BUILD=1; DO_DEPLOY=1; DO_WAIT=1; APP_IMAGE_OVERRIDE=""
-PY=""             # python3 or python
-TMPDIR_SECURE=""  # mktemp -d, holds the curl config with the API key
-RESPONSE_FILE=""  # api_json writes response bodies here (inside TMPDIR_SECURE)
+# shellcheck source=lib/common.sh
+. "$LIB_DIR/common.sh"
+
+DRY_RUN=0; DO_BUILD=1; DO_DEPLOY=1; DO_WAIT=1; APP_IMAGE_OVERRIDE=""; PULL_IMAGE=0
+IMAGE_MODE=0     # --image: no remote build, the stack points at a pullable/pre-built image
+PY=""            # python3 or python
 
 usage() {
   cat <<'USAGE'
@@ -30,37 +32,14 @@ usage: deploy/deploy.sh [options]
   --build-only        build the image on the remote engine, do not touch the stack
   --deploy-only       skip the build, only create/update the stack
   --no-wait           do not poll the health endpoint afterwards
-  --tag <image-ref>   override APP_IMAGE (default: porterclaude:local)
+  --tag <image-ref>   override APP_IMAGE for the remote build (default: porterclaude:local)
+  --image <image-ref> skip the remote build entirely and deploy this already-built or
+                      pullable image (e.g. ghcr.io/<owner>/porterclaude:v1.2.3). The stack
+                      update asks Portainer to pull it. Use this when the proxy in front of
+                      Portainer cuts long /docker/build requests — see docs/DEPLOYMENT.md.
   --env-file <path>   default: deploy/.env
   -h, --help          this text
 USAGE
-}
-
-log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
-warn() { printf '\033[1;33m warn\033[0m %s\n' "$*" >&2; }
-die()  { printf '\033[1;31merror\033[0m %s\n' "$*" >&2; exit 1; }
-
-cleanup() {
-  if [ -n "${TMPDIR_SECURE:-}" ] && [ -d "${TMPDIR_SECURE:-}" ]; then
-    rm -rf "$TMPDIR_SECURE"
-  fi
-}
-trap cleanup EXIT
-
-have() { command -v "$1" >/dev/null 2>&1; }
-
-# Secure scratch dir: everything that touches a secret (env copy, curl config, request
-# bodies, response bodies) lives here and nowhere else. Removed by the EXIT trap.
-ensure_tmpdir() {
-  if [ -n "$TMPDIR_SECURE" ]; then return 0; fi
-  local old_umask
-  old_umask="$(umask)"
-  umask 077
-  TMPDIR_SECURE="$(mktemp -d 2>/dev/null || mktemp -d -t porterclaude)"
-  umask "$old_umask"
-  [ -d "$TMPDIR_SECURE" ] || die "could not create a temporary directory"
-  chmod 700 "$TMPDIR_SECURE"
-  RESPONSE_FILE="$TMPDIR_SECURE/response.json"
 }
 
 parse_args() {
@@ -72,6 +51,9 @@ parse_args() {
       --no-wait)     DO_WAIT=0 ;;
       --tag)         shift; [ $# -gt 0 ] || { usage >&2; exit 2; }; APP_IMAGE_OVERRIDE="$1" ;;
       --tag=*)       APP_IMAGE_OVERRIDE="${1#*=}" ;;
+      --image)       shift; [ $# -gt 0 ] || { usage >&2; exit 2; }
+                     APP_IMAGE_OVERRIDE="$1"; IMAGE_MODE=1 ;;
+      --image=*)     APP_IMAGE_OVERRIDE="${1#*=}"; IMAGE_MODE=1 ;;
       --env-file)    shift; [ $# -gt 0 ] || { usage >&2; exit 2; }; ENV_FILE="$1" ;;
       --env-file=*)  ENV_FILE="${1#*=}" ;;
       -h|--help)     usage; exit 0 ;;
@@ -82,27 +64,21 @@ parse_args() {
   if [ "$DO_BUILD" -eq 0 ] && [ "$DO_DEPLOY" -eq 0 ]; then
     die "--build-only and --deploy-only are mutually exclusive"
   fi
+  if [ "$IMAGE_MODE" -eq 1 ]; then
+    [ -n "$APP_IMAGE_OVERRIDE" ] || die "--image needs an image reference"
+    if [ "$DO_DEPLOY" -eq 0 ]; then
+      die "--image and --build-only are mutually exclusive (--image is the no-build mode)"
+    fi
+    DO_BUILD=0
+    PULL_IMAGE=1
+  fi
 }
 
 # --- env -----------------------------------------------------------------------------------
 load_env() {
-  [ -f "$ENV_FILE" ] || die "env file not found: $ENV_FILE (copy deploy/.env.example to deploy/.env)"
-  ensure_tmpdir
-  # Strip CR so a CRLF .env edited on Windows does not smuggle \r into values (and into URLs).
-  local safe_env="$TMPDIR_SECURE/env.sh"
-  tr -d '\r' < "$ENV_FILE" > "$safe_env"
-  chmod 600 "$safe_env"
-  set -a
-  # shellcheck disable=SC1090
-  . "$safe_env"
-  set +a
-  rm -f "$safe_env"
-
-  local missing="" var
-  for var in PORTAINER_URL PORTAINER_ENDPOINT_ID PORTAINER_API_KEY APP_HOSTNAME APP_PASSWORD STACK_NAME; do
-    if [ -z "${!var:-}" ]; then missing="$missing $var"; fi
-  done
-  [ -z "$missing" ] || die "missing in $ENV_FILE:$missing"
+  pc_load_env_file "$ENV_FILE"
+  pc_require_env "$ENV_FILE" PORTAINER_URL PORTAINER_ENDPOINT_ID PORTAINER_API_KEY \
+                 APP_HOSTNAME APP_PASSWORD STACK_NAME
 
   PORTAINER_URL="${PORTAINER_URL%/}"
   APP_IMAGE="${APP_IMAGE_OVERRIDE:-${APP_IMAGE:-porterclaude:local}}"
@@ -110,42 +86,9 @@ load_env() {
   HEALTH_URL="${HEALTH_URL:-https://$APP_HOSTNAME/api/health}"
   export PORTAINER_URL APP_IMAGE HEALTH_TIMEOUT HEALTH_URL
   log "target: $PORTAINER_URL endpoint $PORTAINER_ENDPOINT_ID, stack '$STACK_NAME', image '$APP_IMAGE'"
-}
-
-# --- curl plumbing (API key never on the command line) ---------------------------------------
-setup_curl_config() {
-  ensure_tmpdir
-  local cfg="$TMPDIR_SECURE/curl.cfg"
-  ( umask 077; printf 'header = "X-API-Key: %s"\n' "$PORTAINER_API_KEY" > "$cfg" )
-  chmod 600 "$cfg"
-}
-
-# curl with the API key config attached. Usage: pcurl <curl args...>
-pcurl() {
-  curl -sS --config "$TMPDIR_SECURE/curl.cfg" "$@"
-}
-
-# api_json <METHOD> <URL> [<body-file>] -> prints the HTTP status, body lands in $RESPONSE_FILE
-api_json() {
-  local method="$1" url="$2" body="${3:-}"
-  if [ -n "$body" ]; then
-    pcurl -o "$RESPONSE_FILE" -w '%{http_code}' -X "$method" \
-      -H 'Content-Type: application/json' --data-binary "@$body" "$url"
-  else
-    pcurl -o "$RESPONSE_FILE" -w '%{http_code}' -X "$method" "$url"
+  if [ "$IMAGE_MODE" -eq 1 ]; then
+    log "--image: no remote build; the stack update pulls '$APP_IMAGE'"
   fi
-}
-
-response_excerpt() {
-  [ -f "$RESPONSE_FILE" ] || return 0
-  head -c 400 "$RESPONSE_FILE" | tr -d '\r\n'
-}
-
-# Last `HTTP/x nnn` status line of a `curl --dump-header` file (skips 100-continue and
-# redirect hops). Prints nothing when curl never got a response.
-http_status_from_headers() {
-  [ -s "$1" ] || return 0
-  tr -d '\r' < "$1" | awk '/^[Hh][Tt][Tt][Pp]\// { code = $2 } END { if (code != "") print code }'
 }
 
 require_tools() {
@@ -155,22 +98,76 @@ require_tools() {
   fi
 }
 
-preflight() {
-  have curl || die "curl not found"
-  local code
-  code="$(api_json GET "$PORTAINER_URL/api/endpoints/$PORTAINER_ENDPOINT_ID/docker/_ping" || true)"
+# --- the gid of /var/run/docker.sock ----------------------------------------------------------
+# The image runs as uid 10001, so socket mode only works when the container joins the group
+# that owns the socket — a host-specific gid. When DOCKER_GID is not in the env file, ask the
+# engine itself: a throwaway container that bind-mounts the socket read-only and prints
+# `stat -c %g`. Failure is never fatal; the compose default (999) and a warning take over.
+detect_docker_gid() {
+  if [ -n "${DOCKER_GID:-}" ]; then
+    log "DOCKER_GID=$DOCKER_GID (from $ENV_FILE)"
+    return 0
+  fi
+  local base image repo tag name body code cid gid
+  base="$(pc_docker_api)"
+  image="${DOCKER_GID_PROBE_IMAGE:-alpine:3.20}"
+  repo="${image%:*}"; tag="${image##*:}"
+  [ "$repo" != "$image" ] || tag="latest"
+  name="pc-deploy-gid-$$"
+  log "DOCKER_GID unset in $ENV_FILE — probing the engine with a throwaway $image container"
+
+  code="$(pc_api_json POST "$base/images/create?fromImage=$repo&tag=$tag" || true)"
   case "$code" in
-    200) log "portainer reachable (docker _ping ok)" ;;
-    401|403) die "portainer rejected the API key (HTTP $code) — check PORTAINER_API_KEY" ;;
-    404) die "endpoint $PORTAINER_ENDPOINT_ID not found (HTTP 404) — check PORTAINER_ENDPOINT_ID" ;;
-    000|"") die "cannot reach $PORTAINER_URL — check PORTAINER_URL / network / TLS" ;;
-    *) die "unexpected reply from $PORTAINER_URL (HTTP $code): $(response_excerpt)" ;;
+    2??) ;;
+    *) warn "could not pull $image (HTTP $code) — trying anyway, it may already be present" ;;
   esac
+
+  body="$TMPDIR_SECURE/gid-probe.json"
+  # Tty:true keeps the log stream unmultiplexed, NetworkMode:none keeps the probe offline,
+  # and the socket is mounted READ-ONLY: this container only ever runs `stat`.
+  printf '{"Image":"%s","Cmd":["stat","-c","%%g","/var/run/docker.sock"],"Tty":true,'\
+'"Labels":{"porterclaude.managed":"true","porterclaude.role":"gid-probe"},'\
+'"HostConfig":{"Binds":["/var/run/docker.sock:/var/run/docker.sock:ro"],'\
+'"AutoRemove":false,"NetworkMode":"none"}}\n' "$image" > "$body"
+  chmod 600 "$body"
+
+  code="$(pc_api_json POST "$base/containers/create?name=$name" "$body" || true)"
+  case "$code" in
+    2??) ;;
+    *) warn "could not create the gid probe (HTTP $code): $(pc_response_excerpt)"; gid="" ;;
+  esac
+  cid=""
+  case "$code" in
+    2??) cid="$("$PY" "$LIB_DIR/portainer.py" json-get --path Id < "$RESPONSE_FILE")" ;;
+  esac
+
+  gid=""
+  if [ -n "$cid" ]; then
+    if [ "$(pc_start_container "$base" "$cid")" = "204" ]; then
+      pc_api_json POST "$base/containers/$cid/wait" >/dev/null 2>&1 || true
+      pcurl -o "$TMPDIR_SECURE/gid.log" "$base/containers/$cid/logs?stdout=1&stderr=1" \
+        >/dev/null 2>&1 || true
+      gid="$(tr -cd '0-9\n' < "$TMPDIR_SECURE/gid.log" 2>/dev/null | grep -m1 '[0-9]' || true)"
+    else
+      warn "the gid probe container did not start: $(pc_response_excerpt)"
+    fi
+    pc_api_json DELETE "$base/containers/$cid?force=1&v=1" >/dev/null 2>&1 || true
+  fi
+
+  if [ -n "$gid" ]; then
+    DOCKER_GID="$gid"
+    export DOCKER_GID
+    log "detected DOCKER_GID=$DOCKER_GID (stat -c %g /var/run/docker.sock)"
+  else
+    warn "could not detect the docker socket gid — the stack falls back to the compose"
+    warn "default (999). If Settings reports the socket as unavailable, run"
+    warn "  stat -c %g /var/run/docker.sock   on the docker host and set DOCKER_GID in $ENV_FILE"
+  fi
 }
 
 # --- steps ------------------------------------------------------------------------------------
 build_context_tar() {
-  ensure_tmpdir
+  pc_ensure_tmpdir
   mkdir -p "$BUILD_DIR"
   local list="$TMPDIR_SECURE/context.files"
   "$PY" "$LIB_DIR/dockerignore.py" --root "$REPO_ROOT" --print0 > "$list"
@@ -205,12 +202,13 @@ build_context_tar() {
 
 remote_build() {
   log "building $APP_IMAGE on endpoint $PORTAINER_ENDPOINT_ID (this runs on the remote engine)"
-  ensure_tmpdir
-  local url hdr code stream_rc=0
+  pc_ensure_tmpdir
+  local url hdr code stream_rc=0 started elapsed proxy_cut=0 html=0
   hdr="$TMPDIR_SECURE/build.headers"
   rm -f "$hdr"
-  url="$PORTAINER_URL/api/endpoints/$PORTAINER_ENDPOINT_ID/docker/build"
+  url="$(pc_docker_api)/build"
   url="$url?t=$APP_IMAGE&dockerfile=docker/Dockerfile&rm=1&forcerm=1&pull=1"
+  started="$(date +%s)"
   # Two independent failure channels, both of which must be checked:
   #   * the HTTP status — a rejected key, or a reverse proxy in front of Portainer timing the
   #     upload out, answers non-2xx with JSON or an HTML error page and never builds anything;
@@ -222,17 +220,38 @@ remote_build() {
         --data-binary "@$CONTEXT_TAR" "$url" | "$PY" "$LIB_DIR/portainer.py" build-stream; then
     stream_rc=1
   fi
-  code="$(http_status_from_headers "$hdr")"
+  elapsed=$(( $(date +%s) - started ))
+  code="$(pc_http_status_from_headers "$hdr")"
+  if pc_response_is_html "$hdr"; then html=1; fi
+
+  case "${code:-}" in
+    401|403) die "portainer rejected the API key on /docker/build (HTTP $code) — nothing was built" ;;
+  esac
+
+  # The reference host's failure mode: nginx in front of Portainer answers an HTML 504 after
+  # ~60 s and docker aborts the build. Recognise it (proxy status, HTML body, or a failure
+  # landing suspiciously close to the 60 s default) and print the remedy instead of a raw
+  # status code that tells the operator nothing.
+  case "${code:-}" in 502|503|504) proxy_cut=1 ;; esac
+  if [ "$html" -eq 1 ]; then proxy_cut=1; fi
+  if [ "$stream_rc" -ne 0 ] && [ "$elapsed" -ge 55 ] && [ "$elapsed" -le 95 ]; then proxy_cut=1; fi
+  if [ "$proxy_cut" -eq 1 ]; then
+    if [ "$html" -eq 1 ]; then
+      warn "the build request ended after ${elapsed}s with HTTP ${code:-<no status>} and an HTML body"
+    else
+      warn "the build request ended after ${elapsed}s with HTTP ${code:-<no status>}"
+    fi
+    pc_proxy_timeout_hint "$(pc_url_host "$PORTAINER_URL")"
+    die "the build never reached the engine (proxy timeout) — nothing was built, nothing was deployed"
+  fi
+
   case "${code:-}" in
     2??) ;;
     "")  die "no HTTP response from the build endpoint — check PORTAINER_URL / network / TLS" ;;
-    401|403) die "portainer rejected the API key on /docker/build (HTTP $code) — nothing was built" ;;
-    502|503|504)
-      die "the build request never reached the engine (HTTP $code from the proxy in front of Portainer) — nothing was built; raise that proxy's read timeout for /api/endpoints/*/docker/build" ;;
     *) die "the build request failed (HTTP $code) — nothing was built" ;;
   esac
   [ "$stream_rc" -eq 0 ] || die "image build failed on the remote engine (see the log above)"
-  log "image built: $APP_IMAGE"
+  log "image built: $APP_IMAGE (${elapsed}s)"
 }
 
 render_stack() {
@@ -245,10 +264,10 @@ render_stack() {
 
 find_stack_id() {
   local code
-  code="$(api_json GET "$PORTAINER_URL/api/stacks" || true)"
+  code="$(pc_api_json GET "$PORTAINER_URL/api/stacks" || true)"
   case "$code" in
     200) ;;
-    *) die "GET /api/stacks failed (HTTP $code): $(response_excerpt)" ;;
+    *) die "GET /api/stacks failed (HTTP $code): $(pc_response_excerpt)" ;;
   esac
   "$PY" "$LIB_DIR/portainer.py" find-stack --name "$STACK_NAME" --endpoint "$PORTAINER_ENDPOINT_ID" \
     < "$RESPONSE_FILE"
@@ -268,28 +287,37 @@ create_stack() {
   log "creating stack '$STACK_NAME'"
   local body code
   body="$(stack_body_file "")"
-  code="$(api_json POST \
+  code="$(pc_api_json POST \
     "$PORTAINER_URL/api/stacks/create/standalone/string?endpointId=$PORTAINER_ENDPOINT_ID" "$body" || true)"
   if [ "$code" = "404" ] || [ "$code" = "405" ]; then
     warn "standalone/string endpoint unavailable (HTTP $code) — retrying the legacy stack API"
     body="$(stack_body_file "--legacy")"
-    code="$(api_json POST \
+    code="$(pc_api_json POST \
       "$PORTAINER_URL/api/stacks?type=2&method=string&endpointId=$PORTAINER_ENDPOINT_ID" "$body" || true)"
   fi
   case "$code" in
     2??) log "stack created" ;;
-    *) die "stack create failed (HTTP $code): $(response_excerpt)" ;;
+    *) die "stack create failed (HTTP $code): $(pc_response_excerpt)" ;;
   esac
 }
 
 update_stack() {
-  local sid="$1" body code
+  local sid="$1" body code flags="--update"
+  # The image was just built on that engine -> pullImage:false. With --image it comes from a
+  # registry instead and Portainer has to fetch it.
+  if [ "$PULL_IMAGE" -eq 1 ]; then flags="--update --pull"; fi
   log "updating stack '$STACK_NAME' (id $sid)"
-  body="$(stack_body_file "--update")"
-  code="$(api_json PUT "$PORTAINER_URL/api/stacks/$sid?endpointId=$PORTAINER_ENDPOINT_ID" "$body" || true)"
+  body="$(stack_body_file "$flags")"
+  code="$(pc_api_json PUT "$PORTAINER_URL/api/stacks/$sid?endpointId=$PORTAINER_ENDPOINT_ID" "$body" || true)"
   case "$code" in
-    2??) log "stack updated (prune=true, pullImage=false)" ;;
-    *) die "stack update failed (HTTP $code): $(response_excerpt)" ;;
+    2??)
+      if [ "$PULL_IMAGE" -eq 1 ]; then
+        log "stack updated (prune=true, pullImage=true — the image comes from a registry)"
+      else
+        log "stack updated (prune=true, pullImage=false — the image was just built there)"
+      fi
+      ;;
+    *) die "stack update failed (HTTP $code): $(pc_response_excerpt)" ;;
   esac
 }
 
@@ -318,15 +346,25 @@ main() {
   load_env
   if [ "$DRY_RUN" -eq 1 ]; then
     log "dry run: tarring context and rendering the stack file only"
-    build_context_tar
-    render_stack
-    log "wrote $CONTEXT_TAR and $STACK_FILE"
+    if [ -z "${DOCKER_GID:-}" ]; then
+      warn "DOCKER_GID is unset — a real run probes the engine for it; the rendered file"
+      warn "falls back to the compose default (999)"
+    fi
+    if [ "$DO_BUILD" -eq 1 ]; then
+      build_context_tar
+      render_stack
+      log "wrote $CONTEXT_TAR and $STACK_FILE"
+    else
+      render_stack
+      log "wrote $STACK_FILE (--image / --deploy-only: no build context)"
+    fi
     return 0
   fi
-  setup_curl_config
-  preflight
+  pc_setup_curl_config
+  pc_preflight
   if [ "$DO_BUILD" -eq 1 ]; then build_context_tar; remote_build; fi
   if [ "$DO_DEPLOY" -eq 1 ]; then
+    detect_docker_gid
     render_stack
     local sid
     sid="$(find_stack_id)"

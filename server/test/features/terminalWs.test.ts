@@ -28,6 +28,8 @@ let server: http.Server;
 let handle: ReturnType<typeof attachTerminalWs>;
 let stream: ReturnType<typeof stubExecStream> & TestStream;
 let openError: unknown = null;
+let sessionStateError: unknown = null;
+let execExitCode: number | null = 0;
 let unregistered: string[] = [];
 
 function makeCtx(): AppContext {
@@ -45,6 +47,17 @@ function makeCtx(): AppContext {
         };
       },
       unregister: (id: string) => unregistered.push(id),
+    },
+    sessions: {
+      requireRunningContainer: async () => {
+        if (sessionStateError) throw sessionStateError;
+        return { containerId: 'c1', config: {} };
+      },
+    },
+    backends: {
+      get: () => ({
+        execInspect: async () => ({ running: false, exitCode: execExitCode, pid: 1 }),
+      }),
     },
   } as unknown as AppContext;
 }
@@ -77,6 +90,8 @@ function nextClose(ws: WebSocket): Promise<number> {
 beforeEach(async () => {
   authState.ok = true;
   openError = null;
+  sessionStateError = null;
+  execExitCode = 0;
   unregistered = [];
   stream = stubExecStream() as ReturnType<typeof stubExecStream> & TestStream;
   server = http.createServer((_req, res) => res.end('ok'));
@@ -180,15 +195,52 @@ describe('attachTerminalWs', () => {
     ws.close();
   });
 
-  it('closes 1000 with an exit message when the shell exits', async () => {
+  it('closes 1000 with the real exec exit code when the shell exits', async () => {
+    execExitCode = 3;
     const ws = connect();
     await nextText(ws);
     const exit = nextText(ws);
     const closed = nextClose(ws);
-    stream.emitClose(0);
-    expect(await exit).toEqual({ type: 'exit', code: 0 });
+    // the transport close code (1006 from the portainer exec socket) is NOT an exit status
+    stream.emitClose(1006);
+    expect(await exit).toEqual({ type: 'exit', code: 3 });
     expect(await closed).toBe(TERMINAL_CLOSE.normal);
     expect(unregistered).toContain('t1');
+  });
+
+  it('closes 4409 when the exec ends because the session was stopped', async () => {
+    sessionStateError = AppError.conflict("session 'web' is not running");
+    const ws = connect();
+    await nextText(ws);
+    const message = nextText(ws);
+    const closed = nextClose(ws);
+    stream.emitClose(1006);
+    expect(await message).toMatchObject({ type: 'error', code: 'session_not_running' });
+    expect(await closed).toBe(TERMINAL_CLOSE.sessionNotRunning);
+    expect(unregistered).toContain('t1');
+  });
+
+  it('closes 4404 when the exec ends because the session is gone', async () => {
+    sessionStateError = AppError.notFound("session 'web' does not exist");
+    const ws = connect();
+    await nextText(ws);
+    const message = nextText(ws);
+    const closed = nextClose(ws);
+    stream.emitClose(1006);
+    expect(await message).toMatchObject({ type: 'error', code: 'session_not_found' });
+    expect(await closed).toBe(TERMINAL_CLOSE.sessionNotFound);
+  });
+
+  it('still reports a normal exit when the session state cannot be confirmed', async () => {
+    sessionStateError = new Error('portainer unreachable');
+    execExitCode = null;
+    const ws = connect();
+    await nextText(ws);
+    const exit = nextText(ws);
+    const closed = nextClose(ws);
+    stream.emitClose(1006);
+    expect(await exit).toEqual({ type: 'exit', code: null });
+    expect(await closed).toBe(TERMINAL_CLOSE.normal);
   });
 
   it.each([

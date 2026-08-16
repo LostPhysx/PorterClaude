@@ -42,6 +42,8 @@ jobs:
       - name: syntax floor
         run: |
           bash -n deploy/deploy.sh
+          bash -n deploy/host-prep.sh
+          bash -n deploy/lib/common.sh
           bash -n docker/recipes/common.sh
           sh -n docker/tools/entrypoint.sh
           sh -n docker/tools/populate.sh
@@ -49,7 +51,7 @@ jobs:
       - name: shellcheck
         run: |
           shellcheck --version
-          shellcheck -S warning deploy/deploy.sh docker/recipes/common.sh docker/tools/*.sh
+          shellcheck -S warning deploy/deploy.sh deploy/host-prep.sh deploy/lib/common.sh docker/recipes/common.sh docker/tools/*.sh
       - name: python helpers compile
         run: |
           python3 -m compileall -q deploy/lib
@@ -103,6 +105,26 @@ jobs:
           grep -qF 'porterclaude:local' deploy/.build/stack.yml
           # the password must NOT be substituted: it travels in the Portainer stack env array
           grep -qF '${APP_PASSWORD}' deploy/.build/stack.yml
+      - name: deploy.sh --image renders a registry image and skips the build
+        run: |
+          rm -f deploy/.build/stack.yml
+          bash deploy/deploy.sh --dry-run --image ghcr.io/example/porterclaude:v9.9.9 \
+            --env-file deploy/.env.ci
+          grep -qF 'ghcr.io/example/porterclaude:v9.9.9' deploy/.build/stack.yml
+          # --image is the no-build mode, so it must refuse --build-only instead of building
+          if bash deploy/deploy.sh --image x --build-only --env-file deploy/.env.ci; then
+            echo "--image --build-only should have failed"; exit 1
+          fi
+          # restore the ordinary artifacts for the upload step below
+          bash deploy/deploy.sh --dry-run --env-file deploy/.env.ci
+      - name: host-prep.sh --dry-run changes nothing and needs an action
+        run: |
+          # portainer.example.com does not resolve: the dry run must still describe the plan.
+          bash deploy/host-prep.sh --dry-run --clean --prune --vhost --reload \
+            --env-file deploy/.env.ci
+          if bash deploy/host-prep.sh --dry-run --env-file deploy/.env.ci; then
+            echo "host-prep.sh without an action should have failed"; exit 1
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: rendered-stack

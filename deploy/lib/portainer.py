@@ -19,14 +19,36 @@ subcommands:
   find-stack --name N --endpoint E  stdin = GET /api/stacks response; prints the matching
                                     stack Id (case-insensitive name, endpoint filtered) or
                                     nothing; exit 0 either way
-  stack-body --file F --name N [--env VAR]... [--update] [--legacy]
+  stack-body --file F --name N [--env VAR]... [--update] [--legacy] [--pull]
                                     prints the JSON body for stack create/update:
                                     {"name":..., "stackFileContent":<file>,
                                      "env":[{"name":VAR,"value":os.environ[VAR]}, ...]}
                                     --update swaps in the update shape
                                     ({"stackFileContent","env","prune":true,
                                       "pullImage":false}) and --legacy the capitalised
-                                    field names of the pre-2.x create endpoint
+                                    field names of the pre-2.x create endpoint.
+                                    --pull sets pullImage:true, for a stack that points at
+                                    a registry image instead of one just built on the engine
+  json-get --path A.B.0.C          stdin = any JSON; prints the value at that dotted path
+                                    (list indices allowed), nothing when it is absent
+  filter-containers [--name-prefix P]... [--label K[=V]]...
+                                    stdin = GET /containers/json?all=1; prints one
+                                    `id<TAB>name<TAB>state` line per container matching ALL
+                                    given label filters and ANY of the name prefixes
+  filter-images [--label-prefix P] stdin = GET /images/json?filters=dangling; prints one
+                                    `id<TAB>sizeBytes<TAB>labels` line per image carrying at
+                                    least one label whose key starts with P
+  find-container --match S [--match S]...
+                                    stdin = GET /containers/json?all=1; prints
+                                    `id<TAB>name` of the first container whose name or image
+                                    contains one of the substrings
+  mount-source --dest D            stdin = GET /containers/<id>/json; prints the HOST path
+                                    bind-mounted at D inside that container (the leading
+                                    slash of D is optional — leave it off under Git Bash,
+                                    which would rewrite it into a Windows path)
+  mount-volumes [--prefix P]...    stdin = GET /containers/<id>/json; prints the NAME of
+                                    every named volume the container mounts, one per line,
+                                    restricted to the given name prefixes when any is given
 """
 from __future__ import annotations
 
@@ -230,7 +252,7 @@ def _env_array(env_names: List[str]) -> List[Dict[str, str]]:
 
 
 def cmd_stack_body(path: str, name: str, env_names: List[str], legacy: bool,
-                   update: bool = False) -> int:
+                   update: bool = False, pull: bool = False) -> int:
     """Print the JSON create/update body (json.dumps - never string concatenation)."""
     try:
         with open(path, "r", encoding="utf-8") as fh:
@@ -241,12 +263,191 @@ def cmd_stack_body(path: str, name: str, env_names: List[str], legacy: bool,
     env = _env_array(env_names)
     body: Dict[str, Any]
     if update:
-        body = {"stackFileContent": content, "env": env, "prune": True, "pullImage": False}
+        body = {"stackFileContent": content, "env": env, "prune": True, "pullImage": bool(pull)}
     elif legacy:
         body = {"Name": name, "StackFileContent": content, "Env": env}
     else:
         body = {"name": name, "stackFileContent": content, "env": env}
     sys.stdout.write(json.dumps(body))
+    return 0
+
+
+# ---------------------------------------------------------------------------------------
+# small read-only helpers for deploy.sh / host-prep.sh (no jq on the reference boxes)
+# ---------------------------------------------------------------------------------------
+
+def _load(stream) -> Any:
+    try:
+        return json.load(stream)
+    except ValueError as exc:
+        sys.stderr.write("error: expected JSON on stdin (%s)\n" % exc)
+        return None
+
+
+def _dig(data: Any, path: str) -> Any:
+    """Walk a dotted path; integer segments index into lists."""
+    cur = data
+    for part in path.split("."):
+        if part == "":
+            continue
+        if isinstance(cur, dict):
+            if part not in cur:
+                return None
+            cur = cur[part]
+        elif isinstance(cur, list):
+            try:
+                cur = cur[int(part)]
+            except (ValueError, IndexError):
+                return None
+        else:
+            return None
+    return cur
+
+
+def cmd_json_get(stream, path: str) -> int:
+    data = _load(stream)
+    if data is None:
+        return 0
+    value = _dig(data, path)
+    if value is None:
+        return 0
+    if isinstance(value, (dict, list)):
+        sys.stdout.write(json.dumps(value))
+    else:
+        sys.stdout.write(str(value))
+    return 0
+
+
+def _container_names(container: Dict[str, Any]) -> List[str]:
+    names = container.get("Names") or container.get("names") or []
+    if isinstance(names, str):
+        names = [names]
+    return [str(n).lstrip("/") for n in names if n]
+
+
+def _labels(obj: Dict[str, Any]) -> Dict[str, str]:
+    labels = obj.get("Labels") or obj.get("labels") or {}
+    return {str(k): str(v) for k, v in labels.items()} if isinstance(labels, dict) else {}
+
+
+def cmd_filter_containers(stream, prefixes: List[str], label_filters: List[str]) -> int:
+    """Print `id<TAB>name<TAB>state` for containers matching every label and any prefix."""
+    data = _load(stream)
+    if not isinstance(data, list):
+        return 0
+    wanted: List[tuple] = []
+    for raw in label_filters:
+        key, sep, value = str(raw).partition("=")
+        wanted.append((key.strip(), value.strip() if sep else None))
+    for container in data:
+        if not isinstance(container, dict):
+            continue
+        labels = _labels(container)
+        if any(key not in labels or (val is not None and labels[key] != val)
+               for key, val in wanted):
+            continue
+        names = _container_names(container)
+        if prefixes and not any(n.startswith(p) for n in names for p in prefixes):
+            continue
+        cid = str(container.get("Id") or container.get("id") or "")
+        if not cid:
+            continue
+        sys.stdout.write("%s\t%s\t%s\n" % (cid, names[0] if names else cid[:12],
+                                             container.get("State") or "?"))
+    return 0
+
+
+def cmd_filter_images(stream, label_prefix: str) -> int:
+    """Print `id<TAB>sizeBytes<TAB>labels` for images carrying a label with that prefix."""
+    data = _load(stream)
+    if not isinstance(data, list):
+        return 0
+    for image in data:
+        if not isinstance(image, dict):
+            continue
+        labels = _labels(image)
+        hits = {k: v for k, v in labels.items() if not label_prefix or k.startswith(label_prefix)}
+        if not hits:
+            continue
+        iid = str(image.get("Id") or image.get("id") or "")
+        if not iid:
+            continue
+        summary = ",".join("%s=%s" % (k, v) for k, v in sorted(hits.items()))
+        sys.stdout.write("%s\t%s\t%s\n" % (iid, image.get("Size") or 0, summary))
+    return 0
+
+
+def cmd_find_container(stream, matches: List[str]) -> int:
+    """Print `id<TAB>name` of the first container whose name or image contains a substring."""
+    data = _load(stream)
+    if not isinstance(data, list):
+        return 0
+    needles = [m.lower() for m in matches if m]
+    for container in data:
+        if not isinstance(container, dict):
+            continue
+        names = _container_names(container)
+        haystack = " ".join(names + [str(container.get("Image") or "")]).lower()
+        if any(n in haystack for n in needles):
+            cid = str(container.get("Id") or container.get("id") or "")
+            if cid:
+                sys.stdout.write("%s\t%s\n" % (cid, names[0] if names else cid[:12]))
+                return 0
+    return 0
+
+
+def cmd_mount_source(stream, dest: str) -> int:
+    """Print the host path bind-mounted at `dest` inside an inspected container.
+
+    The leading slash of `dest` is optional, and callers running under Git Bash on Windows
+    should leave it off: MSYS rewrites an argument that looks like an absolute POSIX path
+    into a Windows path before it ever reaches (native) python.
+    """
+    data = _load(stream)
+    if not isinstance(data, dict):
+        return 0
+    mounts = data.get("Mounts") or []
+    if not isinstance(mounts, list):
+        return 0
+    wanted = "/" + dest.strip("/")
+    for mount in mounts:
+        if not isinstance(mount, dict):
+            continue
+        if str(mount.get("Destination") or "").rstrip("/") != wanted:
+            continue
+        source = mount.get("Source") or mount.get("Name") or ""
+        if source:
+            sys.stdout.write(str(source))
+            return 0
+    return 0
+
+
+def cmd_mount_volumes(stream, prefixes: List[str]) -> int:
+    """Print the named volumes a container mounts (optionally only those with a prefix).
+
+    Removing a container with `v=1` only drops its ANONYMOUS volumes; the workspace and
+    history volumes PorterClaude creates are named, so a cleanup has to collect them from
+    the container spec before the container disappears.
+    """
+    data = _load(stream)
+    if not isinstance(data, dict):
+        return 0
+    mounts = data.get("Mounts") or []
+    if not isinstance(mounts, list):
+        return 0
+    seen = set()
+    for mount in mounts:
+        if not isinstance(mount, dict):
+            continue
+        if str(mount.get("Type") or "") != "volume":
+            continue
+        name = str(mount.get("Name") or "")
+        if not name or name in seen:
+            continue
+        if prefixes and not any(name.startswith(p) for p in prefixes):
+            continue
+        seen.add(name)
+        sys.stdout.write(name + "\n")
     return 0
 
 
@@ -266,6 +467,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_body.add_argument("--env", action="append", default=[])
     p_body.add_argument("--legacy", action="store_true")
     p_body.add_argument("--update", action="store_true")
+    p_body.add_argument("--pull", action="store_true",
+                        help="pullImage:true — the stack points at a registry image")
+    p_get = sub.add_parser("json-get")
+    p_get.add_argument("--path", required=True)
+    p_fc = sub.add_parser("filter-containers")
+    p_fc.add_argument("--name-prefix", action="append", default=[])
+    p_fc.add_argument("--label", action="append", default=[])
+    p_fi = sub.add_parser("filter-images")
+    p_fi.add_argument("--label-prefix", default="")
+    p_find = sub.add_parser("find-container")
+    p_find.add_argument("--match", action="append", default=[], required=True)
+    p_mount = sub.add_parser("mount-source")
+    p_mount.add_argument("--dest", required=True)
+    p_vols = sub.add_parser("mount-volumes")
+    p_vols.add_argument("--prefix", action="append", default=[])
     args = ap.parse_args(argv)
 
     if args.cmd == "build-stream":
@@ -274,7 +490,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.cmd == "find-stack":
         return cmd_find_stack(sys.stdin, args.name, args.endpoint)
     if args.cmd == "stack-body":
-        return cmd_stack_body(args.file, args.name, args.env, args.legacy, args.update)
+        return cmd_stack_body(args.file, args.name, args.env, args.legacy, args.update,
+                              args.pull)
+    if args.cmd == "json-get":
+        return cmd_json_get(sys.stdin, args.path)
+    if args.cmd == "filter-containers":
+        return cmd_filter_containers(sys.stdin, args.name_prefix, args.label)
+    if args.cmd == "filter-images":
+        return cmd_filter_images(sys.stdin, args.label_prefix)
+    if args.cmd == "find-container":
+        return cmd_find_container(sys.stdin, args.match)
+    if args.cmd == "mount-source":
+        return cmd_mount_source(sys.stdin, args.dest)
+    if args.cmd == "mount-volumes":
+        return cmd_mount_volumes(sys.stdin, args.prefix)
     ap.error("unknown command")
     return 2
 

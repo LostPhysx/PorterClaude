@@ -4,7 +4,7 @@
 # features (no syntax directive, no build mounts, no per-build platform override).
 # Must build unchanged on amd64 and arm64.
 FROM debian:bookworm-slim
-ARG CLAUDE_VERSION=latest
+ARG CLAUDE_VERSION=stable
 LABEL porterclaude.recipe="base" \
       porterclaude.claude-version="${CLAUDE_VERSION}"
 ENV LANG=C.UTF-8 \

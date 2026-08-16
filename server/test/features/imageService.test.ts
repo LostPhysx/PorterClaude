@@ -93,6 +93,58 @@ describe('recipeStatuses', () => {
   });
 });
 
+describe('the image a rebuild replaces', () => {
+  // Re-tagging <ns>/<name>:latest leaves the previous image untagged; nothing else ever
+  // removes it, so a few rebuild cycles used to fill the host's disk (1-2 GB each).
+  function movingTagBackend(opts: { staleTags?: string[]; removeFails?: boolean } = {}) {
+    const removed: string[] = [];
+    let current = imageInspect({ id: 'sha256:old', tags: ['porterclaude/node:latest'] });
+    const sb = stubBackend({
+      inspectImage: async (ref: string) => {
+        if (ref === 'porterclaude/node:latest') return current;
+        if (ref === 'sha256:old') return imageInspect({ id: 'sha256:old', tags: opts.staleTags ?? [] });
+        return null;
+      },
+      buildImage: async () => {
+        current = imageInspect({ id: 'sha256:new', tags: ['porterclaude/node:latest'] });
+      },
+      removeImage: async (ref: string) => {
+        if (opts.removeFails) throw new Error('conflict: image is being used by container abc');
+        removed.push(ref);
+      },
+    });
+    return { sb, removed };
+  }
+
+  it('removes the now-untagged image after a successful rebuild', async () => {
+    const { sb, removed } = movingTagBackend();
+    const { service } = makeService(sb);
+    const job = await service.buildRecipe('node');
+    await settle(service, job.id);
+    expect(service.getJob(job.id)?.status).toBe('success');
+    expect(removed).toEqual(['sha256:old']);
+  });
+
+  it('keeps it when another tag still references it', async () => {
+    const { sb, removed } = movingTagBackend({ staleTags: ['porterclaude/node:keepme'] });
+    const { service } = makeService(sb);
+    const job = await service.buildRecipe('node');
+    await settle(service, job.id);
+    expect(service.getJob(job.id)?.status).toBe('success');
+    expect(removed).toEqual([]);
+  });
+
+  it('does not fail the build when the old image is still in use', async () => {
+    const { sb } = movingTagBackend({ removeFails: true });
+    const { service } = makeService(sb);
+    const job = await service.buildRecipe('node');
+    await settle(service, job.id);
+    const done = service.getJob(job.id);
+    expect(done?.status).toBe('success');
+    expect(service.getJobLines(job.id).lines.join(' ')).toContain('still in use');
+  });
+});
+
 describe('buildRecipe', () => {
   it('builds the tagged image with the porterclaude labels', async () => {
     const { service, sb } = makeService();
@@ -241,6 +293,65 @@ describe('syncTools', () => {
     expect(service.getJob(job.id)?.status).toBe('error');
     expect(service.getJob(job.id)?.error).toContain('exited with code 3');
     expect(sb.calls).toContain('removeContainer');
+  });
+
+  // BE-8: after an upgrade the image must be rebuilt without the operator knowing about
+  // {force:true}, otherwise the volume keeps the old entrypoint.sh / claude binaries.
+  it('rebuilds the tools image when the stored context hash no longer matches', async () => {
+    const { service, sb } = makeService();
+    sb.images.set(
+      'porterclaude/tools:latest',
+      imageInspect({ labels: { [IMAGE_LABELS.contextHash]: 'stale-hash' } }),
+    );
+
+    const job = await service.syncTools();
+    await settle(service, job.id);
+
+    expect(service.getJob(job.id)?.status).toBe('success');
+    const build = sb.log.find((c) => c.method === 'buildImage');
+    expect(build).toBeTruthy();
+    const opts = build?.args[0] as { tag: string; labels: Record<string, string>; pull: boolean; noCache: boolean };
+    expect(opts.tag).toBe('porterclaude/tools:latest');
+    expect(opts.labels[IMAGE_LABELS.contextHash]).toBe(await hashContext({ dir: path.join(dockerDir, 'tools') }));
+    // a plain sync is a normal (cached, no-pull) rebuild; force is the escape hatch
+    expect(opts.pull).toBe(false);
+    expect(opts.noCache).toBe(false);
+    expect(service.getJobLines(job.id).lines.some((l) => l.includes('stale-hash'))).toBe(true);
+  });
+
+  it('reuses the image when its context hash still matches, and rebuilds on force', async () => {
+    const { service, sb } = makeService();
+    const hash = await hashContext({ dir: path.join(dockerDir, 'tools') });
+    sb.images.set('porterclaude/tools:latest', imageInspect({ labels: { [IMAGE_LABELS.contextHash]: hash } }));
+
+    const job = await service.syncTools();
+    await settle(service, job.id);
+    expect(sb.calls).not.toContain('buildImage');
+    expect(service.getJobLines(job.id).lines.some((l) => l.includes('reusing existing image'))).toBe(true);
+    // the volume is still re-populated from the (current) image
+    expect(sb.calls).toContain('createContainer');
+
+    const forced = await service.syncTools({ force: true });
+    await settle(service, forced.id);
+    const build = sb.log.find((c) => c.method === 'buildImage');
+    const opts = build?.args[0] as { pull: boolean; noCache: boolean };
+    expect(opts.pull).toBe(true);
+    expect(opts.noCache).toBe(true);
+  });
+
+  it('reports outdated in the tools status (mirrors RecipeStatus.outdated)', async () => {
+    const { service, sb } = makeService();
+    const hash = await hashContext({ dir: path.join(dockerDir, 'tools') });
+    sb.volumes.push({ name: 'porterclaude-tools', driver: 'local', labels: {} });
+
+    // populated volume, no image at all -> the next sync has to build one
+    expect(await service.toolsStatus()).toMatchObject({ outdated: true, contextHash: hash });
+
+    sb.images.set('porterclaude/tools:latest', imageInspect({ labels: { [IMAGE_LABELS.contextHash]: 'stale' } }));
+    expect((await service.toolsStatus()).outdated).toBe(true);
+
+    sb.images.set('porterclaude/tools:latest', imageInspect({ labels: { [IMAGE_LABELS.contextHash]: hash } }));
+    expect((await service.toolsStatus()).outdated).toBe(false);
   });
 
   it('reports the tools volume status', async () => {

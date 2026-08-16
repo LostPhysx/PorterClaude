@@ -380,6 +380,7 @@ export class TerminalPane {
       this._awaitEnter = true;
       this._writeDim('[process exited] press Enter to restart');
       this._clearNote('conn');
+      void this._noteIfSessionStopped();
       return;
     }
 
@@ -448,6 +449,30 @@ export class TerminalPane {
       return;
     }
     this._scheduleReconnect(reason);
+  }
+
+  /**
+   * Defence in depth for "the session was stopped while this pane was open": the server
+   * closes 4409 in that case, but a racing stop (or an older server) can still close 1000,
+   * which alone would only say "[process exited]". Confirm the session state and, when it is
+   * not running, show the same note the 4409 path shows instead of a bare exit line.
+   */
+  async _noteIfSessionStopped() {
+    let status = null;
+    try {
+      const res = await api.sessions.get(this.session);
+      const view = (res && res.session) || null;
+      status = view && typeof view.status === 'string' ? view.status : null;
+    } catch {
+      return; // cannot tell (offline / 401 / gone): leave the plain exit line alone
+    }
+    // only decorate the close we are still sitting in
+    if (this.disposed || this.ws || !this._awaitEnter || !status || status === 'running') return;
+    this._renderNote('conn', {
+      variant: 'warning',
+      text: `session "${this.session}" is not running`,
+      actions: [{ label: 'Start session', onClick: () => this._startSession() }],
+    });
   }
 
   /** Ask the API to start the session, then reconnect immediately on success. */

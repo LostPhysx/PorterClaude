@@ -145,13 +145,28 @@ ensure_dev_user() {
 
 # --- 4. Claude Code (native installer, installed outside $HOME) --------------------------
 install_claude() {
-  local launcher resolved version
+  local launcher resolved version requested installer
+  requested="${CLAUDE_VERSION:-stable}"
   mkdir -p "$CLAUDE_INSTALL_ROOT" /etc/porterclaude
   # /home/dev/.claude is replaced by a shared volume at runtime, so the installer must not
   # write there: HOME points at $CLAUDE_INSTALL_ROOT for the duration of the install.
-  log "installing Claude Code with the native installer (HOME=$CLAUDE_INSTALL_ROOT)"
-  HOME="$CLAUDE_INSTALL_ROOT" bash -c 'curl -fsSL https://claude.ai/install.sh | bash' \
+  #
+  # $CLAUDE_VERSION is the recipe Dockerfile's `ARG CLAUDE_VERSION` (the classic builder puts
+  # build args into RUN's environment) and it MUST reach the installer: the same value is what
+  # the porterclaude.claude-version label claims, and a label saying 2.1.200 on an image that
+  # actually runs `latest` is worse than no label at all. `install.sh [version]` accepts
+  # `stable`, `latest` or an exact version; `stable` is the installer's own default and is
+  # therefore passed as no argument at all, so an older installer that ignores arguments still
+  # produces exactly what the label promises.
+  log "installing Claude Code (requested version '$requested', HOME=$CLAUDE_INSTALL_ROOT)"
+  installer=/tmp/claude-install.sh
+  curl -fsSL --retry 3 --connect-timeout 20 https://claude.ai/install.sh -o "$installer" \
+    || die "could not download https://claude.ai/install.sh — a recipe without claude is useless"
+  set --
+  if [ -n "$requested" ] && [ "$requested" != "stable" ]; then set -- "$requested"; fi
+  HOME="$CLAUDE_INSTALL_ROOT" bash "$installer" "$@" \
     || die "the Claude Code installer failed — a recipe without claude is useless"
+  rm -f "$installer"
 
   launcher=""
   if [ -x "$CLAUDE_INSTALL_ROOT/.local/bin/claude" ]; then
@@ -171,6 +186,17 @@ install_claude() {
   [ -n "$version" ] || die "'claude --version' produced no output"
   printf '%s\n' "$version" > /etc/porterclaude/claude-version
   log "claude installed: $version  ($resolved)"
+  # An exact request that did not come out the other end means the label lies — say so
+  # loudly instead of shipping an image that disagrees with porterclaude.claude-version.
+  case "$requested" in
+    stable|latest|"") ;;
+    *)
+      case "$version" in
+        *"$requested"*) ;;
+        *) warn "requested claude version '$requested' but the installer produced '$version'" ;;
+      esac
+      ;;
+  esac
 }
 
 # --- 5. shell environment ----------------------------------------------------------------

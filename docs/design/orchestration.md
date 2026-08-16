@@ -339,6 +339,9 @@ Settings -> Images -> "Sync tools"
   POST /api/images/tools/sync
     ImageService.syncTools()
       buildImage(tar(docker/tools), t=porterclaude/tools:latest)   <- this topic's Dockerfile
+        only when the image is missing or its porterclaude.context-hash label differs
+        from the current docker/tools hash (force:true = always, --pull + --no-cache);
+        otherwise the existing image is reused and only the volume is re-populated
       createVolume(porterclaude-tools) if missing
       createContainer(image=porterclaude/tools:latest, binds=[porterclaude-tools:/out])
       startContainer -> waitContainer (exit 0) -> removeContainer  <- CMD = populate.sh

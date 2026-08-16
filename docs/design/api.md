@@ -132,6 +132,18 @@ values fall back to what is stored. Response `{ "endpoints": PortainerEndpoint[]
 ### `PUT /api/settings/general`
 Partial `general` object. Response: full sanitized settings.
 
+Every field is validated where it enters the system (an unchecked value would otherwise
+fail deep inside docker on the *next* session create), so a bad value is a `422
+validation_error` naming the field:
+
+| field | rule |
+|---|---|
+| `containerPrefix`, `imageNamespace`, `defaultRecipe` | `[a-z0-9][a-z0-9._-]*` (max 64) |
+| `sharedClaudeVolume`, `sharedClaudeHomeVolume`, `toolsVolume`, `sessionNetwork` | docker object name `[a-zA-Z0-9][a-zA-Z0-9_.-]*` (max 128); `sessionNetwork` may be `null` |
+| `workspacesRoot`, `containerHome`, `workspaceMount`, `toolsMount` | absolute POSIX path, no `.`/`..` segment (max 512) |
+
+Session `env` keys are validated the same way by `SessionInput`: `[A-Za-z_][A-Za-z0-9_]*`.
+
 ### `PUT /api/settings/ui`
 `{ "layout"?: any, "theme"?: "auto"|"light"|"dark" }` — the UI persists its GoldenLayout
 state here. Response `{ "ui": { "layout": ..., "theme": ... } }`.
@@ -171,7 +183,7 @@ Debug aid: `{ "routes": [ { "route": "/vendor/bootstrap", "dir": "…", "mounted
   "image": { "type": "recipe", "recipe": "node" },// or { "type":"custom", "ref":"nginx:1.27" }
   "workspace": { "type": "volume" },              // or {"type":"bind","hostPath":"/srv/x"}
                                                   // or {"type":"git","url":"…","branch":"main"}
-  "env": { "FOO": "bar" },
+  "env": { "FOO": "bar" },                        // keys: ^[A-Za-z_][A-Za-z0-9_]*$
   "ports": [ { "containerPort": 3000, "hostPort": 3000, "protocol": "tcp" } ],
   "extraMounts": [ { "type": "volume", "source": "cache", "target": "/cache", "readOnly": false } ],
   "limits": { "cpus": 2, "memoryMb": 4096 },
@@ -207,7 +219,7 @@ Debug aid: `{ "routes": [ { "route": "/vendor/bootstrap", "dir": "…", "mounted
 | POST | `/api/sessions/:name/restart` | – | `{ "session": SessionView }` |
 | POST | `/api/sessions/:name/recreate` | – | `{ "session": SessionView }` |
 | GET | `/api/sessions/:name/logs?tail=200&timestamps=0` | – | `{ "logs": "…" }` |
-| POST | `/api/sessions/reconcile` | – | `{ "report": { "known": 3, "running": 2, "orphans": ["x"], "missing": ["y"] } }` |
+| POST | `/api/sessions/reconcile` | – | `{ "report": { "known": 3, "running": 2, "orphans": [], "adopted": ["x"], "missing": ["y"] } }` |
 
 Notes
 * `PUT` = edit = **recreate**: stop → remove container (volumes kept) → create → start if
@@ -216,6 +228,13 @@ Notes
   `porterclaude-ws-<name>` and `porterclaude-hist-<name>` (never the shared volumes).
 * `409 conflict` when creating a name that already exists (config or container).
 * Route order: `/reconcile` is registered before `/:name`.
+* `POST /reconcile` **adopts**: every container labelled `porterclaude.managed=true` that
+  has no stored definition is written back into `config.json` (reconstructed from its
+  labels/inspect) and reported under `adopted`; those sessions answer `orphan:false`
+  afterwards and are editable again. `orphans` therefore only lists the containers that
+  could *not* be adopted (e.g. a container name that is not a valid session slug), and
+  `known` is the session count **after** the adoption. The reconcile that runs at startup
+  never adopts — there an orphan stays visible as `orphan:true`.
 
 ---
 
@@ -259,9 +278,18 @@ streamed — `since`/`nextIndex` give an append-only cursor.
 ```json
 { "status": { "volume": "porterclaude-tools", "imageRef": "porterclaude/tools:latest",
               "present": true, "lastSyncedAt": "…", "claudeVersion": "1.2.3",
+              "contextHash": "9f86d081…", "outdated": false,
               "syncing": false, "jobId": null } }
 ```
+`contextHash` is the hash of the current `docker/tools` context; `outdated` = the image's
+stored `porterclaude.context-hash` differs from it (or the volume is populated from an image
+that no longer exists) — the same rule as `RecipeStatus.outdated`.
+
 `POST /api/images/tools/sync` body `{ "force"?: boolean }` → `202 { "job": JobSummary }`.
+The sync **rebuilds `<ns>/tools:latest` whenever it is missing or outdated** and only then
+re-populates the volume, so upgrading PorterClaude replaces the entrypoint and the claude
+binaries in the volume without any extra step. `force: true` rebuilds unconditionally,
+pulling the base image and ignoring the layer cache.
 
 ### `POST /api/images/custom/validate`
 Body `{ "image": "nginx:1.27" }` →
@@ -318,11 +346,18 @@ Upgrade: websocket          Cookie: pc_session=…   (sent automatically, same o
 `ready` is always the first text frame on success. `tmux:false` means the image has no
 tmux — the UI must warn that a reload kills the shell.
 
+`exit.code` is the **process** exit status of the exec (read back with `exec inspect`), never
+a transport code, and may be `null` when the engine cannot report it. When the exec ends
+because the container is no longer running, the server does not send `exit` at all: it sends
+`{"type":"error","code":"session_not_running"}` and closes `4409` (`session_not_found` /
+`4404` when the session is gone), so the pane can offer "Start session" instead of claiming
+the shell exited.
+
 ### Close codes
 
 | code | meaning |
 |---|---|
-| 1000 | normal (shell exited, or client closed) |
+| 1000 | normal (the shell itself exited, or the client closed the socket) |
 | 4400 | bad request (invalid query) |
 | 4401 | unauthorized — the upgrade is rejected with an HTTP `401` before the handshake |
 | 4404 | session not found |

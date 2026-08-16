@@ -56,8 +56,11 @@ export interface RemoveOptions {
 export interface ReconcileReport {
   known: number;
   running: number;
-  /** containers labelled porterclaude.managed with no stored config */
+  /** containers labelled porterclaude.managed that STILL have no stored config after this
+   *  run (everything, when the caller did not ask to adopt) */
   orphans: string[];
+  /** orphans this run turned back into stored sessions (POST /api/sessions/reconcile only) */
+  adopted: string[];
   /** stored sessions whose container is gone */
   missing: string[];
 }
@@ -189,6 +192,7 @@ export class SessionService {
         await backend.startContainer(created.id);
       } catch (err) {
         await this.safeRemoveContainer(backend, created.id);
+        await this.removeFreshVolumes(backend, created.freshVolumes);
         throw err;
       }
       await this.afterStart(backend, cfg, general, created.id);
@@ -198,6 +202,7 @@ export class SessionService {
       await this.deps.config.putSession(cfg);
     } catch (err) {
       await this.safeRemoveContainer(backend, created.id);
+      await this.removeFreshVolumes(backend, created.freshVolumes);
       throw err;
     }
 
@@ -336,10 +341,12 @@ export class SessionService {
    * container disappeared.
    *
    * `adopt` (the explicit POST /api/sessions/reconcile, never the startup call) persists a
-   * definition reconstructed from those containers so they become editable again. The
-   * startup reconcile deliberately does NOT: an orphan must stay visible as `orphan:true`
-   * instead of being silently rewritten into a reconstructed definition behind the user's
-   * back. start/recreate/update adopt on demand as well (loadConfig).
+   * definition reconstructed from those containers so they become editable again; those
+   * names come back as `adopted` and are no longer counted as `orphans` (only the ones that
+   * could NOT be adopted are). The startup reconcile deliberately does not adopt: an orphan
+   * must stay visible as `orphan:true` instead of being silently rewritten into a
+   * reconstructed definition behind the user's back. start/recreate/update adopt on demand
+   * as well (loadConfig).
    */
   async reconcile(opts?: { adopt?: boolean }): Promise<ReconcileReport> {
     const general = this.deps.config.general();
@@ -348,6 +355,7 @@ export class SessionService {
     const configs = this.deps.config.listSessions();
 
     const orphans: string[] = [];
+    const adopted: string[] = [];
     const missing: string[] = [];
     const matched = new Set<string>();
 
@@ -360,20 +368,28 @@ export class SessionService {
     const inspects = opts?.adopt ? await this.inspectAll(orphanContainers) : new Map();
     for (const container of orphanContainers) {
       const label = container.labels[CONTAINER_LABELS.session] ?? container.name;
-      orphans.push(label);
-      if (!opts?.adopt) continue;
-      // Explicit user action: adopt the orphan so it becomes startable/editable again.
+      if (!opts?.adopt) {
+        orphans.push(label);
+        continue;
+      }
+      // Explicit user action: adopt the orphan so it becomes startable/editable again. It
+      // is reported as `adopted`, NOT as an orphan: by the time this response is written
+      // the session is stored and a following GET already says orphan:false.
       try {
-        await this.adopt(container, inspects.get(container.id) ?? null, general);
+        const cfg = await this.adopt(container, inspects.get(container.id) ?? null, general);
+        adopted.push(cfg.name);
       } catch (err) {
         this.deps.log.warn({ err, session: label }, 'adopting an orphan container failed');
+        orphans.push(label);
       }
     }
 
     const report: ReconcileReport = {
-      known: configs.length,
+      // after the (optional) adoption above, so the report describes the resulting state
+      known: this.deps.config.listSessions().length,
       running: containers.filter((c) => c.state === 'running').length,
       orphans,
+      adopted,
       missing,
     };
     this.deps.log.info({ report }, 'session reconcile');
@@ -516,46 +532,86 @@ export class SessionService {
     return out;
   }
 
-  /** ensure volumes + resolve the image + createContainer (no start, no persist). */
+  /**
+   * resolve the image + ensure volumes + createContainer (no start, no persist).
+   *
+   * The image is resolved FIRST: it is the step most likely to fail (a recipe that is not
+   * built -> 409, a custom ref that cannot be pulled -> 502) and creating
+   * porterclaude-ws-<slug> before it would leave an empty volume behind that no session
+   * owns. Whatever this call does create is rolled back when a later step throws — but only
+   * the volumes it created itself, never one that already held a workspace.
+   */
   private async createContainerFor(
     backend: DockerBackend,
     cfg: SessionConfig,
     general: GeneralConfig,
-  ): Promise<{ id: string; specHash: string; warnings: string[] }> {
+  ): Promise<{ id: string; specHash: string; warnings: string[]; freshVolumes: string[] }> {
+    const { ref: resolvedImage, imageEnvPath } = await this.resolveImage(backend, cfg, general);
+
     await this.ensureSharedVolumes();
 
+    const wanted: string[] = [];
     const workspace = workspaceMountFor(cfg, general);
-    if (workspace.type === 'volume') {
-      await backend.createVolume({
-        name: workspace.source,
-        labels: { [CONTAINER_LABELS.managed]: 'true', [CONTAINER_LABELS.session]: cfg.name },
-      });
-    }
-    if (!cfg.shareHistory) {
-      await backend.createVolume({
-        name: historyVolumeFor(cfg.name),
-        labels: { [CONTAINER_LABELS.managed]: 'true', [CONTAINER_LABELS.session]: cfg.name },
-      });
-    }
+    if (workspace.type === 'volume') wanted.push(workspace.source);
+    if (!cfg.shareHistory) wanted.push(historyVolumeFor(cfg.name));
 
-    const { ref: resolvedImage, imageEnvPath } = await this.resolveImage(backend, cfg, general);
-    const warnings: string[] = [];
-    if (!cfg.shareHistory) {
-      warnings.push(...(await this.prepareHistoryVolume(backend, cfg, general, resolvedImage)));
+    // null = the engine could not be asked; then nothing is rolled back rather than
+    // guessing that a volume is new and deleting somebody's workspace.
+    const before = wanted.length ? await this.existingVolumeNames(backend) : new Set<string>();
+    const fresh: string[] = [];
+    try {
+      for (const name of wanted) {
+        await backend.createVolume({
+          name,
+          labels: { [CONTAINER_LABELS.managed]: 'true', [CONTAINER_LABELS.session]: cfg.name },
+        });
+        if (before && !before.has(name)) fresh.push(name);
+      }
+
+      const warnings: string[] = [];
+      if (!cfg.shareHistory) {
+        warnings.push(...(await this.prepareHistoryVolume(backend, cfg, general, resolvedImage)));
+      }
+      const spec = buildContainerSpec({
+        session: cfg,
+        general,
+        resolvedImage,
+        imageType: cfg.image.type,
+        imageEnvPath,
+      });
+      const created = await backend.createContainer(spec);
+      return {
+        id: created.id,
+        specHash: spec.labels?.[CONTAINER_LABELS.specHash] ?? '',
+        warnings: [...warnings, ...(created.warnings ?? [])],
+        // the caller rolls these back too when the START or the config write fails
+        freshVolumes: fresh,
+      };
+    } catch (err) {
+      await this.removeFreshVolumes(backend, fresh);
+      throw err;
     }
-    const spec = buildContainerSpec({
-      session: cfg,
-      general,
-      resolvedImage,
-      imageType: cfg.image.type,
-      imageEnvPath,
-    });
-    const created = await backend.createContainer(spec);
-    return {
-      id: created.id,
-      specHash: spec.labels?.[CONTAINER_LABELS.specHash] ?? '',
-      warnings: [...warnings, ...(created.warnings ?? [])],
-    };
+  }
+
+  /** delete per-session volumes this process just created (rollback; never pre-existing ones). */
+  private async removeFreshVolumes(backend: DockerBackend, names: string[]): Promise<void> {
+    for (const name of names) {
+      try {
+        await backend.removeVolume(name, { force: true });
+      } catch (err) {
+        this.deps.log.warn({ err, volume: name }, 'rolling back a session volume failed');
+      }
+    }
+  }
+
+  /** names of the volumes that exist right now, or null when the engine cannot be asked. */
+  private async existingVolumeNames(backend: DockerBackend): Promise<Set<string> | null> {
+    try {
+      return new Set((await backend.listVolumes()).map((v) => v.name));
+    } catch (err) {
+      this.deps.log.debug({ err }, 'listing volumes before a session create failed');
+      return null;
+    }
   }
 
   /**

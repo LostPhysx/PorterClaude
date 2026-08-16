@@ -50,6 +50,14 @@ export interface ToolsStatus {
   present: boolean;
   lastSyncedAt: string | null;
   claudeVersion: string | null;
+  /** hash of the current docker/tools context (null when it cannot be read) */
+  contextHash: string | null;
+  /**
+   * the tools image is missing or its stored porterclaude.context-hash differs from
+   * `contextHash`, i.e. the volume still holds the entrypoint.sh / claude binaries of an
+   * older PorterClaude build. The next sync rebuilds it (mirrors RecipeStatus.outdated).
+   */
+  outdated: boolean;
   syncing: boolean;
   jobId: string | null;
 }
@@ -87,6 +95,12 @@ interface JobRecord {
 
 function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/** `sha256:0123456789ab…` — enough to identify an image in a job log. */
+function shortImageId(id: string): string {
+  const hex = id.startsWith('sha256:') ? id.slice(7) : id;
+  return `sha256:${hex.slice(0, 12)}`;
 }
 
 export class ImageService {
@@ -166,6 +180,10 @@ export class ImageService {
       const context = this.recipeContext(recipe.name);
       await this.requireDir(context.dir, `recipe context '${context.dir}'`);
 
+      // Remembered BEFORE the build so the image this tag is about to leave behind can be
+      // collected afterwards (see removeReplacedImage).
+      const previousId = (await backend.inspectImage(tag).catch(() => null))?.id ?? null;
+
       const contextHash = await hashContext(context);
       this.append(job, `building ${tag} (context hash ${contextHash.slice(0, 12)})`);
 
@@ -186,6 +204,7 @@ export class ImageService {
       });
       stream.destroy();
       this.append(job, `built ${tag}`);
+      await this.removeReplacedImage(job, previousId, tag);
     });
   }
 
@@ -217,6 +236,15 @@ export class ImageService {
     let present = false;
     let claudeVersion: string | null = null;
     let lastSyncedAt = this.lastToolsSyncAt;
+    let imageHash: string | null = null;
+    let built = false;
+
+    let contextHash: string | null = null;
+    try {
+      contextHash = await hashContext(this.toolsContext());
+    } catch (err) {
+      this.deps.log.debug({ err }, 'hashing the tools context failed');
+    }
 
     if (backend) {
       try {
@@ -227,12 +255,18 @@ export class ImageService {
       }
       try {
         const inspect = await backend.inspectImage(imageRef);
+        built = Boolean(inspect);
         claudeVersion = inspect?.labels[IMAGE_LABELS.claudeVersion] ?? null;
+        imageHash = inspect?.labels[IMAGE_LABELS.contextHash] ?? null;
         lastSyncedAt = lastSyncedAt ?? inspect?.labels[IMAGE_LABELS.builtAt] ?? null;
       } catch (err) {
         this.deps.log.debug({ err, imageRef }, 'inspecting tools image failed');
       }
     }
+
+    // A missing image counts as outdated only once the volume claims to be populated:
+    // on a fresh install "nothing built yet" is already reported by present:false.
+    const outdated = Boolean(contextHash) && (built ? imageHash !== contextHash : present);
 
     return {
       volume: general.toolsVolume,
@@ -240,6 +274,8 @@ export class ImageService {
       present,
       lastSyncedAt,
       claudeVersion,
+      contextHash,
+      outdated,
       syncing: Boolean(job),
       jobId: job?.id ?? null,
     };
@@ -247,7 +283,12 @@ export class ImageService {
 
   /**
    * Populate the shared read-only tools volume:
-   *   1. build <ns>/tools:latest from <paths.toolsDir>
+   *   1. build <ns>/tools:latest from <paths.toolsDir> when it is missing or when its
+   *      stored porterclaude.context-hash no longer matches the current context (exactly
+   *      what RecipeStatus.outdated reports for recipes); `force` rebuilds unconditionally,
+   *      pulling the base image and ignoring the layer cache. This is what makes an upgrade
+   *      take effect: re-populating the volume from a stale image would keep the old
+   *      entrypoint.sh and the old claude binaries forever.
    *   2. createVolume(general.toolsVolume) if missing
    *   3. run a one-shot container from that image with the volume mounted rw at /out
    *   4. waitContainer -> non-zero exit fails the job; then removeContainer
@@ -261,13 +302,20 @@ export class ImageService {
     const imageRef = toolsImageRef(general.imageNamespace);
 
     return this.startJob('tools-sync', general.toolsVolume, async (job) => {
-      const context: TarContextOptions = { dir: this.deps.paths.toolsDir };
+      const context = this.toolsContext();
       await this.requireDir(context.dir, `tools context '${context.dir}'`);
 
+      const contextHash = await hashContext(context);
       const existing = await backend.inspectImage(imageRef);
-      if (opts?.force || !existing) {
-        const contextHash = await hashContext(context);
-        this.append(job, `building ${imageRef}`);
+      const previousId = existing?.id ?? null;
+      const storedHash = existing?.labels[IMAGE_LABELS.contextHash] ?? null;
+      if (opts?.force || !existing || storedHash !== contextHash) {
+        const why = !existing
+          ? 'not built yet'
+          : opts?.force
+            ? 'forced'
+            : `context hash ${storedHash ? storedHash.slice(0, 12) : 'missing'} -> ${contextHash.slice(0, 12)}`;
+        this.append(job, `building ${imageRef} (${why})`);
         const stream = this.contextStream(job, context);
         await backend.buildImage({
           tag: imageRef,
@@ -278,13 +326,14 @@ export class ImageService {
             [IMAGE_LABELS.builtAt]: new Date().toISOString(),
           },
           pull: Boolean(opts?.force),
-          noCache: false,
+          noCache: Boolean(opts?.force),
           onLog: (line) => this.appendBuildLine(job, line),
           signal: job.abort.signal,
         });
         stream.destroy();
+        await this.removeReplacedImage(job, previousId, imageRef);
       } else {
-        this.append(job, `reusing existing image ${imageRef}`);
+        this.append(job, `reusing existing image ${imageRef} (context hash ${contextHash.slice(0, 12)})`);
       }
 
       this.append(job, `ensuring volume ${general.toolsVolume}`);
@@ -326,6 +375,39 @@ export class ImageService {
       this.lastToolsSyncAt = new Date().toISOString();
       this.append(job, `tools volume ${general.toolsVolume} populated`);
     });
+  }
+
+  /**
+   * Collect the image a `:latest` tag pointed at before this build.
+   *
+   * Every recipe rebuild and every tools sync re-tags `<ns>/<name>:latest`, which leaves the
+   * previous image behind UNTAGGED — 1-2 GB per recipe, ~1.2 GB per tools sync. Nothing else
+   * ever removes those, so a handful of rebuild cycles fills a small VPS (OPS-8).
+   *
+   * Deliberately conservative: only an image that (a) is no longer what the tag resolves to,
+   * (b) still exists, and (c) carries no repo tag at all is removed, and never with `force`.
+   * A container still using it answers 409 — that is an expected outcome, not a build
+   * failure, so every error is reported into the job log and swallowed.
+   */
+  private async removeReplacedImage(job: JobRecord, previousId: string | null, tag: string): Promise<void> {
+    if (!previousId) return;
+    const backend = this.deps.backends.get();
+    try {
+      const current = await backend.inspectImage(tag);
+      if (!current || current.id === previousId) return;      // the tag did not move
+      const stale = await backend.inspectImage(previousId);
+      if (!stale) return;                                      // already gone
+      if (stale.tags.length > 0) return;                       // another tag still holds it
+      await backend.removeImage(previousId, { force: false });
+      this.append(job, `removed the image replaced by this build (${shortImageId(previousId)})`);
+    } catch (err) {
+      this.deps.log.debug({ err, previousId, tag }, 'removing the replaced image failed');
+      this.append(
+        job,
+        `note: the previous image ${shortImageId(previousId)} is still in use and was kept ` +
+          `(${errMessage(err)})`,
+      );
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -483,6 +565,11 @@ export class ImageService {
   // -------------------------------------------------------------------------
   // internals
   // -------------------------------------------------------------------------
+
+  /** build context of the tools image: docker/tools, no extra files. */
+  private toolsContext(): TarContextOptions {
+    return { dir: this.deps.paths.toolsDir };
+  }
 
   private recipeContext(recipe: string): TarContextOptions {
     const recipesDir = this.deps.paths.recipesDir;

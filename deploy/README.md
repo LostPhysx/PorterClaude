@@ -10,6 +10,8 @@ key with placeholders. **Never commit a real Portainer API key.**
 ```
 deploy/
   deploy.sh              build + stack create/update + health poll
+  host-prep.sh           OPTIONAL one-off host chores (vhost, reload, cleanup), all opt-in
+  lib/common.sh          shared plumbing: secure tmpdir, curl config, API helpers
   lib/dockerignore.py    .dockerignore-aware file lister (feeds the context tar)
   lib/render_compose.py  ${VAR} / ${VAR:-default} substitution with a secret keep-list
   lib/portainer.py       JSON helpers: build-stream printer, stack lookup, request bodies
@@ -31,7 +33,8 @@ bash deploy/deploy.sh                   # build, create/update the stack, wait f
 | `--build-only` | build the image on the remote engine, do not touch the stack |
 | `--deploy-only` | skip the build, only create/update the stack |
 | `--no-wait` | skip the health poll |
-| `--tag <ref>` | override `APP_IMAGE` (default `porterclaude:local`) |
+| `--tag <ref>` | override `APP_IMAGE` for the remote build (default `porterclaude:local`) |
+| `--image <ref>` | **no remote build**: deploy an already-built or pullable image (`pullImage: true` on the stack update). The way around a reverse proxy that cuts long `/docker/build` requests |
 | `--env-file <p>` | use another env file (default `deploy/.env`) |
 | `-h`, `--help` | usage |
 
@@ -52,7 +55,11 @@ What a full run does:
    error object (`{"message": …}`), a proxy error page (nginx 502/504), an empty body and a
    stream cut short all abort the run, so a failed build can never be followed by a stack
    update that silently redeploys the *previous* image;
-5. renders `deploy/docker-compose.yml` into `deploy/.build/stack.yml`;
+5. resolves `DOCKER_GID` — from `deploy/.env`, or by asking the engine: a throwaway
+   `alpine` container that bind-mounts `/var/run/docker.sock` **read-only**, prints
+   `stat -c %g` and is removed again (it is labelled `porterclaude.managed=true`, runs with
+   `NetworkMode: none`, and a failure only warns: the compose default `999` takes over) —
+   then renders `deploy/docker-compose.yml` into `deploy/.build/stack.yml`;
 6. `GET /api/stacks` → create (`POST /api/stacks/create/standalone/string?endpointId=…`,
    falling back to the legacy `POST /api/stacks?type=2&method=string&endpointId=…` on
    404/405) or update (`PUT /api/stacks/<id>?endpointId=…` with `prune:true`,
@@ -76,6 +83,8 @@ What a full run does:
 |---|---|
 | Portainer | EE 2.39.5, endpoint `2` ("local", docker.sock) |
 | Docker host | Ubuntu 24.04, **arm64**, 4 CPU, 23 GiB, Docker 29.1.3 |
+| `/var/run/docker.sock` gid | **989** (measured 2026-08-16 — *not* the 999 the compose file defaults to) |
+| nginx-proxy `vhost.d` | bind-mounted from `/srv/nginx/vhost.d` on the host |
 | Reverse proxy | `nginxproxy/nginx-proxy` + `acme-companion` (DEFAULT_EMAIL set), ports 80/443 |
 | Proxy convention | `VIRTUAL_HOST`, `LETSENCRYPT_HOST`, `VIRTUAL_PORT`; networks `portainer_dmz` (internal) + `portainer_gate` |
 | App hostname | `claude.example.com` (DNS ready) |
@@ -100,8 +109,39 @@ proxy_request_buffering off;
 client_max_body_size 0;
 ```
 
-Then reload nginx-proxy. `deploy.sh` detects the failure mode (it dies with "the build
-request never reached the engine (HTTP 504 …)") but it cannot work around it.
+Then reload nginx-proxy. `deploy.sh` recognises the failure mode — a proxy status, an HTML
+body, or a failure landing suspiciously close to the 60 s default — and prints that snippet
+instead of a bare status code, but it cannot work around it. Two ways out:
+
+```bash
+bash deploy/host-prep.sh --dry-run --vhost --reload   # preview
+bash deploy/host-prep.sh --vhost --reload             # write both vhost files + SIGHUP
+bash deploy/deploy.sh --image ghcr.io/lostphysx/porterclaude:latest   # or skip the build
+```
+
+Still true as of 2026-08-16: a stream through this Portainer is cut after **60.1 s** with an
+HTML `504`, so this is a prerequisite for the first real deploy.
+
+## host-prep.sh
+
+Optional, never called by `deploy.sh`, and every step is opt-in — nothing happens without an
+action flag, and `--dry-run` prints exactly what each one would do.
+
+| Flag | Effect |
+|---|---|
+| `--clean` | remove containers labelled `porterclaude.managed=true` **and** named `pc-qa-*` / `pc-o1-*` (override with `HOST_PREP_PREFIXES`), together with their `porterclaude-ws-*` / `porterclaude-hist-*` volumes — the named volumes are read off the container *before* it is deleted, because `?v=1` only drops anonymous ones |
+| `--prune` | remove **dangling** images that carry a `porterclaude.*` label (a rebuild leaves 0.6–1.4 GB behind each time); `409 Conflict` = still referenced, kept |
+| `--vhost` | write `vhost.d/<portainer-host>` (long build streams) and `vhost.d/<app-host>` (idle terminal WebSockets). The host directory is read from the nginx-proxy container's own mount of `/etc/nginx/vhost.d`, falling back to `NGINX_VHOST_DIR` / `/srv/nginx/vhost.d`; the files are written by a throwaway `alpine` container with that directory bind-mounted |
+| `--reload` | `SIGHUP` the nginx-proxy container so it reloads |
+| `--all` | all four, in that order |
+| `--dry-run` | change nothing; print every action, the vhost file contents, and a final count |
+
+```bash
+bash deploy/host-prep.sh --dry-run --clean --prune --vhost --reload
+```
+
+It uses the same secret handling as `deploy.sh` (`lib/common.sh`): the API key only ever
+exists in a `chmod 600` curl config inside a `mktemp -d` directory.
 
 Because the host is arm64, the app image is built **natively there** by `deploy.sh` — no
 buildx, no emulation. (CI releases a multi-arch image to ghcr.io separately; recipe images
@@ -128,7 +168,8 @@ key and signs session cookies.
 | `SECURITY: a secret.key leaked into the build context` | a `DATA_DIR` lives inside the checkout under a name `.dockerignore`'s `data*` rule does not cover — rename it to `data…` or move it out of the repo. It holds `secret.key` + the encrypted Portainer key |
 | `SECURITY: a DATA_DIR config.json leaked into the build context` | same cause as above |
 | build error lines then a non-zero exit | the remote build failed; the printed lines are Docker's own output |
-| `the build request never reached the engine (HTTP 504 …)` | the reverse proxy in front of Portainer closed the upload before the build finished. Nothing was built and **nothing was deployed** — raise `proxy_read_timeout`/`proxy_send_timeout` for `/api/endpoints/*/docker/build` (or hit Portainer directly), then rerun |
+| `the build never reached the engine (proxy timeout)` | the reverse proxy in front of Portainer closed the request before the build finished. Nothing was built and **nothing was deployed**; the printed snippet is the fix (`host-prep.sh --vhost --reload`), or use `--image <ref>` |
+| `could not detect the docker socket gid` | the probe container could not run; put `DOCKER_GID` (from `stat -c %g /var/run/docker.sock`) into `deploy/.env`. Symptom of getting it wrong: the app starts, but Settings reports the socket as unavailable |
 | `the build endpoint did not return Docker JSON output` | the response was an HTML/plain-text error page (proxy, WAF, wrong `PORTAINER_URL` path) rather than Docker's JSON lines |
 | `the build stream ended without a success marker` | the connection dropped mid-build, so the image is incomplete; the run stops instead of redeploying the previous image |
 | `health check timed out` | check the container logs for the stack in Portainer; the proxy also needs `Upgrade`/`Connection` forwarding for terminals |

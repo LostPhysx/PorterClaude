@@ -122,9 +122,40 @@ function updateBackendBadge(settings) {
 // login modal
 // ---------------------------------------------------------------------------
 
+/** true between show()/hide() and the matching shown./hidden. bootstrap event */
+let loginTransitioning = false;
+let loginModalWired = false;
+
+function wireLoginModal(el) {
+  if (loginModalWired) return;
+  loginModalWired = true;
+  const settled = () => {
+    loginTransitioning = false;
+    syncLoginModal();
+  };
+  el.addEventListener('show.bs.modal', () => { loginTransitioning = true; });
+  el.addEventListener('hide.bs.modal', () => { loginTransitioning = true; });
+  el.addEventListener('shown.bs.modal', settled);
+  el.addEventListener('hidden.bs.modal', settled);
+}
+
+/**
+ * Bootstrap ignores show()/hide() while the modal is still animating (~300ms), so a login
+ * submitted inside the show transition (password managers, automation, a very fast Enter)
+ * used to leave the static backdrop over the shell forever. `loginVisible` is the WANTED
+ * state; this replays it whenever a transition finishes.
+ */
+function syncLoginModal() {
+  const modal = loginModal();
+  if (!modal || loginTransitioning) return;
+  if (loginVisible) modal.show();
+  else modal.hide();
+}
+
 function loginModal() {
   const el = byId('login-modal');
   if (!el || typeof bootstrap === 'undefined') return null;
+  wireLoginModal(el);
   return bootstrap.Modal.getOrCreateInstance(el);
 }
 
@@ -141,8 +172,7 @@ export function showLogin() {
   const input = byId('login-password');
   if (input) input.value = '';
   setLoginError('');
-  const modal = loginModal();
-  if (modal) modal.show();
+  syncLoginModal();
   setTimeout(() => {
     const pwd = byId('login-password');
     if (pwd) pwd.focus();
@@ -151,8 +181,7 @@ export function showLogin() {
 
 function hideLogin() {
   loginVisible = false;
-  const modal = loginModal();
-  if (modal) modal.hide();
+  syncLoginModal();
 }
 
 async function submitLogin(event) {

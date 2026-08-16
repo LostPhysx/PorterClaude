@@ -89,8 +89,14 @@ export async function reloadTools() {
         `<span class="spinner-border spinner-border-sm me-1"></span>syncing tools volume <code>${escapeHtml(s.volume || '')}</code>` +
         (s.jobId ? ` · <a href="#" data-job="${escapeHtml(s.jobId)}">view log</a>` : '');
     } else if (s.present) {
+      const badge = s.outdated
+        ? ' <span class="badge text-bg-warning">outdated</span>'
+        : '';
+      const hint = s.outdated
+        ? '<div class="small text-secondary">the tools image no longer matches <code>docker/tools</code> - sync to rebuild it and refresh the volume</div>'
+        : '';
       el.innerHTML =
-        `tools volume <code>${escapeHtml(s.volume || '')}</code> · claude ${escapeHtml(s.claudeVersion || '?')} · synced ${escapeHtml(fmtDate(s.lastSyncedAt))}`;
+        `tools volume <code>${escapeHtml(s.volume || '')}</code> · claude ${escapeHtml(s.claudeVersion || '?')} · synced ${escapeHtml(fmtDate(s.lastSyncedAt))}${badge}${hint}`;
     } else {
       el.innerHTML = `tools volume <code>${escapeHtml(s.volume || 'porterclaude-tools')}</code> is not populated - custom images cannot bootstrap Claude Code yet.`;
     }

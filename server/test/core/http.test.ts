@@ -183,6 +183,28 @@ describe('/api/settings', () => {
     expect(res.body.general.imageNamespace).toBe('porterclaude');
   });
 
+  // BE-11: path-like settings are used verbatim in every later docker call, so a bad
+  // value has to be a 422 here instead of a 502 on the next session create.
+  it('PUT /general rejects path-like fields that docker would choke on', async () => {
+    const cookie = await login();
+    const cases: Array<Record<string, unknown>> = [
+      { containerPrefix: '../x' },
+      { workspaceMount: 'relative' },
+      { containerHome: '/home/../etc' },
+      { toolsVolume: '-bad name' },
+      { imageNamespace: 'Upper/Case' },
+      { workspacesRoot: '' },
+    ];
+    for (const body of cases) {
+      const res = await request(h.app).put('/api/settings/general').set('Cookie', cookie).send(body);
+      expect(res.status, JSON.stringify(body)).toBe(422);
+      expect(res.body.error.code).toBe('validation_error');
+    }
+    const after = await request(h.app).get('/api/settings').set('Cookie', cookie);
+    expect(after.body.general.containerPrefix).toBe('pc-');
+    expect(after.body.general.workspaceMount).toBe('/workspace');
+  });
+
   it('PUT /ui persists the layout blob and the theme', async () => {
     const cookie = await login();
     const layout = { v: 1, savedAt: 123, root: { type: 'row' } };

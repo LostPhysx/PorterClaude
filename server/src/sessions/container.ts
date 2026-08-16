@@ -265,7 +265,7 @@ export function specHash(spec: CreateContainerSpec): string {
     init: spec.init ?? false,
     mounts: [...(spec.mounts ?? [])]
       .map((m) => ({ type: m.type, source: m.source, target: m.target, readOnly: m.readOnly ?? false }))
-      .sort((a, b) => `${a.target} ${a.source}`.localeCompare(`${b.target} ${b.source}`)),
+      .sort((a, b) => `${a.target}\u0000${a.source}`.localeCompare(`${b.target}\u0000${b.source}`)),
     ports: [...(spec.ports ?? [])]
       .map((p) => ({
         containerPort: p.containerPort,

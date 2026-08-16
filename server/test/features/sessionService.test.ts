@@ -61,6 +61,10 @@ describe('SessionService.create', () => {
     await expect(service.create(sessionInput({ name: 'web' }))).rejects.toThrow('disk full');
     expect(sb!.calls).toContain('removeContainer');
     expect(cfg.sessions.has('web')).toBe(false);
+    // BE-9: the volume created for that session goes with it
+    expect(sb!.log.filter((c) => c.method === 'removeVolume').map((c) => c.args[0])).toEqual([
+      'porterclaude-ws-web',
+    ]);
   });
 
   it('refuses a duplicate name (stored config)', async () => {
@@ -86,6 +90,48 @@ describe('SessionService.create', () => {
     const { service, sb } = makeService();
     await service.create(sessionInput({ name: 'web', image: { type: 'custom', ref: 'nginx:1.27' } }));
     expect(sb!.calls).toContain('pullImage');
+  });
+
+  // BE-9: a failed create must not leave porterclaude-ws-<slug> behind
+  it('creates no session volume when the image cannot be resolved', async () => {
+    const { service, sb } = makeService();
+    await expect(service.create(sessionInput({ name: 'web' }))).rejects.toMatchObject({ code: 'conflict' });
+    const created = sb!.log
+      .filter((c) => c.method === 'createVolume')
+      .map((c) => (c.args[0] as { name: string }).name);
+    expect(created).not.toContain('porterclaude-ws-web');
+    expect(sb!.calls).not.toContain('createContainer');
+  });
+
+  it('removes the volumes it just created when the container create fails', async () => {
+    const sb = stubBackend({
+      createContainer: async () => {
+        throw new Error('invalid container name');
+      },
+    });
+    const { service } = makeService({ backend: sb });
+    sb.images.set('porterclaude/node:latest', imageInspect());
+
+    await expect(
+      service.create(sessionInput({ name: 'web', shareHistory: false })),
+    ).rejects.toThrow('invalid container name');
+
+    const removed = sb.log.filter((c) => c.method === 'removeVolume').map((c) => c.args[0]);
+    expect(removed).toEqual(['porterclaude-ws-web', 'porterclaude-hist-web']);
+  });
+
+  it('keeps a workspace volume that already existed', async () => {
+    const sb = stubBackend({
+      createContainer: async () => {
+        throw new Error('boom');
+      },
+    });
+    const { service } = makeService({ backend: sb });
+    sb.images.set('porterclaude/node:latest', imageInspect());
+    sb.volumes.push({ name: 'porterclaude-ws-web', driver: 'local', labels: {} });
+
+    await expect(service.create(sessionInput({ name: 'web' }))).rejects.toThrow('boom');
+    expect(sb.calls).not.toContain('removeVolume');
   });
 });
 
@@ -239,7 +285,7 @@ describe('SessionService.reconcile / requireRunningContainer', () => {
       }),
     );
     const report = await service.reconcile();
-    expect(report).toEqual({ known: 2, running: 1, orphans: ['ghost'], missing: ['gone'] });
+    expect(report).toEqual({ known: 2, running: 1, orphans: ['ghost'], adopted: [], missing: ['gone'] });
   });
 
   it('resolves a running container for the terminal layer', async () => {
@@ -430,7 +476,10 @@ describe('SessionService orphan adoption (BE-5)', () => {
     const { service, cfg, sb } = makeService();
     sb!.containers.push(ghost());
     const report = await service.reconcile({ adopt: true });
-    expect(report.orphans).toEqual(['ghost']);
+    // BE-10: an adopted container is reported as `adopted`, not as a (still) orphan
+    expect(report.adopted).toEqual(['ghost']);
+    expect(report.orphans).toEqual([]);
+    expect(report.known).toBe(1);
     expect(cfg.sessions.has('ghost')).toBe(true);
     const [view] = await service.list();
     expect(view?.orphan).toBe(false);

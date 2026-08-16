@@ -128,6 +128,27 @@ describe('ConfigStore', () => {
     expect(files.some((f) => f.includes('corrupt'))).toBe(true);
   });
 
+  // BE-11: the API rejects these values, but a hand-edited file must not cost the user
+  // every stored session - an invalid general value falls back to its default instead.
+  it('falls back to the default for an invalid general value without quarantining the file', async () => {
+    const dir = await freshDir();
+    const { ctx: first } = await buildContext({ DATA_DIR: dir });
+    await first.config.putSession(sampleSession('alpha'));
+
+    const file = path.join(dir, 'config.json');
+    const raw = JSON.parse(await readFile(file, 'utf8'));
+    raw.general.containerPrefix = '../x';
+    raw.general.workspaceMount = 'relative';
+    await writeFile(file, JSON.stringify(raw), 'utf8');
+
+    const { ctx } = await buildContext({ DATA_DIR: dir });
+    expect(ctx.config.general().containerPrefix).toBe('pc-');
+    expect(ctx.config.general().workspaceMount).toBe('/workspace');
+    expect(ctx.config.listSessions().map((s) => s.name)).toEqual(['alpha']);
+    const files = await (await import('node:fs/promises')).readdir(dir);
+    expect(files.some((f) => f.includes('corrupt'))).toBe(false);
+  });
+
   it('stores, reads and deletes sessions (the storage B2 calls)', async () => {
     const dir = await freshDir();
     const { ctx } = await buildContext({ DATA_DIR: dir });

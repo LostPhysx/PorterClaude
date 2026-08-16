@@ -2,7 +2,7 @@
 # NOTE: this base already has a uid-1000 user called `node`; common.sh RENAMES it to `dev`
 # (usermod -l dev -d /home/dev -m node) instead of creating a second uid-1000 account.
 FROM node:22-bookworm
-ARG CLAUDE_VERSION=latest
+ARG CLAUDE_VERSION=stable
 LABEL porterclaude.recipe="node" \
       porterclaude.claude-version="${CLAUDE_VERSION}"
 ENV LANG=C.UTF-8 \

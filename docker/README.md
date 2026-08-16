@@ -55,14 +55,49 @@ hardcode an architecture — use `dpkg --print-architecture` or a `uname -m` `ca
 
 ## Versions and labels
 
-* Build arg `CLAUDE_VERSION` (default `latest`) is recorded as the label
-  `porterclaude.claude-version`. The classic builder cannot turn `RUN` output into a label,
-  so that label carries the **requested** version only.
+* Build arg `CLAUDE_VERSION` (default **`stable`** in every recipe *and* in
+  `tools/Dockerfile`, so a recipe session and a custom-image session run the same Claude
+  Code) is both **passed to the installer** by `common.sh` and recorded as the label
+  `porterclaude.claude-version`:
+
+  ```bash
+  docker build --build-arg CLAUDE_VERSION=2.1.200 …    # installs 2.1.200, label says 2.1.200
+  ```
+
+  `install.sh [version]` takes `stable`, `latest` or an exact version. `stable` is the
+  installer's own default and is therefore passed as *no* argument at all, so an older
+  installer that ignores arguments still produces what the label promises. When an exact
+  version is requested and the installer produces something else, the build log carries a
+  `[porterclaude][warn] requested claude version … but the installer produced …` line — the
+  label must never claim a version the image does not have.
 * The **exact** installed version is written to `/etc/porterclaude/claude-version` inside the
   image (`docker exec <c> cat /etc/porterclaude/claude-version`). The recipe name lands in
   `/etc/porterclaude/recipe`.
 * `porterclaude.context-hash` and `porterclaude.built-at` are added by the server at build
   time — Dockerfiles must not set them.
+
+## Disk usage: rebuilds leave the previous image behind
+
+A rebuild re-tags `porterclaude/<name>:latest`, and the image the tag pointed at before
+becomes **untagged (dangling)** — it is not deleted, and it is not small: ~0.6 GB for `base`,
+1.4 GB for `node`, ~1.2 GB for the tools image (four claude binaries). A handful of
+*Sync tools* / rebuild cycles fills a small VPS; the reference host had 23 GB of them.
+
+The server therefore removes the image a successful build replaced (`ImageService`
+`removeReplacedImage`, `server/src/images/service.ts`): only when the tag really moved, the
+old id is now untagged, and no container still uses it — a `409 Conflict` is reported into
+the job log and the image is kept. Images left over from *before* that fix, or held by a
+stopped container, still have to be collected by hand:
+
+```bash
+# on the docker host: only images this project built
+docker image prune -f --filter label=porterclaude.recipe
+docker image prune -f --filter label=porterclaude.claude-version
+```
+
+or, through the Portainer API and without shell access to the host,
+[`deploy/host-prep.sh --prune`](../deploy/README.md) (`--dry-run` first: it lists every
+image it would remove with its size).
 
 ## Runtime contract of a recipe image
 

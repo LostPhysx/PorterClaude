@@ -2,7 +2,7 @@
 # The only recipe that serves traffic: nginx on port 80, document root /workspace/public.
 # Everything runs as uid 1000 (`dev`), so every writable path lives under /tmp or /home/dev.
 FROM php:8.3-fpm-bookworm
-ARG CLAUDE_VERSION=latest
+ARG CLAUDE_VERSION=stable
 LABEL porterclaude.recipe="php" \
       porterclaude.claude-version="${CLAUDE_VERSION}"
 ENV LANG=C.UTF-8 \

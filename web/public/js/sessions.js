@@ -67,15 +67,46 @@ function workspaceLabel(session) {
   return `volume ${ws.volume || `porterclaude-ws-${session.name}`}`;
 }
 
-function portsLabel(session) {
+/**
+ * Collapse the raw runtime bindings into one entry per container port.
+ * Docker reports one binding per host address (0.0.0.0 *and* ::), so a single published
+ * port arrives twice; a container port that is both exposed and published also arrives
+ * twice (once without a host port). Exported for tests.
+ * @param {{containerPort:number, hostPort?:number, protocol?:string}[]} list
+ * @returns {{containerPort:number, hostPort?:number, protocol:string}[]}
+ */
+export function dedupePorts(list) {
+  /** @type {Map<string, any>} */
+  const byPort = new Map();
+  for (const p of Array.isArray(list) ? list : []) {
+    const containerPort = Number(p && p.containerPort);
+    if (!Number.isFinite(containerPort) || containerPort <= 0) continue;
+    const protocol = p.protocol === 'udp' ? 'udp' : 'tcp';
+    const raw = Number(p.hostPort);
+    const hostPort = Number.isFinite(raw) && raw > 0 ? raw : null;
+    const key = `${containerPort}/${protocol}/${hostPort || ''}`;
+    if (byPort.has(key)) continue;
+    byPort.set(key, { containerPort, protocol, ...(hostPort ? { hostPort } : {}) });
+  }
+  const published = new Set(
+    [...byPort.values()].filter((p) => p.hostPort).map((p) => `${p.containerPort}/${p.protocol}`),
+  );
+  // drop the bare "exposed" entry when the same port is also published
+  return [...byPort.values()].filter((p) => p.hostPort || !published.has(`${p.containerPort}/${p.protocol}`));
+}
+
+/** Ports cell markup for one session. Exported for tests. */
+export function portsLabel(session) {
   const runtime = Array.isArray(session.runtimePorts) && session.runtimePorts.length
     ? session.runtimePorts
     : session.ports || [];
-  if (!runtime.length) return '<span class="text-secondary">-</span>';
-  return runtime
+  const ports = dedupePorts(runtime);
+  if (!ports.length) return '<span class="text-secondary">-</span>';
+  return ports
     .map((p) => {
-      const host = p.hostPort ? `${p.hostPort}&rarr;` : '';
-      return `<span class="badge text-bg-light border me-1">${escapeHtml(host)}${escapeHtml(String(p.containerPort))}/${escapeHtml(p.protocol || 'tcp')}</span>`;
+      // the arrow is markup, so it must be appended AFTER escaping the numbers
+      const host = p.hostPort ? `${escapeHtml(String(p.hostPort))}&rarr;` : '';
+      return `<span class="badge text-bg-light border me-1">${host}${escapeHtml(String(p.containerPort))}/${escapeHtml(p.protocol)}</span>`;
     })
     .join('');
 }
@@ -819,8 +850,10 @@ async function reconcile() {
   try {
     const res = await api.sessions.reconcile();
     const report = (res && res.report) || {};
+    const adopted = (report.adopted || []).length;
     toast(
       `Reconciled: ${report.known ?? 0} known, ${report.running ?? 0} running, ` +
+        (adopted ? `${adopted} adopted, ` : '') +
         `${(report.orphans || []).length} orphan(s), ${(report.missing || []).length} missing`,
       { variant: 'info', title: 'Reconcile' },
     );

@@ -40,6 +40,11 @@ stat -c %g /var/run/docker.sock      # e.g. 999 — the gid, which differs per h
       - "999"        # the gid printed above
 ```
 
+The gid differs per host (Debian/Ubuntu commonly 999 or 989, Fedora 992 …), so **do not copy
+the number above**. `deploy/deploy.sh` reads it from `DOCKER_GID` in `deploy/.env` and, when
+that is unset, asks the engine itself: it runs a throwaway `alpine` container that
+bind-mounts the socket read-only, prints `stat -c %g`, and is removed again.
+
 Alternatives: `user: "0:0"` (drops the non-root hardening) or a socket proxy. Without it the
 app starts fine but Settings reports the socket as unavailable — that hint is *correct*, not
 a bug. Portainer mode needs no socket at all.
@@ -189,10 +194,29 @@ proxy_request_buffering off;  # stream the (large) build-context upload
 client_max_body_size 0;       # a build context can be tens of MB
 ```
 
-With nginx-proxy that is a file `vhost.d/<portainer-host>` on the proxy container. **Do this
-before running `deploy/deploy.sh` or building recipes from Settings → Images.** Symptom when
-it is missing: a build job that dies after ~60 s with `aborted`, or `deploy.sh` printing an
-HTML error body instead of the JSON build stream.
+With nginx-proxy that is a file `vhost.d/<portainer-host>` on the proxy container, followed
+by a reload (`docker kill -s HUP <nginx-proxy>`). **Do this before running
+`deploy/deploy.sh` or building recipes from Settings → Images.**
+
+[`deploy/host-prep.sh`](../deploy/README.md) writes both vhost files and reloads the proxy
+through the Portainer API, so it needs no shell on the host:
+
+```bash
+bash deploy/host-prep.sh --dry-run --vhost --reload   # prints the files it would write
+bash deploy/host-prep.sh --vhost --reload
+```
+
+Symptoms while it is missing: a build job that dies after ~60 s with `aborted`; `deploy.sh`
+stopping with *"the build never reached the engine (proxy timeout)"* followed by the exact
+snippet to install. Nothing is built and nothing is deployed in that case — the previous
+image is never silently redeployed.
+
+**Escape hatch.** If you cannot change the proxy, skip the remote build and deploy an image
+that already exists (CI publishes multi-arch images to ghcr.io):
+
+```bash
+bash deploy/deploy.sh --image ghcr.io/lostphysx/porterclaude:latest
+```
 
 ## Deploying via Portainer Stacks (API)
 
@@ -210,7 +234,12 @@ Older Portainer versions only have the legacy `POST /api/stacks?type=2&method=st
 [`deploy/deploy.sh`](../deploy/README.md) automates all of it — including building the image
 remotely through Portainer's Docker proxy — and keeps the API key out of the process list,
 the logs and every generated file. Run `bash deploy/deploy.sh --dry-run` first: it renders
-the artifacts without touching the network.
+the artifacts without touching the network. `--image <ref>` skips the remote build and points
+the stack at a registry image instead (`pullImage: true`).
+
+[`deploy/host-prep.sh`](../deploy/README.md) is the optional companion for the one-off host
+chores — nginx vhost snippets, proxy reload, leftover QA containers, dangling images — each
+behind its own flag and all of them previewable with `--dry-run`.
 
 ## Images
 
@@ -219,6 +248,22 @@ the artifacts without touching the network.
 * **Recipe images** (`porterclaude/<recipe>:latest`) and the **tools volume** are built by
   the app itself, on the Docker host it manages, from Settings → Images. They are therefore
   always native-arch and never pulled from a registry.
+
+### Disk: dangling images after a rebuild
+
+Every rebuild re-tags `porterclaude/<name>:latest` and leaves the **previous** image untagged
+(0.6–1.4 GB per recipe, ~1.2 GB per tools sync). The app removes the image a successful build
+replaced, unless a container still uses it. To collect what is left — old images from before
+that behaviour existed, or ones a stopped container was holding:
+
+```bash
+docker image prune -f --filter label=porterclaude.recipe          # recipe images
+docker image prune -f --filter label=porterclaude.claude-version  # + the tools image
+```
+
+Without shell access to the host, `bash deploy/host-prep.sh --prune` does the same through
+the Portainer API and only ever touches dangling images carrying a `porterclaude.*` label.
+Run it with `--dry-run` first: it prints every image and its size.
 
 ## Volumes created on the managed host
 

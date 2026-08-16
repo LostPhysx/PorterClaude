@@ -247,6 +247,7 @@ async function handleConnection(ws: WebSocket, req: IncomingMessage, ctx: AppCon
 
   stream = opened.stream;
   terminalId = opened.terminalId;
+  const execId = opened.stream.execId;
 
   send(ws, {
     type: 'ready',
@@ -284,15 +285,46 @@ async function handleConnection(ws: WebSocket, req: IncomingMessage, ctx: AppCon
     }
   });
 
-  stream.onClose((info) => {
+  // The exec ended. `info.code` is the TRANSPORT close code (the portainer backend reports
+  // the exec websocket's 1006 when the container dies), never a process status - so ask the
+  // engine for the real exit status, and when the container is no longer running close with
+  // 4409 instead of pretending the shell exited normally: the pane then shows the
+  // "session is not running" note with its Start action rather than "[process exited]".
+  const onStreamClosed = async (): Promise<void> => {
+    if (closed) return;
+    let stopped: unknown = null;
     try {
-      send(ws, { type: 'exit', code: typeof info.code === 'number' ? info.code : null });
-      ws.close(TERMINAL_CLOSE.normal, 'shell exited');
+      await ctx.sessions.requireRunningContainer(query.session);
     } catch (err) {
-      log.debug({ err }, 'closing terminal socket failed');
-    } finally {
-      cleanup();
+      const appErr = toAppError(err);
+      // only a definite "gone"/"stopped" answer overrides the normal exit path
+      if (appErr.code === 'not_found' || appErr.code === 'conflict') stopped = appErr;
+      else log.debug({ err }, 'could not confirm the session state after the exec ended');
     }
+    if (closed || ws.readyState !== WebSocket.OPEN) return;
+    if (stopped) {
+      const mapped = mapError(stopped);
+      fail(ws, mapped.code, mapped.message, mapped.close);
+      cleanup();
+      return;
+    }
+    let code: number | null = null;
+    try {
+      code = (await ctx.backends.get().execInspect(execId)).exitCode;
+    } catch (err) {
+      log.debug({ err, terminalId }, 'inspecting the finished exec failed');
+    }
+    if (closed || ws.readyState !== WebSocket.OPEN) return;
+    send(ws, { type: 'exit', code });
+    ws.close(TERMINAL_CLOSE.normal, 'shell exited');
+    cleanup();
+  };
+
+  stream.onClose(() => {
+    onStreamClosed().catch((err: unknown) => {
+      log.debug({ err }, 'closing terminal socket failed');
+      cleanup();
+    });
   });
 
   stream.onError((err) => {

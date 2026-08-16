@@ -42,13 +42,22 @@ export const LimitsSchema = z.object({
   memoryMb: z.number().int().positive().max(1024 * 1024).optional(),
 });
 
+/**
+ * Environment variable names as accepted by every POSIX shell (and by `docker exec`'s
+ * `--env`): a key like `A B` is happily stored in `Config.Env` by the engine but can never
+ * be read back inside the container, so it is rejected at the API boundary.
+ */
+export const EnvKeySchema = z
+  .string()
+  .regex(/^[A-Za-z_][A-Za-z0-9_]*$/, 'environment variable names must match [A-Za-z_][A-Za-z0-9_]*');
+
 /** What the client sends to create/update a session. */
 export const SessionInputSchema = z.object({
   name: SessionNameSchema,
   displayName: z.string().max(120).optional(),
   image: ImageRefSchema,
   workspace: WorkspaceSchema.default({ type: 'volume' }),
-  env: z.record(z.string(), z.string()).default({}),
+  env: z.record(EnvKeySchema, z.string()).default({}),
   ports: z.array(PortMapSchema).default([]),
   extraMounts: z.array(MountSchema).default([]),
   limits: LimitsSchema.default({}),
@@ -63,6 +72,10 @@ export const SessionInputSchema = z.object({
 
 /** Persisted form: input + bookkeeping. */
 export const SessionConfigSchema = SessionInputSchema.extend({
+  /** deliberately laxer than the input: a session adopted from a container may carry an
+   *  env var the engine accepted before this rule existed, and rejecting it here would
+   *  fail AppConfigSchema and quarantine the whole config.json. */
+  env: z.record(z.string(), z.string()).default({}),
   createdAt: z.string(),
   updatedAt: z.string(),
   /** sha256 of the normalised spec that produced the running container */
