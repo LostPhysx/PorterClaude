@@ -9,13 +9,17 @@ ENV LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
     PORTERCLAUDE_RECIPE=node \
     NPM_CONFIG_FUND=false \
-    NPM_CONFIG_AUDIT=false
+    NPM_CONFIG_AUDIT=false \
+    NPM_CONFIG_CACHE=/home/dev/.npm \
+    COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 
 COPY common.sh /tmp/common.sh
 RUN bash /tmp/common.sh && rm -f /tmp/common.sh
 
-# TODO(O1): recipe tooling as root:
-#   corepack enable (pnpm + yarn shims), npm cache dir under /home/dev, chown 1000:1000
+# pnpm + yarn shims, and a writable npm cache inside the session home
+RUN corepack enable || echo "[porterclaude][warn] corepack enable failed - npm still works" \
+ && mkdir -p /home/dev/.npm /home/dev/.cache \
+ && chown -R 1000:1000 /home/dev
 
 USER dev
 WORKDIR /workspace

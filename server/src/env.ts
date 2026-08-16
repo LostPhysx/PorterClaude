@@ -1,5 +1,6 @@
 // OWNER: B1. Process environment -> typed, validated config bootstrap. Env only *seeds*
 // runtime settings; the source of truth after first boot is <DATA_DIR>/config.json.
+import dotenv from 'dotenv';
 import { z } from 'zod';
 
 const boolish = z
@@ -35,7 +36,30 @@ export const EnvSchema = z.object({
 
 export type Env = z.infer<typeof EnvSchema>;
 
-/** TODO(B1): load .env via dotenv (dev only), parse, and produce a friendly error on failure. */
+let dotenvApplied = false;
+
+/**
+ * Load `.env` (development only, never in production images), then validate.
+ * Empty-string values are treated as "unset" so an empty compose variable does not turn
+ * into a validation error.
+ */
 export function loadEnv(source: NodeJS.ProcessEnv = process.env): Env {
-  throw new Error('TODO(B1): implement loadEnv');
+  if (source === process.env && !dotenvApplied && process.env.NODE_ENV !== 'production') {
+    dotenvApplied = true;
+    dotenv.config({ override: false });
+  }
+
+  const cleaned: Record<string, string> = {};
+  for (const [k, v] of Object.entries(source)) {
+    if (typeof v === 'string' && v !== '') cleaned[k] = v;
+  }
+
+  const parsed = EnvSchema.safeParse(cleaned);
+  if (!parsed.success) {
+    const details = parsed.error.issues
+      .map((i) => `  - ${i.path.join('.') || '(env)'}: ${i.message}`)
+      .join('\n');
+    throw new Error(`invalid environment configuration:\n${details}`);
+  }
+  return parsed.data;
 }

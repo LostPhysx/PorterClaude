@@ -21,6 +21,20 @@
 .pc-rail-item:hover { background: var(--bs-secondary-bg); }
 .pc-rail-item.is-stopped { opacity: .55; }
 
+/* rail rows: name grows, the two quick actions only appear on hover/focus */
+.pc-rail-head { flex: 0 0 auto; }
+.pc-rail-foot { flex: 0 0 auto; }
+.pc-rail-name { font-size: .85rem; min-width: 0; }
+.pc-rail-actions {
+  flex: 0 0 auto;
+  opacity: 0;
+  transition: opacity .12s ease-in-out;
+  white-space: nowrap;
+}
+.pc-rail-item:hover .pc-rail-actions,
+.pc-rail-item:focus-within .pc-rail-actions { opacity: 1; }
+.pc-rail-actions .btn { line-height: 1; }
+
 .pc-code-main {
   flex: 1 1 auto;
   min-width: 0;
@@ -29,6 +43,7 @@
 }
 
 .pc-code-toolbar { flex: 0 0 auto; }
+.pc-code-toolbar #code-session-select { max-width: 16rem; }
 
 /* GoldenLayout mount point: must be positioned and sized, never auto-height. */
 .pc-code-root {
@@ -51,16 +66,83 @@
 /* one terminal pane inside a GoldenLayout component container */
 .pc-pane { display: flex; flex-direction: column; height: 100%; background: #0d1117; }
 .pc-pane-term { flex: 1 1 auto; min-height: 0; padding: 2px 4px; }
+.pc-pane-notes { flex: 0 0 auto; }
 .pc-pane-note {
   flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: .5rem;
   font-size: 11px;
+  line-height: 1.5;
   padding: 2px 6px;
   background: var(--bs-warning-bg-subtle);
   color: var(--bs-warning-text-emphasis);
+  border-bottom: 1px solid rgba(0, 0, 0, .25);
 }
+.pc-pane-note-text { flex: 1 1 auto; min-width: 0; }
+.pc-pane-note-info {
+  background: var(--bs-info-bg-subtle);
+  color: var(--bs-info-text-emphasis);
+}
+.pc-pane-note-warning {
+  background: var(--bs-warning-bg-subtle);
+  color: var(--bs-warning-text-emphasis);
+}
+.pc-pane-note-danger {
+  background: var(--bs-danger-bg-subtle);
+  color: var(--bs-danger-text-emphasis);
+}
+.pc-pane-note-action {
+  flex: 0 0 auto;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-decoration: underline;
+  padding: 0 .25rem;
+  cursor: pointer;
+}
+.pc-pane-note-action:hover { text-decoration: none; opacity: .8; }
 .pc-pane .xterm { height: 100%; }
+.pc-pane .xterm-viewport { overflow-y: auto; }
 
-/* GoldenLayout dark theme is linked in index.html; nudge it toward Bootstrap's palette.
-   TODO(F2): tab strip colours, drag proxy, splitter width, light-theme overrides under
-   [data-bs-theme="light"]. */
+/* GoldenLayout dark theme is linked in index.html; nudge it toward Bootstrap's palette
+   and provide the light-theme variant here (only the dark stylesheet is loaded). */
 .lm_goldenlayout { background: transparent; }
+.lm_content { background: #0d1117; border: 0; }
+.lm_header {
+  background: var(--bs-tertiary-bg);
+  height: 22px;
+}
+.lm_header .lm_tabs { padding-left: 2px; }
+.lm_header .lm_tab {
+  font-family: var(--pc-mono, monospace);
+  font-size: 11px;
+  height: 20px;
+  padding: 2px 22px 2px 8px;
+  margin-right: 2px;
+  background: var(--bs-secondary-bg);
+  color: var(--bs-secondary-color);
+  border: 0;
+  box-shadow: none;
+}
+.lm_header .lm_tab.lm_active {
+  background: #0d1117;
+  color: var(--bs-emphasis-color);
+  box-shadow: none;
+}
+.lm_header .lm_tab .lm_title { line-height: 16px; }
+.lm_splitter { background: var(--bs-border-color); opacity: .6; }
+.lm_splitter:hover, .lm_splitter.lm_dragging { background: var(--bs-primary); opacity: 1; }
+.lm_splitter.lm_vertical .lm_drag_handle { height: 100%; }
+.lm_dragProxy .lm_content, .lm_dropTargetIndicator { border: 1px solid var(--bs-primary); }
+.lm_dropTargetIndicator { background: rgba(13, 110, 253, .15); box-shadow: none; }
+.lm_maximised .lm_header { background: var(--bs-tertiary-bg); }
+
+[data-bs-theme="light"] .pc-pane { background: #ffffff; }
+[data-bs-theme="light"] .lm_content { background: #ffffff; }
+[data-bs-theme="light"] .lm_header .lm_tab.lm_active { background: #ffffff; }
+[data-bs-theme="light"] .lm_header .lm_tab { color: var(--bs-secondary-color); }
+[data-bs-theme="light"] .lm_header .lm_tab .lm_close_tab { filter: invert(1); }
+[data-bs-theme="light"] .lm_controls > li { filter: invert(1); }
+[data-bs-theme="light"] .pc-pane-note { border-bottom-color: rgba(0, 0, 0, .1); }

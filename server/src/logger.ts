@@ -8,6 +8,8 @@ export const REDACT_PATHS = [
   'req.headers.cookie',
   'req.headers.authorization',
   'req.headers["x-api-key"]',
+  // the response header carries a freshly issued session JWT -- never write it to a log
+  'res.headers["set-cookie"]',
   '*.apiKey',
   '*.password',
   '*.newPassword',
@@ -16,7 +18,26 @@ export const REDACT_PATHS = [
   'password',
 ];
 
-/** TODO(B1): pretty transport when NODE_ENV=development, plain JSON otherwise. */
+/** pretty transport when NODE_ENV=development, plain JSON otherwise. */
 export function createLogger(env: Env): Logger {
-  throw new Error('TODO(B1): implement createLogger');
+  const options: pino.LoggerOptions = {
+    level: env.LOG_LEVEL,
+    redact: { paths: REDACT_PATHS, censor: '[redacted]' },
+  };
+
+  if (env.NODE_ENV === 'development') {
+    try {
+      return pino({
+        ...options,
+        transport: {
+          target: 'pino-pretty',
+          options: { colorize: true, translateTime: 'HH:MM:ss.l', ignore: 'pid,hostname' },
+        },
+      });
+    } catch {
+      // pino-pretty is a devDependency: fall through to plain JSON when it is absent.
+    }
+  }
+
+  return pino(options);
 }

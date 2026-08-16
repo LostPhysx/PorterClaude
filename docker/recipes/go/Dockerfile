@@ -13,7 +13,9 @@ ENV LANG=C.UTF-8 \
 COPY common.sh /tmp/common.sh
 RUN bash /tmp/common.sh && rm -f /tmp/common.sh
 
-# TODO(O1): mkdir -p $GOPATH $GOCACHE && chown -R 1000:1000 /home/dev/go /home/dev/.cache
+# module + build caches inside the session home, owned by uid 1000
+RUN mkdir -p /home/dev/go/bin /home/dev/go/pkg /home/dev/.cache/go-build \
+ && chown -R 1000:1000 /home/dev
 
 USER dev
 WORKDIR /workspace

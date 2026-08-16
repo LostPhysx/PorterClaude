@@ -94,7 +94,10 @@ knows `attachTerminalWs`, B1 and B2 never touch the same file.
    read/create `config.json`, migrate by `version`, then seed **only what is unset**:
    `APP_PASSWORD` → `auth.passwordHash` (when null), `PORTERCLAUDE_BACKEND`/`PORTAINER_*`
    → `backend.*` (when `backend.kind === 'none'`).
-6. `new BackendManager({config, env, log})`; `config.on('change', () => backends.invalidate())`.
+6. `new BackendManager({config, env, log})`; `config.on('change', () => backends.invalidateIfChanged())`
+   — the instance is only rebuilt when the *backend* section actually changed (UI layout
+   autosave, session writes and password changes must not tear down a transport that
+   still carries running builds/pulls/execs).
 7. `new SessionService(deps)`, `new ImageService(deps)`, `new TerminalService(deps, sessions)`.
 8. `createAuthService(...)`, assemble `AppContext`.
 9. `createApp(ctx)` → `http.createServer(app)`.
@@ -176,7 +179,8 @@ Docker Engine API; only transport, auth and the exec stream differ.
   keeps status 404 so services can distinguish "missing" from "broken".
 * `BackendManager.get()` throws `AppError.backendNotConfigured()` when settings are
   incomplete; `tryGet()` returns null (health, settings screen). The instance is cached and
-  dropped on every config change.
+  dropped only when the backend settings change (`invalidateIfChanged()`); `close()` on the
+  old instance never destroys sockets that still carry in-flight requests.
 * Nothing in this layer ever logs the API key or the raw `X-API-Key` header.
 
 ## 7. Sessions
@@ -199,7 +203,9 @@ mounts      porterclaude-claude        -> /home/dev/.claude
             porterclaude-tools (ro)    -> /opt/porterclaude   (custom images only)
             porterclaude-hist-<slug>   -> /home/dev/.claude/projects   (shareHistory=false)
 env         PORTERCLAUDE_SESSION=<slug>, TERM=xterm-256color, + user env
-            custom images: PORTERCLAUDE_TOOLS=/opt/porterclaude, PORTERCLAUDE_HOME=/home/dev
+            custom images: PORTERCLAUDE_TOOLS=/opt/porterclaude, PORTERCLAUDE_HOME=/home/dev,
+                           HOME=/home/dev,
+                           PATH=/opt/porterclaude/bin:/home/dev/.local/bin:<image PATH>
 custom      entrypoint ["/opt/porterclaude/entrypoint.sh"], cmd ["sleep","infinity"]
 recipes     entrypoint/cmd from the image (sleep infinity)
 workingDir  /workspace   init true   pidsLimit 4096
@@ -208,6 +214,45 @@ resources   cpus -> NanoCpus, memoryMb -> Memory
 ```
 
 Flows
+* **HOME for custom images**: docker inherits `HOME` from the image, which is `/root` for
+  the root images people usually pick — claude would then write `~/.claude` and
+  `~/.claude.json` to `/root`, outside the shared volumes, and "log in once, every session
+  authenticated" would silently not hold. `buildContainerSpec` therefore pins
+  `HOME=<containerHome>` for custom images (recipes already have it right). A user-supplied
+  `env.HOME` still wins. A root custom image writes into the uid-1000 shared volume as
+  root, so `validateCustomImage` warns about it.
+* **non-root custom images** (session `user`, or an image with its own `USER`): docker
+  creates the mountpoint parent `<containerHome>` in the container layer as `root:root`,
+  so the tools entrypoint - which runs as that unprivileged uid - can write neither
+  `/etc/profile.d/porterclaude.sh` nor `$HOME/.profile` / `.bashrc` (no PATH persistence)
+  nor the `$HOME/.claude.json` symlink, and the root-only `/usr/local/bin/claude` wrapper
+  is not installed either. Without help such a session has no usable `claude` at all.
+  The contract is therefore:
+  1. `buildContainerSpec` pins `PATH=<toolsMount>/bin:<containerHome>/.local/bin:<image
+     PATH>` in the **container env** (the image PATH comes from `inspectImage`; the docker
+     default is the fallback). Every `docker exec` inherits it, so no rc file is needed.
+     `SessionView.needsRecreate` recomputes the spec with the image PATH recovered from the
+     container env (`imagePathFromEnv`), otherwise custom sessions would flap.
+  2. `afterStart` runs `chown <user> <containerHome>` (plus the shared claude dirs when they
+     are still root-owned) as **uid 0** via exec - the only way in, since nothing inside the
+     container runs as root before the entrypoint - and then re-runs
+     `<toolsMount>/entrypoint.sh --porterclaude-bootstrap` as the session user, which now
+     persists PATH and links `~/.claude.json`. Both steps are best effort.
+  3. `TerminalService.open` additionally passes `PATH` in the exec env and re-exports it
+     inside the `sh -lc` command (see section 8), because a login shell re-sources
+     `/etc/profile`, which on Debian & co overwrites PATH unconditionally.
+* **private history**: `porterclaude-hist-<slug>` overlays `<home>/.claude/projects`, a
+  path *inside* the shared claude volume. If that directory does not exist yet, docker
+  creates it as `root:root` while wiring the mount and the fresh history volume is
+  root-owned too — the session cannot write its own history and, worse, the root-owned
+  `projects` directory stays behind in the SHARED volume and breaks history for every other
+  session. `create`/`recreate` therefore run a one-shot root container first
+  (`porterclaude-histinit-<rand>`, *not* labelled `porterclaude.managed`) which mounts the
+  shared volume at its real path (so docker's empty-volume seeding still copies the image's
+  uid-1000 ownership) plus the history volume at `/pc-hist`, creates `projects` and chowns
+  both to the owner of the shared volume root. It is best effort: a failure becomes a
+  session warning. In addition every start runs a root exec that re-creates/re-chowns
+  `<home>/.claude/projects`, which self-heals volumes damaged by older builds.
 * **create**: validate name free (config **and** container) → `ensureSharedVolumes()` →
   create the workspace/history volumes → resolve the image (recipe → `<ns>/<recipe>:latest`,
   must exist, else `409` "recipe not built"; custom → pull when missing) → `createContainer`
@@ -219,11 +264,22 @@ Flows
   `porterclaude-ws-<slug>` / `porterclaude-hist-<slug>` (never the shared volumes) → drop
   the config entry.
 * **reconcile**: list containers filtered by `porterclaude.managed=true`; match on the
-  `porterclaude.session` label. Containers without a stored config are adopted as
-  `orphan:true` views (best-effort config reconstructed from labels/inspect) so losing
-  `/data` does not lose your sessions. Stored sessions with no container get
-  `status:'absent'`. `needsRecreate` = the container's `spec-hash` label ≠ the hash of the
-  spec the current config would produce.
+  `porterclaude.session` label. Containers without a stored config are shown as
+  `orphan:true` views whose definition is reconstructed from labels + inspect, so losing
+  `/data` does not lose your sessions. The reconstruction is **lossless as far as docker
+  remembers**: name/image/workspace/shareHistory/user plus `env` (Config.Env minus the
+  image's own env and minus everything `buildContainerSpec` sets), `ports`
+  (HostConfig.PortBindings, runtime bindings as fallback), `extraMounts` (every mount that
+  is not one of ours), `limits` (NanoCpus/Memory), `network` (NetworkMode) and `autoStart`
+  (RestartPolicy) - because that definition is what a later Recreate/Edit rebuilds from.
+  **Adoption** (persisting it) only happens on an explicit user action: `POST
+  /api/sessions/reconcile` (`reconcile({adopt:true})`), or the first
+  `start`/`recreate`/`PUT` on the session. The startup `reconcile()` deliberately does not
+  adopt, so an orphan stays visible as `orphan:true` instead of being silently rewritten
+  into a reconstructed definition. A freshly adopted session does not report
+  `needsRecreate` (its definition describes that container by construction). Stored
+  sessions with no container get `status:'absent'`. `needsRecreate` = the container's
+  `spec-hash` label differs from the hash of the spec the current config would produce.
 * **git workspace**: the volume is seeded on first start with a `git clone` exec inside the
   container (the recipe images ship git); failures become a `warnings[]` entry, not a 500.
 
@@ -239,12 +295,18 @@ Command matrix (`buildTerminalCommand`):
 
 | tmux | shell | command |
 |---|---|---|
-| yes | bash | `sh -lc "exec tmux new-session -A -s pc_<name> bash -l"` |
-| yes | claude | `sh -lc "exec tmux new-session -A -s pc_<name> sh -lc 'claude; exec bash -l'"` |
+| yes | bash | `sh -lc "exec tmux new-session -A -s pc_<name> <login> -l"` |
+| yes | claude | `sh -lc "exec tmux new-session -A -s pc_<name> sh -lc 'claude; exec <login> -l'"` |
 | yes | sh | `sh -lc "exec tmux new-session -A -s pc_<name> sh -l"` |
 | no | bash | `["bash","-l"]` (→ `["sh","-l"]` when bash is missing) |
-| no | claude | `["sh","-lc","claude; exec bash -l"]` |
+| no | claude | `["sh","-lc","claude; exec <login> -l"]` |
 | no | sh | `["sh","-l"]` |
+
+`<login>` is `bash` when the container has bash and `sh` otherwise. The fallback applies to
+the **tmux rows too**: the tools entrypoint installs tmux into images that ship no bash
+(alpine & co), where `tmux new-session … bash -l` cannot spawn its pane command and the
+exec exits immediately. `command -v bash` is therefore probed on every open (cached like
+the tmux probe), not only when tmux is missing.
 
 * `tmux new-session -A` attaches when `pc_<name>` exists and creates it otherwise — that is
   the entire reconnect story. `reattached` in the `ready` message comes from a
@@ -252,7 +314,12 @@ Command matrix (`buildTerminalCommand`):
 * tmux presence is probed with `command -v tmux` through `runExec`, cached ~60 s per
   container id (a `tools` sync or a package install can change it).
 * Exec env: `TERM=xterm-256color`, `COLORTERM=truecolor`, `LANG=C.UTF-8`; `workingDir`
-  `/workspace`; `user` from the session config when set.
+  `/workspace`; `user` from the session config when set. **Custom images** additionally get
+  `PATH=<toolsMount>/bin:<containerHome>/.local/bin:<container PATH>` (read from
+  `inspectContainer`, cached per container like the probes), and every `sh -lc` row is
+  prefixed with `PATH='<toolsMount>/bin:<containerHome>/.local/bin':$PATH; export PATH; `.
+  The prefix runs *after* `sh -l` sourced `/etc/profile`, which is what makes `claude`
+  resolvable in an image that resets PATH there and cannot write an rc file (section 7).
 * Resize: `{type:'resize'}` → `stream.resize()` → `execResize` (REST on both backends).
 * Backpressure: drop the socket when `ws.bufferedAmount` exceeds 4 MiB.
 * Shutdown: `terminals.closeAll()` closes every exec stream and socket with code 1000.

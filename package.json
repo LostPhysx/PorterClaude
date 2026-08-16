@@ -14,7 +14,9 @@
     "typecheck": "npm run typecheck --workspaces --if-present",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
-    "test": "npm run test --workspaces --if-present"
+    "test": "npm run test --workspaces --if-present",
+    "deploy": "bash deploy/deploy.sh",
+    "deploy:dry": "bash deploy/deploy.sh --dry-run"
   },
   "devDependencies": {
     "@eslint/js": "^9.17.0",

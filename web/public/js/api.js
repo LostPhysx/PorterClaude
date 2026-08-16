@@ -2,7 +2,7 @@
 // api.settings.get(), api.settings.putUi() and terminalWsUrl(). Do not rename/remove; adding
 // is fine. Every path/shape comes from docs/design/api.md (authoritative).
 //
-// Only `request()` and `ApiError` plumbing are TODO(F1); every endpoint helper below is
+// `request()` and the ApiError plumbing are implemented below; every endpoint helper is
 // already wired and must keep working exactly as written.
 import { bus, EVENTS } from './bus.js';
 
@@ -33,29 +33,104 @@ export class ApiError extends Error {
   }
 }
 
+/** Default per-request timeout (ms). Builds/pulls are polled, so nothing here is long. */
+export const DEFAULT_TIMEOUT_MS = 30000;
+
+/** Build '/api/<path>?<query>' dropping undefined/null/'' query values. */
+function buildUrl(path, query) {
+  let url = `${API_BASE}${path}`;
+  if (query) {
+    const qs = new URLSearchParams();
+    for (const [key, value] of Object.entries(query)) {
+      if (value === undefined || value === null || value === '') continue;
+      qs.set(key, String(value));
+    }
+    const s = qs.toString();
+    if (s) url += `${url.includes('?') ? '&' : '?'}${s}`;
+  }
+  return url;
+}
+
+/**
+ * Paths whose 401 means "wrong credentials in this form", not "session expired".
+ * A 401 from these must never tear the UI down into the login modal.
+ */
+const CREDENTIAL_CHECK_PATHS = ['/auth/', '/settings/password'];
+
+function isCredentialCheckPath(path) {
+  return CREDENTIAL_CHECK_PATHS.some((p) => path === p || path.startsWith(p));
+}
+
+/** Turn a failed jqXHR into an ApiError following the api.md envelope. */
+function errorFromXhr(jqXHR, textStatus) {
+  const status = jqXHR ? jqXHR.status || 0 : 0;
+  let envelope = jqXHR && jqXHR.responseJSON ? jqXHR.responseJSON : null;
+  if (!envelope && jqXHR && typeof jqXHR.responseText === 'string' && jqXHR.responseText) {
+    try {
+      envelope = JSON.parse(jqXHR.responseText);
+    } catch {
+      envelope = null;
+    }
+  }
+  const err = envelope && envelope.error ? envelope.error : null;
+  if (err && err.code) {
+    return new ApiError(String(err.code), status, err.message || String(err.code), err.details ?? null);
+  }
+  if (textStatus === 'timeout') {
+    return new ApiError('timeout', 0, 'The server took too long to answer');
+  }
+  if (status === 0) {
+    return new ApiError('network', 0, 'Server unreachable');
+  }
+  if (textStatus === 'parsererror') {
+    return new ApiError('parse_error', status, 'The server sent a malformed response');
+  }
+  return new ApiError('internal', status, (jqXHR && jqXHR.statusText) || 'Request failed');
+}
+
 /**
  * The single HTTP entry point. Everything else delegates here.
  *
- * TODO(F1):
- *  - use jQuery `$.ajax({ url, method, contentType:'application/json', dataType:'json',
- *    data: body ? JSON.stringify(body) : undefined, timeout })`; same-origin so the
- *    `pc_session` cookie is sent automatically (do NOT set withCredentials/CORS headers).
- *  - resolve with the parsed JSON body; resolve with `null` for 204/empty bodies.
- *  - on failure build an ApiError from the `{error:{code,message,details}}` envelope;
- *    fall back to ('network', 0, ...) when there is no JSON body (jqXHR.status === 0)
- *    and ('internal', status, statusText) otherwise.
- *  - on 401 for anything other than `/auth/*`: emit `bus.emit(EVENTS.AUTH_REQUIRED)`
- *    exactly once per failed request, then still reject with the ApiError.
- *  - `query`: append with URLSearchParams, dropping undefined/null/'' values.
+ * Same-origin, so the `pc_session` cookie rides along automatically (no CORS options).
+ * Resolves with the parsed JSON body, or `null` for 204/empty responses; rejects with an
+ * ApiError. A 401 emits `auth:required` once before rejecting, except on endpoints where
+ * 401 means "the credentials you just typed are wrong" rather than "your session is gone":
+ * `/auth/*`, `/settings/password` (api.md: 401 = wrong currentPassword, the caller's own
+ * cookie stays valid and is refreshed on success), and any call passing `noAuthEvent`.
  *
  * @param {'GET'|'POST'|'PUT'|'DELETE'} method
  * @param {string} path path under /api, e.g. '/sessions/web/start'
- * @param {{ body?: unknown, query?: Record<string, unknown>, timeoutMs?: number }} [opts]
+ * @param {{ body?: unknown, query?: Record<string, unknown>, timeoutMs?: number,
+ *           noAuthEvent?: boolean }} [opts]
  * @returns {Promise<any>}
  */
 export function request(method, path, opts = {}) {
-  void method; void path; void opts;
-  throw new Error('TODO(F1): implement request()');
+  const url = buildUrl(path, opts.query);
+  const hasBody = opts.body !== undefined && opts.body !== null;
+  return new Promise((resolve, reject) => {
+    $.ajax({
+      url,
+      method,
+      dataType: 'json',
+      contentType: hasBody ? 'application/json' : false,
+      data: hasBody ? JSON.stringify(opts.body) : undefined,
+      timeout: typeof opts.timeoutMs === 'number' ? opts.timeoutMs : DEFAULT_TIMEOUT_MS,
+    })
+      .done((data, _textStatus, jqXHR) => {
+        if (!jqXHR || jqXHR.status === 204 || jqXHR.status === 205 || data === undefined) {
+          resolve(null);
+          return;
+        }
+        resolve(data);
+      })
+      .fail((jqXHR, textStatus) => {
+        const err = errorFromXhr(jqXHR, textStatus);
+        if (err.status === 401 && !opts.noAuthEvent && !isCredentialCheckPath(path)) {
+          bus.emit(EVENTS.AUTH_REQUIRED, {});
+        }
+        reject(err);
+      });
+  });
 }
 
 const get = (p, query) => request('GET', p, { query });
@@ -88,7 +163,12 @@ export const api = {
     /** @param {{layout?:unknown, theme?:'auto'|'light'|'dark'}} ui */
     putUi: (ui) => put('/settings/ui', ui),
     changePassword: (currentPassword, newPassword) =>
-      post('/settings/password', { currentPassword, newPassword }),
+      // noAuthEvent: a 401 here means the typed currentPassword was wrong; the session cookie
+      // is untouched, so this must not trigger the global re-login flow.
+      request('POST', '/settings/password', {
+        body: { currentPassword, newPassword },
+        noAuthEvent: true,
+      }),
     vendor: () => get('/settings/vendor'),
   },
 

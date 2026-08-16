@@ -14,10 +14,13 @@ RUN apt-get update \
 
 COPY fetch-claude.sh entrypoint.sh populate.sh /usr/local/bin/
 
-# TODO(O1):
-#   chmod 0755 the three scripts, mkdir -p /payload/bin,
-#   cp /usr/local/bin/entrypoint.sh /payload/entrypoint.sh,
-#   CLAUDE_VERSION="${CLAUDE_VERSION}" /usr/local/bin/fetch-claude.sh
-RUN true
+# fetch-claude.sh downloads the native binaries for all four targets (with an installer
+# fallback for the host architecture) and writes the dispatcher + VERSION into /payload.
+RUN chmod 0755 /usr/local/bin/fetch-claude.sh /usr/local/bin/entrypoint.sh /usr/local/bin/populate.sh \
+ && mkdir -p /payload/bin \
+ && cp /usr/local/bin/entrypoint.sh /payload/entrypoint.sh \
+ && chmod 0755 /payload/entrypoint.sh \
+ && CLAUDE_VERSION="${CLAUDE_VERSION}" /usr/local/bin/fetch-claude.sh \
+ && chmod -R a+rX /payload
 
 CMD ["/usr/local/bin/populate.sh"]

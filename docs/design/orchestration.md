@@ -72,7 +72,7 @@ From `docs/design/backend.md` §7/§9 and the backend planner's handoff. Hard re
 | Recipe runtime | user `dev` **uid 1000**, `HOME=/home/dev`, `WORKDIR /workspace`, idles via `sleep infinity`, ships `git tmux ripgrep jq curl` (+ `gh`, `unzip`) |
 | Session mounts | `porterclaude-claude` → `/home/dev/.claude`, `porterclaude-claude-home` → `/home/dev/.claude-home`, workspace → `/workspace`, `porterclaude-tools` (ro) → `/opt/porterclaude`, `porterclaude-hist-<slug>` → `/home/dev/.claude/projects` |
 | Tools image | `docker/tools/Dockerfile`, tagged `porterclaude/tools:latest`; its default `CMD` populates `/out` and exits 0; the result contains an **executable** `entrypoint.sh` |
-| Custom sessions | entrypoint `["/opt/porterclaude/entrypoint.sh"]`, cmd `["sleep","infinity"]`, env `PORTERCLAUDE_TOOLS=/opt/porterclaude`, `PORTERCLAUDE_HOME=/home/dev`, `PORTERCLAUDE_SESSION=<slug>` |
+| Custom sessions | entrypoint `["/opt/porterclaude/entrypoint.sh"]`, cmd `["sleep","infinity"]`, env `PORTERCLAUDE_TOOLS=/opt/porterclaude`, `PORTERCLAUDE_HOME=/home/dev`, `HOME=/home/dev` (pinned so exec'ed terminals do not inherit the image's `/root`), `PORTERCLAUDE_SESSION=<slug>` |
 | App image | start command `node server/dist/index.js`, `PORT=8080`, `DATA_DIR=/data`, healthcheck `GET /api/health`, `docker/` copied next to `server/` (`PORTERCLAUDE_DOCKER_DIR` defaults to `<repoRoot>/docker`, and `repoRoot = dirname(serverRoot)`), `web/public` present, `node_modules` present (vendor assets are served out of it) |
 | Builds | classic Docker Engine `/build` API — **no BuildKit syntax, no `RUN --mount`, no heredoc `COPY <<EOF`, no `--platform`**. Native-arch builds only; the same Dockerfile must work on amd64 and arm64 |
 
@@ -119,7 +119,14 @@ Responsibilities, in order:
      gid 1000 exists) — do **not** delete it;
    * else `groupadd -g 1000 dev` (skip when gid 1000 is taken) +
      `useradd -m -u 1000 -g dev -s /bin/bash dev`;
-   * `mkdir -p /home/dev/.claude /home/dev/.claude-home /workspace` and `chown -R 1000:1000`
+   * `mkdir -p /home/dev/.claude/projects /home/dev/.claude-home /workspace` and
+     `chown -R 1000:1000` (`chmod 0700` on `projects`). `projects` **must** ship in the
+     image: when a `shareHistory:false` session mounts `porterclaude-hist-<slug>` at
+     `/home/dev/.claude/projects`, docker creates a missing mountpoint inside the shared
+     volume as `root:root` and every uid-1000 session then gets `EACCES` on
+     `~/.claude/projects`. Shipping it lets docker's copy-up seed both the shared volume
+     and each fresh history volume with the right owner; the server repairs volumes that
+     already exist (`backend.md` §7, `prepareHistoryVolume`/`ensureProjectsDir`).
      them. Docker copies image content + ownership into an *empty* named volume on first
      use, which is exactly what makes uid 1000 own the shared login volume.
 6. **Claude Code via the native installer**, installed *outside* `$HOME` because
@@ -258,10 +265,20 @@ RUN chmod 0755 /usr/local/bin/fetch-claude.sh /usr/local/bin/entrypoint.sh /usr/
 CMD ["/usr/local/bin/populate.sh"]
 ```
 
-`populate.sh`: `set -eu`; require `/out` to exist and be writable; `cp -a /payload/. /out/`;
-`chmod -R a+rX /out`; ensure `/out/entrypoint.sh` and `/out/bin/*` are `0755`; print what it
-wrote; `exit 0`. The server runs this container once with the tools volume mounted rw at
-`/out` and treats a non-zero exit as a failed job (`backend.md` §9).
+`populate.sh`: `set -eu`; require `/out` to exist and be writable; then **stage and
+rename** — `cp -a /payload/. /out/.pc-stage.$$/`, `chmod -R a+rX` + `0755` on
+`entrypoint.sh` and `bin/*` inside the staging directory, and finally `mv -f` every staged
+file over its target in `/out` (creating missing directories first). Print what it wrote;
+`exit 0`. The server runs this container once with the tools volume mounted rw at `/out`
+and treats a non-zero exit as a failed job (`backend.md` §9).
+
+> Why not a plain `cp -a /payload/. /out/`: re-syncing while a session is running `claude`
+> straight off the volume overwrites a **busy executable** and fails with `ETXTBSY`
+> ("Text file busy"), leaving the volume half-updated. `rename(2)` has no such restriction —
+> the running process keeps the old (now unlinked) inode and the next start picks up the new
+> binary, which is exactly the "existing sessions pick the new payload up on their next
+> restart" behaviour `docker/tools/README.md` promises. Stale `/out/.pc-stage.*` directories
+> from an interrupted run are removed at the start of the next sync.
 
 ### 4.4 `entrypoint.sh` (runtime, inside arbitrary user images)
 
@@ -271,7 +288,20 @@ Strict POSIX `sh` (busybox ash / dash must run it) and **nothing in it may abort
 container** — every step logs on failure and continues.
 
 1. `TOOLS=${PORTERCLAUDE_TOOLS:-/opt/porterclaude}`;
-   `HOME=${HOME:-${PORTERCLAUDE_HOME:-/root}}`; `export HOME`.
+   **`HOME=${PORTERCLAUDE_HOME:-${HOME:-/root}}`; `export HOME`** — `$PORTERCLAUDE_HOME`
+   wins over whatever home the image brings. That is where the server mounts the shared
+   login volumes, so honouring the image's own home (`/root` for the root images most
+   people pick, which is what `runc` derives from the passwd entry when nothing pins `HOME`)
+   would make `claude` write its credentials *outside* the shared volumes and break
+   "log in once, every session is authenticated". The server pins `HOME=<containerHome>` in
+   the container env as well, so `docker exec`ed terminals see the same home — the two
+   halves are independent on purpose.
+   Remember the image's own home in `IMAGE_HOME` for step 6: **when `PORTERCLAUDE_HOME` is
+   set, take it from the passwd entry of `id -u`, not from `$HOME`** — the server has
+   already overwritten `$HOME`, so reading it back would make `IMAGE_HOME == HOME`, turn
+   the bridge into a no-op and leave `su -` / `sudo -i` / `getpwuid()` callers in an
+   unlinked `/root`. Only without `PORTERCLAUDE_HOME` is `$HOME` the image's own answer
+   (then passwd is the fallback). `/` counts as no home.
 2. `PATH="$TOOLS/bin:$HOME/.local/bin:$PATH"`; export it and persist it best-effort:
    `/etc/profile.d/porterclaude.sh` (when writable), `$HOME/.profile`, `$HOME/.bashrc`,
    each guarded by a marker comment so repeats are no-ops. Terminals open login shells, so
@@ -288,8 +318,17 @@ container** — every step logs on failure and continues.
    symlink to it (moving an existing regular file into the volume first). Do **not**
    `chown -R` the shared volume (it is owned by uid 1000 for the recipes); when it is not
    writable, log a warning and carry on.
-6. `date -u +%FT%TZ > /tmp/porterclaude-ready` (debug marker).
-7. Idle: if the CMD is exactly `sleep infinity`, run a portable loop
+6. Bridge `$IMAGE_HOME` (when it exists and differs from `$HOME`): symlink
+   `$IMAGE_HOME/.claude` → `$HOME/.claude`, `$IMAGE_HOME/.claude-home` →
+   `$HOME/.claude-home` and `$IMAGE_HOME/.claude.json` →
+   `$HOME/.claude-home/.claude.json`, so that anything resolving `~` through the passwd
+   entry instead of `$HOME` (`su -`, `sudo -i`, node's `os.homedir()`, bash tilde
+   expansion) still lands on the shared login. Pre-existing regular files/directories are
+   **moved aside** to `<path>.pc-backup`, never deleted; an unwritable `$IMAGE_HOME` only
+   produces a warning. Step 2 also persists the PATH snippet into
+   `$IMAGE_HOME/.profile`/`.bashrc`.
+7. `date -u +%FT%TZ > /tmp/porterclaude-ready` (debug marker).
+8. Idle: if the CMD is exactly `sleep infinity`, run a portable loop
    (`while :; do sleep 3600; done`) so images whose `sleep` rejects `infinity` still stay
    up; otherwise `exec "$@"`; with no arguments, idle loop.
 

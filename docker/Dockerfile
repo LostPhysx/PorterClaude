@@ -12,17 +12,23 @@ WORKDIR /app
 COPY package.json package-lock.json* ./
 COPY server/package.json server/
 COPY web/package.json web/
-# TODO(O1): RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
-#   (the lock file is not committed yet — the fallback keeps CI and deploys working)
-RUN true
+# `npm ci` needs a lock file; it is not committed yet, so fall back to `npm install`.
+# Once package-lock.json is committed this keeps working unchanged (and gets reproducible).
+RUN if [ -f package-lock.json ]; then \
+      npm ci --no-audit --no-fund; \
+    else \
+      npm install --no-audit --no-fund; \
+    fi
 
 # ---------- stage 2: build ----------
 FROM deps AS build
 WORKDIR /app
 COPY . .
-# TODO(O1): RUN npm run build --workspaces --if-present   (tsc -> server/dist)
-#   then: RUN npm prune --omit=dev   (keeps the web workspace's vendor deps, drops tsx/vitest)
-RUN true
+# server: tsc -> server/dist ; web is plain ES modules and has no build step
+RUN npm run build --workspaces --if-present
+# drop devDependencies but KEEP the web workspace's prod deps: bootstrap, jquery, xterm and
+# golden-layout are served straight out of node_modules by server/src/vendor.ts
+RUN npm prune --omit=dev --no-audit --no-fund
 
 # ---------- stage 3: runtime ----------
 FROM node:22-bookworm-slim AS runtime
@@ -30,24 +36,32 @@ WORKDIR /app
 ENV NODE_ENV=production \
     PORT=8080 \
     HOST=0.0.0.0 \
-    DATA_DIR=/data
+    DATA_DIR=/data \
+    HOME=/home/porterclaude
 
-# TODO(O1): copy from the build stage:
-#   /app/node_modules -> ./node_modules      (vendor assets are served straight out of it)
-#   /app/server/dist  -> ./server/dist
-#   /app/server/package.json -> ./server/
-#   /app/package.json -> ./
-# and from the context: web/public -> ./web/public, web/package.json -> ./web/,
-#   docker -> ./docker   (recipe + tools build contexts, PORTERCLAUDE_DOCKER_DIR default)
+# --chown on COPY instead of a `chown -R` layer (which would duplicate node_modules)
+COPY --from=build --chown=10001:10001 /app/node_modules ./node_modules
+COPY --from=build --chown=10001:10001 /app/server/dist ./server/dist
+COPY --from=build --chown=10001:10001 /app/server/package.json ./server/
+COPY --from=build --chown=10001:10001 /app/package.json ./
+COPY --chown=10001:10001 web/public ./web/public
+COPY --chown=10001:10001 web/package.json ./web/
+# recipe + tools build contexts: the server tars <repoRoot>/docker/recipes/<name> at runtime
+COPY --chown=10001:10001 docker ./docker
 
-# TODO(O1): create an unprivileged user (uid 10001), mkdir /data, chown /data and /app,
-#   then USER 10001. NOTE for operators: socket mode needs `group_add: ["<docker gid>"]`
-#   in compose because uid 10001 is not in the host's docker group.
+# unprivileged runtime user. NOTE for operators: socket mode needs `group_add: ["<docker gid>"]`
+# in compose (stat -c %g /var/run/docker.sock) because uid 10001 is not in the host docker group.
+RUN useradd -r -u 10001 -m -d /home/porterclaude -s /usr/sbin/nologin porterclaude \
+ && mkdir -p /data \
+ && chown -R 10001:10001 /data
+
+USER 10001
 
 EXPOSE 8080
 
-# TODO(O1): HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-#   CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
-#   (no curl/wget in this image on purpose)
+# no curl/wget in this image on purpose: node's built-in fetch does the healthcheck
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
+# /data is declared by compose, not here: an implicit VOLUME confuses stack updates
 CMD ["node", "server/dist/index.js"]

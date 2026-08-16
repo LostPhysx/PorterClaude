@@ -12,44 +12,132 @@ permissions:
 
 jobs:
   node:
+    name: typecheck / lint / test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-          # NOTE: do NOT enable `cache: npm` until package-lock.json is committed —
-          # setup-node fails when the lock file is missing.
-      # TODO(O2): install (npm ci when package-lock.json exists, else npm install),
-      #   then: npm run typecheck, npm run lint, npm test
-      - run: echo "TODO(O2)"
+          # package-lock.json IS committed (O1 request 1), so setup-node's npm cache works.
+          cache: npm
+      - name: install
+        run: |
+          # the lock file is present today, so this always takes the `npm ci` branch; the
+          # fallback only exists so the workflow still runs if the lock is ever dropped.
+          if [ -f package-lock.json ]; then
+            npm ci --no-audit --no-fund
+          else
+            npm install --no-audit --no-fund
+          fi
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm test
 
   scripts:
+    name: shell + python + dry-run deploy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # TODO(O2):
-      #   shellcheck -S warning deploy/deploy.sh docker/recipes/common.sh docker/tools/*.sh
-      #   python -m compileall -q deploy/lib
-      #   cp deploy/.env.example deploy/.env.ci  (dummy key — never a real one)
-      #   bash deploy/deploy.sh --dry-run --env-file deploy/.env.ci
-      #   assert deploy/.build/context.tar and deploy/.build/stack.yml exist, and that
-      #   `tar -tf deploy/.build/context.tar` contains docker/Dockerfile but NOT deploy/.env
-      - run: echo "TODO(O2)"
+      - name: syntax floor
+        run: |
+          bash -n deploy/deploy.sh
+          bash -n docker/recipes/common.sh
+          sh -n docker/tools/entrypoint.sh
+          sh -n docker/tools/populate.sh
+          bash -n docker/tools/fetch-claude.sh
+      - name: shellcheck
+        run: |
+          shellcheck --version
+          shellcheck -S warning deploy/deploy.sh docker/recipes/common.sh docker/tools/*.sh
+      - name: python helpers compile
+        run: |
+          python3 -m compileall -q deploy/lib
+          find deploy -name __pycache__ -type d -prune -exec rm -rf {} +
+      - name: build-stream fails on everything that is not a built image
+        run: |
+          # Regression guard: build-stream used to exit 0 for a Portainer error object, an
+          # nginx error page, an empty body or a stream cut short, so deploy.sh shipped a
+          # stale image. Only a real success marker may exit 0.
+          # each helper reads the canned response body from stdin and returns non-zero (which
+          # `set -e` turns into a failed step) when build-stream disagrees with the contract
+          expect_fail() {
+            if python3 deploy/lib/portainer.py build-stream >/dev/null 2>&1; then
+              echo "FAIL: build-stream accepted $1"; return 1
+            fi
+          }
+          expect_ok() {
+            if ! python3 deploy/lib/portainer.py build-stream >/dev/null 2>&1; then
+              echo "FAIL: build-stream rejected $1"; return 1
+            fi
+          }
+          printf '%s' '{"message":"Unauthorized","details":"Invalid API key"}' | expect_fail "a portainer error object"
+          printf '%s' '<html><body>504 Gateway Time-out</body></html>' | expect_fail "an html error page"
+          printf '' | expect_fail "an empty body"
+          printf '%s\n' '{"stream":"Step 1/3 : FROM node:22"}' | expect_fail "a truncated stream"
+          printf '%s\n' '{"errorDetail":{"message":"boom"},"error":"boom"}' | expect_fail "a docker build error"
+          printf '%s\n' '{"stream":"Successfully built abc123"}' '{"aux":{"ID":"sha256:abc"}}' | expect_ok "a real build"
+          echo "build-stream contract ok"
+      - name: deploy.sh --dry-run (no network, dummy env)
+        run: |
+          # deploy/.env.example holds placeholders only — never a real key.
+          cp deploy/.env.example deploy/.env.ci
+          bash deploy/deploy.sh --dry-run --env-file deploy/.env.ci
+          test -s deploy/.build/context.tar
+          test -s deploy/.build/stack.yml
+      - name: assert the build context
+        run: |
+          tar -tf deploy/.build/context.tar > /tmp/context.txt
+          grep -qx 'docker/Dockerfile' /tmp/context.txt
+          grep -qx 'server/package.json' /tmp/context.txt
+          grep -qx 'web/package.json' /tmp/context.txt
+          if grep -qE '(^|/)deploy/\.env' /tmp/context.txt; then
+            echo "SECURITY: deploy/.env* is inside the build context"; exit 1
+          fi
+          if grep -qE '(^|/)(node_modules|\.git)/' /tmp/context.txt; then
+            echo "context contains node_modules/ or .git/"; exit 1
+          fi
+      - name: assert the rendered stack file
+        run: |
+          grep -q 'claude.example.com' deploy/.build/stack.yml
+          grep -qF 'porterclaude:local' deploy/.build/stack.yml
+          # the password must NOT be substituted: it travels in the Portainer stack env array
+          grep -qF '${APP_PASSWORD}' deploy/.build/stack.yml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rendered-stack
+          path: deploy/.build/stack.yml
+          retention-days: 7
 
   compose:
+    name: compose files validate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # TODO(O2): docker compose -f docker-compose.yml config -q
-      #   (and the rendered deploy/.build/stack.yml if the scripts job's artifacts are reused)
-      - run: echo "TODO(O2)"
+      - name: generic compose
+        env:
+          APP_PASSWORD: ci-dummy
+        run: docker compose -f docker-compose.yml config -q
+      - name: rendered reference stack
+        env:
+          APP_PASSWORD: ci-dummy
+        run: |
+          cp deploy/.env.example deploy/.env.ci
+          bash deploy/deploy.sh --dry-run --env-file deploy/.env.ci
+          docker compose -f deploy/.build/stack.yml config -q
 
   image:
+    name: app image builds (amd64)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
-      # TODO(O2): docker/build-push-action@v6 with context: ., file: docker/Dockerfile,
-      #   platforms: linux/amd64, push: false, cache-from/to: type=gha
-      - run: echo "TODO(O2)"
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64
+          push: false
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

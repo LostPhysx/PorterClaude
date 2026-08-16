@@ -1,7 +1,8 @@
 # PorterClaude recipe: base (debian:bookworm-slim). OWNER: O1.
 # Built by the server from the Docker Engine /build API with docker/recipes/base as the
-# context plus common.sh injected at the tar root. Classic builder only — no BuildKit
-# syntax, no --platform, no RUN --mount. Must build unchanged on amd64 and arm64.
+# context plus common.sh injected at the tar root. Classic builder only: no BuildKit-only
+# features (no syntax directive, no build mounts, no per-build platform override).
+# Must build unchanged on amd64 and arm64.
 FROM debian:bookworm-slim
 ARG CLAUDE_VERSION=latest
 LABEL porterclaude.recipe="base" \

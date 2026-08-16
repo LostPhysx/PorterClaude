@@ -12,8 +12,27 @@ export interface HealthResponse {
 /**
  * GET /api/health -> 200 HealthResponse   (always 200 while the process is alive;
  *                                          docker healthcheck relies on this)
- * TODO(B1)
  */
 export function createHealthRouter(ctx: AppContext): Router {
-  throw new Error('TODO(B1): implement createHealthRouter');
+  const router = Router();
+
+  router.get('/', (_req, res) => {
+    let kind: HealthResponse['backend']['kind'] = 'none';
+    let configured = false;
+    try {
+      kind = ctx.config.get().backend.kind;
+      configured = ctx.backends.isConfigured();
+    } catch {
+      // never fail the healthcheck because of a config/backend problem
+    }
+    const body: HealthResponse = {
+      status: 'ok',
+      version: ctx.version,
+      uptimeSec: Math.max(0, Math.floor((Date.now() - ctx.startedAt) / 1000)),
+      backend: { kind, configured },
+    };
+    res.json(body);
+  });
+
+  return router;
 }

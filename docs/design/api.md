@@ -362,13 +362,20 @@ Concrete URLs the UI can rely on:
 /vendor/bootstrap-icons/bootstrap-icons.css
 /vendor/jquery/jquery.min.js
 /vendor/xterm/css/xterm.css
-/vendor/xterm/lib/xterm.js            (UMD)   |  /vendor/xterm/lib/xterm.mjs (ESM)
-/vendor/xterm-addon-fit/addon-fit.js           |  …/addon-fit.mjs
+/vendor/xterm/lib/xterm.js            (UMD; no .mjs is published)
+/vendor/xterm-addon-fit/addon-fit.js  (UMD; no .mjs is published)
 /vendor/xterm-addon-web-links/addon-web-links.js
-/vendor/golden-layout/bundle/esm/golden-layout.js
+/vendor/golden-layout/esm/index.js
 /vendor/golden-layout/css/goldenlayout-base.css
 /vendor/golden-layout/css/themes/goldenlayout-dark-theme.css
 ```
+
+Corrected 2026-08-16 (B1/F1/F2, verified against the published tarballs): golden-layout
+2.6.0 ships **no** `dist/bundle/` — `bundle/esm/golden-layout.js` and the `bundle/umd`
+twin never existed — and @xterm 5.5 publishes UMD `.js` only. The ESM entry is
+`/vendor/golden-layout/esm/index.js`; its relative specifiers are extensionless, so the
+vendor mounts pass `extensions: ['js']` to `express.static` for the browser to resolve
+them. `VENDOR_ROUTES` itself is unchanged.
 
 The vendor list is defined in `server/src/vendor.ts` (`VENDOR_ROUTES`, FROZEN). Adding a
 library means adding it to `web/package.json` **and** that array.

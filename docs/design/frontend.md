@@ -92,7 +92,7 @@ Concrete URLs used by `index.html` / `code.js`:
 /vendor/xterm-addon-web-links/addon-web-links.js      -> window.WebLinksAddon.WebLinksAddon
 /vendor/golden-layout/css/goldenlayout-base.css
 /vendor/golden-layout/css/themes/goldenlayout-dark-theme.css
-/vendor/golden-layout/bundle/esm/golden-layout.js     -> ESM `import { GoldenLayout }`
+/vendor/golden-layout/esm/index.js                    -> ESM `import { GoldenLayout }`
 ```
 
 Loading strategy, and why it is mixed:
@@ -101,12 +101,15 @@ Loading strategy, and why it is mixed:
   `<head>`-order at the top of `<body>`, i.e. as globals. They are UMD builds that are
   guaranteed to exist in the published tarballs, and classic scripts run before the
   `type="module"` entry, so `app.js` can rely on them synchronously.
-* GoldenLayout is imported as an **ES module** from its `bundle/esm` build (it is
-  dependency-free, so the browser needs no resolver).
-* **Fallback if a vendor path 404s** (verify with `GET /api/settings/vendor` and
-  `web/tools/verify-assets.mjs` after `npm install`): the UMD twin is at
-  `/vendor/golden-layout/bundle/umd/golden-layout.js` (global `goldenLayout`), and the
-  addons also ship `.mjs` twins (`addon-fit.mjs`). Switching a path is a one-line change in
+* GoldenLayout is imported as an **ES module** from `/vendor/golden-layout/esm/index.js`
+  (it is dependency-free, so the browser needs no resolver). Its internal specifiers are
+  extensionless (`export * from './ts/config/config'`), which is why the vendor mounts pass
+  `extensions: ['js']` to `express.static` — see `server/src/vendor.ts`.
+* **Corrected 2026-08-16 (B1/F1/F2):** golden-layout 2.6.0 publishes no `dist/bundle/` at
+  all, so neither `bundle/esm/golden-layout.js` nor the `bundle/umd` "UMD twin" fallback
+  named by earlier revisions of this doc exists; @xterm 5.5 likewise publishes UMD `.js`
+  only, with no `.mjs` twins. Verify a vendor path with `GET /api/settings/vendor` and
+  `web/tools/verify-assets.mjs` after `npm install`. Switching a path is a one-line change in
   `index.html` (F1) or `code.js` (F2) — it is **not** a reason to add a `VENDOR_ROUTES`
   entry. Adding a *new library* is: it needs `web/package.json` **and** a backend-owned
   `VENDOR_ROUTES` entry.
@@ -414,7 +417,7 @@ ws.binaryType = 'arraybuffer'
    * `curl -sI localhost:8080/ | head -1` → `200`, `content-type: text/html`
    * `curl -s localhost:8080/js/app.js | head -3` → module source
    * `curl -sI localhost:8080/vendor/xterm/lib/xterm.js` → `200`
-   * `curl -sI localhost:8080/vendor/golden-layout/bundle/esm/golden-layout.js` → `200`
+   * `curl -sI localhost:8080/vendor/golden-layout/esm/index.js` → `200`
    * `curl -sI localhost:8080/#/sessions`-equivalent: `curl -sI localhost:8080/anything`
      → `200` + `index.html` (SPA fallback)
    * `curl -s localhost:8080/api/settings/vendor | jq '.routes[] | select(.mounted==false)'`

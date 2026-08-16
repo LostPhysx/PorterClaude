@@ -25,5 +25,6 @@ export function tmuxSessionName(terminalName: string): string {
 
 /** Single-quote a string for safe interpolation into `sh -lc '...'`. */
 export function shQuote(s: string): string {
-  return `'${s.replace(/'/g, `'\''`)}'`;
+  // POSIX: close the quote, emit an escaped quote, reopen -> foo'bar becomes 'foo'\''bar'
+  return `'${s.replace(/'/g, "'\\''")}'`;
 }

@@ -38,48 +38,347 @@ export const SESSION_POLL_MS = 5000;
 /** @type {Record<string, ViewModule>} */
 const views = { code: codeView, sessions: sessionsView, settings: settingsView };
 
-/**
- * TODO(F1) boot sequence:
- *  1. wire the login form + #btn-logout + theme select
- *  2. GET /api/auth/session
- *     - needsSetup -> show #login-setup-hint, disable the form
- *     - !authenticated -> showLogin()
- *     - authenticated -> startApp()
- *  3. bus.on(EVENTS.AUTH_REQUIRED) -> tear the app down (emit AUTH_LOST) and showLogin()
- *  4. window.addEventListener('hashchange', ...) -> route()
- */
-export async function boot() {
-  throw new Error('TODO(F1): implement boot()');
+/** @type {any|null} last GET /api/settings payload */
+let appSettings = null;
+/** @type {'dark'|'light'} */
+let effectiveTheme = 'dark';
+/** @type {'auto'|'light'|'dark'} */
+let themePreference = 'auto';
+/** @type {string|null} currently visible view */
+let currentView = null;
+let viewsReady = false;
+let loginVisible = false;
+let booted = false;
+
+/** @type {AppContext} */
+const ctx = {
+  api,
+  bus,
+  navigate,
+  getSettings: () => appSettings,
+  getTheme: () => effectiveTheme,
+};
+
+// ---------------------------------------------------------------------------
+// theme
+// ---------------------------------------------------------------------------
+
+function prefersDark() {
+  try {
+    return typeof matchMedia === 'function' && matchMedia('(prefers-color-scheme: dark)').matches;
+  } catch {
+    return true;
+  }
 }
 
-/**
- * TODO(F1): reveal #app-shell, load GET /api/settings once, apply the theme, update
- * #backend-badge, `await view.init(ctx)` for all three views (in parallel is fine, but
- * awaited before the first route()), emit AUTH_READY, then route().
- */
-export async function startApp() {
-  throw new Error('TODO(F1): implement startApp()');
+/** Apply 'auto'|'light'|'dark' to <html data-bs-theme>; emit THEME_CHANGED. */
+export function applyTheme(theme) {
+  themePreference = theme === 'light' || theme === 'dark' ? theme : 'auto';
+  const resolved = themePreference === 'auto' ? (prefersDark() ? 'dark' : 'light') : themePreference;
+  const changed = resolved !== effectiveTheme;
+  effectiveTheme = resolved;
+  document.documentElement.setAttribute('data-bs-theme', resolved);
+  const select = byId('theme-select');
+  if (select && select.value !== themePreference) select.value = themePreference;
+  if (changed) bus.emit(EVENTS.THEME_CHANGED, { theme: resolved });
+  return resolved;
 }
 
-/** TODO(F1): hide #app-shell, hide+dispose nothing (views keep state), open #login-modal. */
+function watchSystemTheme() {
+  try {
+    if (typeof matchMedia !== 'function') return;
+    const mq = matchMedia('(prefers-color-scheme: dark)');
+    const onChange = () => {
+      if (themePreference === 'auto') applyTheme('auto');
+    };
+    if (typeof mq.addEventListener === 'function') mq.addEventListener('change', onChange);
+    else if (typeof mq.addListener === 'function') mq.addListener(onChange);
+  } catch {
+    /* ignore */
+  }
+}
+
+// ---------------------------------------------------------------------------
+// backend badge
+// ---------------------------------------------------------------------------
+
+function updateBackendBadge(settings) {
+  const el = byId('backend-badge');
+  if (!el) return;
+  const kind = settings && settings.backend ? settings.backend.kind : 'none';
+  if (kind === 'socket') {
+    el.className = 'badge text-bg-success';
+    el.textContent = 'backend: socket';
+  } else if (kind === 'portainer') {
+    el.className = 'badge text-bg-primary';
+    el.textContent = 'backend: portainer';
+  } else {
+    el.className = 'badge text-bg-warning';
+    el.textContent = 'backend: not configured';
+  }
+}
+
+// ---------------------------------------------------------------------------
+// login modal
+// ---------------------------------------------------------------------------
+
+function loginModal() {
+  const el = byId('login-modal');
+  if (!el || typeof bootstrap === 'undefined') return null;
+  return bootstrap.Modal.getOrCreateInstance(el);
+}
+
+function setLoginError(message) {
+  const el = byId('login-error');
+  if (el) el.textContent = message || '';
+}
+
+/** Hide #app-shell and open the login modal (views keep their state). */
 export function showLogin() {
-  throw new Error('TODO(F1): implement showLogin()');
+  const shell = byId('app-shell');
+  if (shell) shell.classList.add('d-none');
+  loginVisible = true;
+  const input = byId('login-password');
+  if (input) input.value = '';
+  setLoginError('');
+  const modal = loginModal();
+  if (modal) modal.show();
+  setTimeout(() => {
+    const pwd = byId('login-password');
+    if (pwd) pwd.focus();
+  }, 250);
+}
+
+function hideLogin() {
+  loginVisible = false;
+  const modal = loginModal();
+  if (modal) modal.hide();
+}
+
+async function submitLogin(event) {
+  if (event) event.preventDefault();
+  const input = byId('login-password');
+  const password = input ? input.value : '';
+  const button = document.querySelector('#login-form button[type="submit"]');
+  setLoginError('');
+  if (!password) {
+    setLoginError('Enter the password.');
+    return;
+  }
+  if (button) button.disabled = true;
+  try {
+    await api.auth.login(password);
+    if (input) input.value = '';
+    hideLogin();
+    await startApp();
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 429) {
+      setLoginError('Too many attempts. Wait 15 minutes and try again.');
+    } else if (err instanceof ApiError && err.status === 401) {
+      setLoginError('Wrong password.');
+    } else {
+      setLoginError((err && err.message) || 'Login failed.');
+    }
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+async function doLogout() {
+  try {
+    await api.auth.logout();
+  } catch {
+    /* logging out locally is enough */
+  }
+  appSettings = null;
+  bus.emit(EVENTS.AUTH_LOST, {});
+  showLogin();
+}
+
+// ---------------------------------------------------------------------------
+// routing
+// ---------------------------------------------------------------------------
+
+function viewFromHash() {
+  const raw = String(location.hash || '').replace(/^#\/?/, '').split('?')[0];
+  if (VIEWS.includes(raw)) return raw;
+  const remembered = storage.get(LS_LAST_VIEW, null);
+  if (VIEWS.includes(remembered)) return remembered;
+  return DEFAULT_VIEW;
+}
+
+/** Navigate by changing the hash (route() runs from the hashchange handler). */
+export function navigate(view) {
+  const target = VIEWS.includes(view) ? view : DEFAULT_VIEW;
+  const hash = `#/${target}`;
+  if (location.hash === hash) route();
+  else location.hash = hash;
 }
 
 /**
- * Hash routing: '#/code' | '#/sessions' | '#/settings' (anything else -> DEFAULT_VIEW,
- * or the last view remembered in localStorage on a bare '#').
- * TODO(F1): toggle `.active` on #nav-*, toggle `.d-none` on #view-*, call hide() on the
- * previous module and show() on the next, emit VIEW_CHANGED, persist LS_LAST_VIEW.
+ * Hash routing: '#/code' | '#/sessions' | '#/settings' (anything else -> the last view
+ * remembered in localStorage, else DEFAULT_VIEW).
  */
 export function route() {
-  throw new Error('TODO(F1): implement route()');
+  const next = viewFromHash();
+  if (!viewsReady) return;
+  for (const name of VIEWS) {
+    const link = byId(`nav-${name}`);
+    if (link) link.classList.toggle('active', name === next);
+    const section = byId(`view-${name}`);
+    if (section) section.classList.toggle('d-none', name !== next);
+  }
+  if (currentView && currentView !== next) {
+    try {
+      views[currentView].hide();
+    } catch (err) {
+      console.error(`[app] ${currentView}.hide() threw`, err);
+    }
+  }
+  currentView = next;
+  storage.set(LS_LAST_VIEW, next);
+  try {
+    views[next].show();
+  } catch (err) {
+    console.error(`[app] ${next}.show() threw`, err);
+  }
+  bus.emit(EVENTS.VIEW_CHANGED, { view: next });
 }
 
-/** Apply 'auto'|'light'|'dark' to <html data-bs-theme>; emit THEME_CHANGED. TODO(F1) */
-export function applyTheme(theme) {
-  void theme;
-  throw new Error('TODO(F1): implement applyTheme()');
+// ---------------------------------------------------------------------------
+// boot / startApp
+// ---------------------------------------------------------------------------
+
+async function loadSettings() {
+  try {
+    const settings = await api.settings.get();
+    appSettings = settings;
+    updateBackendBadge(settings);
+    applyTheme(settings && settings.ui ? settings.ui.theme : 'auto');
+    return settings;
+  } catch (err) {
+    if (!(err instanceof ApiError) || err.status !== 401) {
+      console.error('[app] failed to load settings', err);
+    }
+    updateBackendBadge(null);
+    return null;
+  }
+}
+
+/**
+ * Reveal the shell, load settings, init every view once, emit AUTH_READY and route().
+ * Safe to call again after a re-login.
+ */
+export async function startApp() {
+  const shell = byId('app-shell');
+  if (shell) shell.classList.remove('d-none');
+  loginVisible = false;
+
+  await loadSettings();
+
+  if (!viewsReady) {
+    await Promise.all(
+      VIEWS.map(async (name) => {
+        try {
+          await views[name].init(ctx);
+        } catch (err) {
+          console.error(`[app] ${name}.init() failed`, err);
+          toast(`The ${name} view failed to initialise: ${(err && err.message) || err}`, {
+            variant: 'danger',
+            title: 'UI error',
+          });
+        }
+      }),
+    );
+    viewsReady = true;
+  }
+
+  bus.emit(EVENTS.AUTH_READY, {});
+  currentView = null;
+  route();
+}
+
+function wireChrome() {
+  const form = byId('login-form');
+  if (form) form.addEventListener('submit', (e) => { void submitLogin(e); });
+
+  const logout = byId('btn-logout');
+  if (logout) logout.addEventListener('click', () => { void doLogout(); });
+
+  const themeSelect = byId('theme-select');
+  if (themeSelect) {
+    themeSelect.addEventListener('change', () => {
+      const value = themeSelect.value;
+      applyTheme(value);
+      if (appSettings && appSettings.ui) appSettings.ui.theme = value;
+      api.settings.putUi({ theme: value }).catch((err) => toastError(err, 'Could not save the theme'));
+    });
+  }
+
+  for (const name of VIEWS) {
+    const link = byId(`nav-${name}`);
+    if (link) {
+      link.addEventListener('click', (e) => {
+        e.preventDefault();
+        navigate(name);
+      });
+    }
+  }
+
+  window.addEventListener('hashchange', () => route());
+  watchSystemTheme();
+}
+
+/**
+ * Boot sequence: wire the chrome, ask who we are, then either show the login modal or
+ * start the app. Any later 401 tears the shell down and reopens the login modal.
+ */
+export async function boot() {
+  if (booted) return;
+  booted = true;
+  wireChrome();
+
+  bus.on(EVENTS.SETTINGS_CHANGED, ({ settings }) => {
+    if (!settings) return;
+    appSettings = settings;
+    updateBackendBadge(settings);
+    if (settings.ui && settings.ui.theme && settings.ui.theme !== themePreference) {
+      applyTheme(settings.ui.theme);
+    }
+  });
+
+  bus.on(EVENTS.AUTH_REQUIRED, () => {
+    if (loginVisible) return;
+    appSettings = null;
+    bus.emit(EVENTS.AUTH_LOST, {});
+    showLogin();
+  });
+
+  let session = null;
+  try {
+    session = await api.auth.session();
+  } catch (err) {
+    console.error('[app] /api/auth/session failed', err);
+    setLoginError('Cannot reach the server.');
+  }
+
+  const hint = byId('login-setup-hint');
+  if (session && session.needsSetup) {
+    if (hint) hint.classList.remove('d-none');
+    const input = byId('login-password');
+    if (input) input.disabled = true;
+    const button = document.querySelector('#login-form button[type="submit"]');
+    if (button) button.disabled = true;
+    showLogin();
+    return;
+  }
+  if (hint) hint.classList.add('d-none');
+
+  if (session && session.authenticated) {
+    await startApp();
+  } else {
+    showLogin();
+  }
 }
 
 // Kick off once the DOM (and the classic vendor scripts above it) are ready.
@@ -88,5 +387,3 @@ if (document.readyState === 'loading') {
 } else {
   void boot();
 }
-
-void ApiError; void byId; void toast; void toastError; void storage; void views; void VIEWS;

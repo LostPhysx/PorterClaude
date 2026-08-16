@@ -14,8 +14,10 @@ ENV LANG=C.UTF-8 \
 COPY common.sh /tmp/common.sh
 RUN bash /tmp/common.sh && rm -f /tmp/common.sh
 
-# TODO(O1): mkdir -p /home/dev/.nuget/packages /home/dev/.dotnet && chown -R 1000:1000 /home/dev
-#   (optionally `dotnet --info` as a smoke check; do NOT run `dotnet workload` installs)
+# writable NuGet / CLI state inside the session home (the SDK itself stays root-owned)
+RUN mkdir -p /home/dev/.nuget/packages /home/dev/.dotnet /home/dev/.templateengine \
+ && chown -R 1000:1000 /home/dev \
+ && dotnet --info
 
 USER dev
 WORKDIR /workspace

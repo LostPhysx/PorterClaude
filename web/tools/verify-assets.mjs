@@ -92,7 +92,8 @@ for (const file of jsFiles) {
     const origin = path.relative(repoRoot, file);
     if (spec.startsWith('./') || spec.startsWith('../')) {
       const p = path.resolve(path.dirname(file), spec);
-      existsSync(p) ? ok(`${origin} -> ${spec}`) : fail(`${origin} -> ${spec} does not exist`);
+      if (existsSync(p)) ok(`${origin} -> ${spec}`);
+      else fail(`${origin} -> ${spec} does not exist`);
     } else if (spec.startsWith('/')) {
       checkUrl(spec, origin);
     } else {

@@ -13,8 +13,10 @@ ENV LANG=C.UTF-8 \
 COPY common.sh /tmp/common.sh
 RUN bash /tmp/common.sh && rm -f /tmp/common.sh
 
-# TODO(O1): pip install --no-cache-dir uv pipx  (wheels exist for amd64 + arm64),
-#   pre-create + chown /home/dev/.cache/pip and /home/dev/.local
+# uv + pipx ship wheels for both architectures, so this stays arch-neutral
+RUN pip install --no-cache-dir uv pipx \
+ && mkdir -p /home/dev/.cache/pip /home/dev/.cache/uv /home/dev/.local/bin \
+ && chown -R 1000:1000 /home/dev
 
 USER dev
 WORKDIR /workspace

@@ -1,6 +1,7 @@
 # Build context filter for the app image (docker/Dockerfile) AND for the tar that
 # deploy/deploy.sh POSTs to Portainer's /build endpoint. OWNER: O1.
-# SECURITY: deploy/.env must never enter a build context. QA asserts this.
+# SECURITY: deploy/.env and any data*/ directory (secret.key + config.json) must never
+# enter a build context. QA and deploy/deploy.sh assert this.
 
 .git
 .gitattributes
@@ -9,12 +10,19 @@ node_modules
 dist
 **/dist
 *.tsbuildinfo
-data
+# Any DATA_DIR that lives inside the checkout (the convention is that it MUST start
+# with `data` - see docs/DEPLOYMENT.md): it holds secret.key + config.json, i.e. the
+# encrypted Portainer API key AND the key that decrypts it. SECURITY-CRITICAL.
+data*
+# defence in depth: never ship key material, wherever it sits
+**/secret.key
 deploy/.env
 deploy/.env.*
 deploy/.build
 *.log
 *.tar
+**/__pycache__
+*.pyc
 .github
 docs
 .idea
@@ -22,6 +30,13 @@ docs
 .DS_Store
 Thumbs.db
 
-# TODO(O1): keep package-lock.json, web/public, docker/ and server/src in the context.
+# Explicitly kept (none of the rules above match them — listed so the intent is testable):
+# the lock file drives `npm ci`, web/public is the UI, docker/ carries the recipe + tools
+# build contexts the running server needs, and server/src is what tsc compiles.
+!package-lock.json
+!web/public
+!docker
+!server/src
+
 # Do NOT add a bare `deploy` line — deploy/docker-compose.yml is harmless, the .env files
 # above are the only secrets. Re-check with: python3 deploy/lib/dockerignore.py --root .

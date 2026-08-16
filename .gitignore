@@ -12,8 +12,15 @@ build/
 *.tsbuildinfo
 .vite/
 
-# data
-data/
+# python bytecode (deploy/lib helpers are byte-compiled by CI)
+__pycache__/
+*.pyc
+
+# data — ANY DATA_DIR inside the checkout (convention: it must start with `data`).
+# These directories hold secret.key + config.json (the encrypted Portainer API key and
+# the key that decrypts it) — they must never be committed. See docs/DEPLOYMENT.md.
+data*/
+**/secret.key
 *.log
 
 # os / editors

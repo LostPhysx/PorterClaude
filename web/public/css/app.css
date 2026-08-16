@@ -46,5 +46,51 @@ html, body { height: 100%; }
 .pc-dot-error   { background: var(--bs-danger); }
 .pc-dot-pending { background: var(--bs-warning); }
 
-/* TODO(F1): sessions table density, settings sub-tabs, session modal repeatable rows
-   (.pc-kv-row), toast tweaks. */
+
+/* ---------------------------------------------------------------- navbar */
+.pc-navbar .navbar-brand { font-weight: 600; letter-spacing: .01em; }
+.pc-navbar .nav-pills .nav-link { border-radius: .35rem; }
+.pc-navbar .nav-pills .nav-link.active { background-color: var(--bs-primary); }
+#backend-badge { font-weight: 500; }
+
+/* ------------------------------------------------------- sessions table */
+#sessions-table { font-size: .9rem; }
+#sessions-table td { vertical-align: middle; }
+#sessions-table thead th {
+  font-size: .75rem;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  color: var(--bs-secondary-color);
+  white-space: nowrap;
+}
+#sessions-table .font-monospace { font-family: var(--pc-mono); font-size: .75rem; }
+.pc-row-actions .btn { --bs-btn-padding-x: .4rem; }
+#sessions-table tr[data-name] .badge { font-weight: 500; }
+
+/* --------------------------------------------------- settings sub-tabs */
+#settings-subtabs .nav-link { cursor: pointer; }
+.pc-subview { max-width: 78rem; }
+#general-form .form-text { font-size: .75rem; }
+#backend-test-result table { font-size: .8rem; }
+#portainer-key-hint { font-weight: 400; }
+
+/* -------------------------------------------------------- images panel */
+.pc-recipe-card .card-title { font-size: .95rem; }
+.pc-recipe-card .card-body { padding: .75rem .9rem; }
+#jobs-list .list-group-item { background: transparent; }
+
+/* -------------------------------------- session modal repeatable rows */
+.pc-kv-row .form-control,
+.pc-kv-row .form-select { font-family: var(--pc-mono); font-size: .8rem; }
+#session-form-body hr { opacity: .15; }
+#session-form-body .form-label { font-weight: 600; font-size: .85rem; }
+
+/* --------------------------------------------------------------- toasts */
+#toast-area { z-index: 1090; }
+#toast-area .toast { min-width: 18rem; }
+#toast-area .toast-body { white-space: pre-wrap; word-break: break-word; }
+
+/* ---------------------------------------------------------------- misc */
+#login-modal .modal-content { border-radius: .6rem; }
+.pc-view .alert a { text-decoration: underline; }
+
