@@ -24,7 +24,7 @@ describe('buildTerminalCommand', () => {
   });
 
   it('tmux + claude', () => {
-    expect(buildTerminalCommand({ shell: 'claude', name: 'main', tmux: true, hasBash: true })).toEqual([
+    expect(buildTerminalCommand({ shell: 'agent', agentCommand: ['claude'], name: 'main', tmux: true, hasBash: true })).toEqual([
       'sh',
       '-lc',
       "exec tmux new-session -A -s 'pc_main' sh -lc 'claude; exec bash -l'",
@@ -40,7 +40,7 @@ describe('buildTerminalCommand', () => {
   });
 
   it('tmux + claude falls back to sh -l after claude when the image has no bash (BE-3)', () => {
-    expect(buildTerminalCommand({ shell: 'claude', name: 'main', tmux: true, hasBash: false })).toEqual([
+    expect(buildTerminalCommand({ shell: 'agent', agentCommand: ['claude'], name: 'main', tmux: true, hasBash: false })).toEqual([
       'sh',
       '-lc',
       "exec tmux new-session -A -s 'pc_main' sh -lc 'claude; exec sh -l'",
@@ -48,7 +48,7 @@ describe('buildTerminalCommand', () => {
   });
 
   it('no tmux + claude falls back to sh -l when the image has no bash (BE-3)', () => {
-    expect(buildTerminalCommand({ shell: 'claude', name: 'main', tmux: false, hasBash: false })).toEqual([
+    expect(buildTerminalCommand({ shell: 'agent', agentCommand: ['claude'], name: 'main', tmux: false, hasBash: false })).toEqual([
       'sh',
       '-lc',
       'claude; exec sh -l',
@@ -75,7 +75,7 @@ describe('buildTerminalCommand', () => {
   });
 
   it('no tmux + claude', () => {
-    expect(buildTerminalCommand({ shell: 'claude', name: 'main', tmux: false, hasBash: true })).toEqual([
+    expect(buildTerminalCommand({ shell: 'agent', agentCommand: ['claude'], name: 'main', tmux: false, hasBash: true })).toEqual([
       'sh',
       '-lc',
       'claude; exec bash -l',
@@ -128,7 +128,7 @@ describe('terminal PATH for custom images (BE-6)', () => {
       `${PREFIX}exec tmux new-session -A -s 'pc_main' sh -l`,
     );
     // the pane command is a login shell too, so it re-exports the PATH as well
-    expect(buildTerminalCommand({ ...opts, shell: 'claude' })[2]).toBe(
+    expect(buildTerminalCommand({ ...opts, shell: 'agent' as const, agentCommand: ['claude'] })[2]).toBe(
       `${PREFIX}exec tmux new-session -A -s 'pc_main' sh -lc '${PREFIX}claude; exec bash -l'`,
     );
   });
@@ -136,7 +136,7 @@ describe('terminal PATH for custom images (BE-6)', () => {
   it('injects the tools PATH into the no-tmux claude row', () => {
     expect(
       buildTerminalCommand({
-        shell: 'claude',
+        shell: 'agent', agentCommand: ['claude'],
         name: 'main',
         tmux: false,
         hasBash: true,
@@ -146,7 +146,7 @@ describe('terminal PATH for custom images (BE-6)', () => {
   });
 
   it('changes nothing without a prefix (recipe images ship claude on the PATH)', () => {
-    expect(buildTerminalCommand({ shell: 'claude', name: 'main', tmux: false, hasBash: true })[2]).toBe(
+    expect(buildTerminalCommand({ shell: 'agent', agentCommand: ['claude'], name: 'main', tmux: false, hasBash: true })[2]).toBe(
       'claude; exec bash -l',
     );
     expect(buildTerminalCommand({ shell: 'bash', name: 'm', tmux: true, hasBash: true, pathPrefix: [] })[2]).toBe(
@@ -191,7 +191,7 @@ describe('TerminalService.open PATH handling (BE-6)', () => {
 
   it('sets PATH in the exec env and in the command for a custom image', async () => {
     const { terminals, sb } = makeTerminals(true);
-    await terminals.open({ session: 'usr', shell: 'claude', name: 'main', cols: 80, rows: 24 });
+    await terminals.open({ session: 'usr', shell: 'agent', agentId: 'claude', name: 'main', cols: 80, rows: 24 });
     const exec = sb.log.find((c) => c.method === 'execCreate')!.args[0] as {
       env?: Record<string, string>;
       cmd: string[];
@@ -222,7 +222,7 @@ describe('TerminalService.open PATH handling (BE-6)', () => {
 
   it('leaves a recipe session alone', async () => {
     const { terminals, sb } = makeTerminals(false);
-    await terminals.open({ session: 'usr', shell: 'claude', name: 'main', cols: 80, rows: 24 });
+    await terminals.open({ session: 'usr', shell: 'agent', agentId: 'claude', name: 'main', cols: 80, rows: 24 });
     const exec = sb.log.find((c) => c.method === 'execCreate')!.args[0] as {
       env?: Record<string, string>;
       cmd: string[];

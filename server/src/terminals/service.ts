@@ -11,6 +11,8 @@ import type { TerminalShell } from './protocol.js';
 export interface OpenTerminalInput {
   session: string;
   shell: TerminalShell;
+  /** required exactly when `shell === 'agent'` (terminals/protocol.ts parseTerminalShell) */
+  agentId?: string | null;
   /** stable pane name -> tmux session pc_<name> */
   name: string;
   cols: number;
@@ -21,6 +23,10 @@ export interface OpenTerminalResult {
   terminalId: string;
   stream: ExecStream;
   containerId: string;
+  /** the host the session runs on (goes into the `ready` frame) */
+  hostId: string;
+  /** the agent this pane started, null for a plain shell */
+  agentId: string | null;
   tmux: boolean;
   reattached: boolean;
 }
@@ -54,9 +60,20 @@ export class TerminalService {
    * 6. best-effort backend.execResize(execId, {cols, rows}) right after start
    */
   async open(input: OpenTerminalInput): Promise<OpenTerminalResult> {
-    const { containerId, config } = await this.sessions.requireRunningContainer(input.session);
+    const { containerId, config, hostId } = await this.sessions.requireRunningContainer(input.session);
+    // TODO(B2): general/backend must come from the SESSION'S host:
+    //   const general = this.deps.hosts.settingsFor(hostId);
+    //   const backend = this.deps.hosts.backendFor(hostId);
     const general = this.deps.config.general();
     const backend = this.deps.backends.get();
+
+    // TODO(B2): resolve the agent for `shell === 'agent'`:
+    //   * `this.sessions.resolveAgents(config)` must contain input.agentId, otherwise throw
+    //     AppError.notFound / a terminal error mapped to `agent_not_available` (close 4410) —
+    //     an agent that is not mounted has no auth volume and would silently start a fresh,
+    //     unauthenticated instance;
+    //   * pass `agentCommandLine(def)` into buildTerminalCommand.
+    const agentId = input.shell === 'agent' ? (input.agentId ?? null) : null;
 
     const tmux = await this.hasTmux(containerId);
     const reattached = tmux ? await this.tmuxSessionExists(containerId, input.name) : false;
@@ -73,6 +90,8 @@ export class TerminalService {
     // tools prefix *and* the image's own entries (/usr/local/go/bin & co): /etc/profile
     // replaces PATH wholesale, so re-adding only the tools dirs would leave a golang or
     // rust custom session without its toolchain in every terminal (OPS-7).
+    // TODO(B2): v0.2 delivers the agents through the tools volume for RECIPES TOO, so the
+    // tools PATH must be composed for every session, not only for custom images.
     const custom = config.image.type === 'custom';
     const toolsPath = custom ? await this.toolsPath(containerId, general) : null;
 
@@ -81,6 +100,8 @@ export class TerminalService {
       name: input.name,
       tmux,
       hasBash,
+      // TODO(B2): agentCommandLine(this.deps.agents.require(agentId))
+      ...(agentId ? { agentCommand: [agentId] } : {}),
       ...(toolsPath ? { pathPrefix: toolsPath.split(':').filter((p) => p.length > 0) } : {}),
     });
 
@@ -115,7 +136,7 @@ export class TerminalService {
       { terminalId, session: input.session, shell: input.shell, name: input.name, tmux, reattached },
       'terminal opened',
     );
-    return { terminalId, stream, containerId, tmux, reattached };
+    return { terminalId, stream, containerId, hostId, agentId, tmux, reattached };
   }
 
   /** `command -v tmux` probe, cached per container id. */
@@ -248,15 +269,16 @@ export class TerminalService {
 }
 
 /**
- * Command matrix (docs/design/backend.md §8). `<login>` is `bash` when the container has
- * bash and `sh` otherwise — the tools entrypoint installs tmux into images that ship no
+ * Command matrix (docs/design/backend.md v0.2 §8). `<login>` is `bash` when the container
+ * has bash and `sh` otherwise — the tools entrypoint installs tmux into images that ship no
  * bash (alpine & co), so the fallback applies to the tmux rows too, otherwise tmux cannot
- * spawn its pane command and the exec exits immediately:
+ * spawn its pane command and the exec exits immediately. `<agent>` is the shell-quoted
+ * `agentCommandLine(def)` of the requested agent (v0.2 replaced the hard-wired `claude`):
  *   tmux + bash    sh -lc "exec tmux new-session -A -s pc_<name> <login> -l"
- *   tmux + claude  sh -lc "exec tmux new-session -A -s pc_<name> sh -lc 'claude; exec <login> -l'"
+ *   tmux + agent   sh -lc "exec tmux new-session -A -s pc_<name> sh -lc '<agent>; exec <login> -l'"
  *   tmux + sh      sh -lc "exec tmux new-session -A -s pc_<name> sh -l"
  *   no tmux bash   ["bash","-l"]  (-> ["sh","-l"] when bash is missing)
- *   no tmux claude ["sh","-lc","claude; exec <login> -l"]
+ *   no tmux agent  ["sh","-lc","<agent>; exec <login> -l"]
  *   no tmux sh     ["sh","-l"]
  *
  * The tmux session name is sanitised by tmuxSessionName() and then shell-quoted, so a
@@ -273,11 +295,16 @@ export function buildTerminalCommand(opts: {
   name: string;
   tmux: boolean;
   hasBash: boolean;
+  /** argv of the agent; required when `shell === 'agent'` (agentCommandLine(def)) */
+  agentCommand?: string[];
   /** extra PATH entries to re-export inside the command (custom images) */
   pathPrefix?: string[];
 }): string[] {
   const target = shQuote(tmuxSessionName(opts.name));
   const login = opts.hasBash ? 'bash' : 'sh';
+  // every argv element is shell quoted: an agent definition is user supplied config and
+  // must never be able to break out of the `sh -lc` string.
+  const agent = (opts.agentCommand ?? []).map((part) => shQuote(part)).join(' ');
   const prefix = (opts.pathPrefix ?? []).filter((p) => p.length > 0);
   const setPath = prefix.length ? `PATH=${shQuote(prefix.join(':'))}:$PATH; export PATH; ` : '';
 
@@ -285,11 +312,11 @@ export function buildTerminalCommand(opts: {
     switch (opts.shell) {
       case 'bash':
         return ['sh', '-lc', `${setPath}exec tmux new-session -A -s ${target} ${login} -l`];
-      case 'claude':
+      case 'agent':
         return [
           'sh',
           '-lc',
-          `${setPath}exec tmux new-session -A -s ${target} sh -lc '${setPath}claude; exec ${login} -l'`,
+          `${setPath}exec tmux new-session -A -s ${target} sh -lc '${setPath}${agent}; exec ${login} -l'`,
         ];
       case 'sh':
       default:
@@ -300,8 +327,8 @@ export function buildTerminalCommand(opts: {
   switch (opts.shell) {
     case 'bash':
       return opts.hasBash ? ['bash', '-l'] : ['sh', '-l'];
-    case 'claude':
-      return ['sh', '-lc', `${setPath}claude; exec ${login} -l`];
+    case 'agent':
+      return ['sh', '-lc', `${setPath}${agent}; exec ${login} -l`];
     case 'sh':
     default:
       return ['sh', '-l'];

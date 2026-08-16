@@ -14,6 +14,7 @@ import {
   stubBackendManager,
   stubConfigStore,
   testPaths,
+  TEST_HOST_ID,
 } from './helpers.js';
 
 let dockerDir: string;
@@ -60,7 +61,7 @@ afterEach(async () => {
 describe('recipeStatuses', () => {
   it('lists every recipe with built:false when nothing is built', async () => {
     const { service } = makeService();
-    const statuses = await service.recipeStatuses();
+    const statuses = await service.recipeStatuses(TEST_HOST_ID);
     expect(statuses.map((s) => s.name)).toEqual(RECIPES.map((r) => r.name));
     expect(statuses.every((s) => !s.built && !s.outdated && !s.building)).toBe(true);
     expect(statuses[0]?.imageRef).toBe('porterclaude/node:latest');
@@ -82,7 +83,7 @@ describe('recipeStatuses', () => {
         },
       }),
     );
-    const node = (await service.recipeStatuses()).find((s) => s.name === 'node');
+    const node = (await service.recipeStatuses(TEST_HOST_ID)).find((s) => s.name === 'node');
     expect(node?.built).toBe(true);
     expect(node?.outdated).toBe(false);
     // the label only says WHAT WAS REQUESTED; the installed version is read from the image
@@ -92,7 +93,7 @@ describe('recipeStatuses', () => {
     expect(node?.builtAt).toBe('2026-01-01T00:00:00.000Z');
 
     sb.images.set('porterclaude/node:latest', imageInspect({ labels: { [IMAGE_LABELS.contextHash]: 'stale' } }));
-    expect((await service.recipeStatuses()).find((s) => s.name === 'node')?.outdated).toBe(true);
+    expect((await service.recipeStatuses(TEST_HOST_ID)).find((s) => s.name === 'node')?.outdated).toBe(true);
   });
 });
 
@@ -122,7 +123,7 @@ describe('the image a rebuild replaces', () => {
   it('removes the now-untagged image after a successful rebuild', async () => {
     const { sb, removed } = movingTagBackend();
     const { service } = makeService(sb);
-    const job = await service.buildRecipe('node');
+    const job = await service.buildRecipe(TEST_HOST_ID, 'node');
     await settle(service, job.id);
     expect(service.getJob(job.id)?.status).toBe('success');
     expect(removed).toEqual(['sha256:old']);
@@ -131,7 +132,7 @@ describe('the image a rebuild replaces', () => {
   it('keeps it when another tag still references it', async () => {
     const { sb, removed } = movingTagBackend({ staleTags: ['porterclaude/node:keepme'] });
     const { service } = makeService(sb);
-    const job = await service.buildRecipe('node');
+    const job = await service.buildRecipe(TEST_HOST_ID, 'node');
     await settle(service, job.id);
     expect(service.getJob(job.id)?.status).toBe('success');
     expect(removed).toEqual([]);
@@ -140,7 +141,7 @@ describe('the image a rebuild replaces', () => {
   it('does not fail the build when the old image is still in use', async () => {
     const { sb } = movingTagBackend({ removeFails: true });
     const { service } = makeService(sb);
-    const job = await service.buildRecipe('node');
+    const job = await service.buildRecipe(TEST_HOST_ID, 'node');
     await settle(service, job.id);
     const done = service.getJob(job.id);
     expect(done?.status).toBe('success');
@@ -151,7 +152,7 @@ describe('the image a rebuild replaces', () => {
 describe('buildRecipe', () => {
   it('builds the tagged image with the porterclaude labels', async () => {
     const { service, sb } = makeService();
-    const job = await service.buildRecipe('node');
+    const job = await service.buildRecipe(TEST_HOST_ID, 'node');
     expect(job.kind).toBe('build');
     expect(job.target).toBe('node');
     await settle(service, job.id);
@@ -169,7 +170,7 @@ describe('buildRecipe', () => {
 
   it('404s an unknown recipe', async () => {
     const { service } = makeService();
-    await expect(service.buildRecipe('nope')).rejects.toMatchObject({ code: 'not_found' });
+    await expect(service.buildRecipe(TEST_HOST_ID, 'nope')).rejects.toMatchObject({ code: 'not_found' });
   });
 
   it('409s while a build for the same recipe is running', async () => {
@@ -180,8 +181,8 @@ describe('buildRecipe', () => {
     const backend = stubBackend({ buildImage: async () => gate });
     const { service } = makeService(backend);
 
-    const job = await service.buildRecipe('node');
-    await expect(service.buildRecipe('node')).rejects.toMatchObject({ code: 'conflict' });
+    const job = await service.buildRecipe(TEST_HOST_ID, 'node');
+    await expect(service.buildRecipe(TEST_HOST_ID, 'node')).rejects.toMatchObject({ code: 'conflict' });
     release();
     await settle(service, job.id);
     expect(service.getJob(job.id)?.status).toBe('success');
@@ -190,7 +191,7 @@ describe('buildRecipe', () => {
   it('fails the job with a clear message when the context is missing', async () => {
     const { service } = makeService();
     await fs.rm(path.join(dockerDir, 'recipes', 'node'), { recursive: true, force: true });
-    const job = await service.buildRecipe('node');
+    const job = await service.buildRecipe(TEST_HOST_ID, 'node');
     await settle(service, job.id);
     const finished = service.getJob(job.id);
     expect(finished?.status).toBe('error');
@@ -216,14 +217,14 @@ describe('a rebuild whose context did not change (INT-01)', () => {
       imageInspect({ id: 'sha256:built', labels: { [IMAGE_LABELS.contextHash]: await nodeContextHash() } }),
     );
 
-    const job = await service.buildRecipe('node');
+    const job = await service.buildRecipe(TEST_HOST_ID, 'node');
     await settle(service, job.id);
 
     expect(service.getJob(job.id)?.status).toBe('success');
     expect(sb.calls).not.toContain('buildImage');
     expect(sb.calls).not.toContain('removeImage');
     expect(service.getJobLines(job.id).lines.join(' ')).toContain('up to date');
-    expect((await service.recipeStatuses()).find((s) => s.name === 'node')?.imageId).toBe('sha256:built');
+    expect((await service.recipeStatuses(TEST_HOST_ID)).find((s) => s.name === 'node')?.imageId).toBe('sha256:built');
   });
 
   it.each([{ force: true }, { noCache: true }, { pull: true }])('builds anyway with %o', async (opts) => {
@@ -232,7 +233,7 @@ describe('a rebuild whose context did not change (INT-01)', () => {
       'porterclaude/node:latest',
       imageInspect({ id: 'sha256:built', labels: { [IMAGE_LABELS.contextHash]: await nodeContextHash() } }),
     );
-    const job = await service.buildRecipe('node', opts);
+    const job = await service.buildRecipe(TEST_HOST_ID, 'node', opts);
     await settle(service, job.id);
     expect(service.getJob(job.id)?.status).toBe('success');
     expect(sb.calls).toContain('buildImage');
@@ -241,7 +242,7 @@ describe('a rebuild whose context did not change (INT-01)', () => {
   it('builds when the context hash moved on', async () => {
     const { service, sb } = makeService();
     sb.images.set('porterclaude/node:latest', imageInspect({ labels: { [IMAGE_LABELS.contextHash]: 'stale' } }));
-    const job = await service.buildRecipe('node');
+    const job = await service.buildRecipe(TEST_HOST_ID, 'node');
     await settle(service, job.id);
     expect(sb.calls).toContain('buildImage');
   });
@@ -263,7 +264,7 @@ describe('the claude version an image really ships (INT-02)', () => {
   it('reads it out of the built image with a one-shot container', async () => {
     const sb = versionBackend('2.1.233 (Claude Code)');
     const { service } = makeService(sb);
-    const job = await service.buildRecipe('node');
+    const job = await service.buildRecipe(TEST_HOST_ID, 'node');
     await settle(service, job.id);
 
     const created = sb.log.find((c) => c.method === 'createContainer')?.args[0] as {
@@ -275,18 +276,18 @@ describe('the claude version an image really ships (INT-02)', () => {
     expect(sb.calls).toContain('removeContainer');
     expect(service.getJobLines(job.id).lines.join(' ')).toContain('claude version: 2.1.233');
 
-    const node = (await service.recipeStatuses()).find((s) => s.name === 'node');
+    const node = (await service.recipeStatuses(TEST_HOST_ID)).find((s) => s.name === 'node');
     expect(node?.claudeVersion).toBe('2.1.233');
   });
 
   it('takes it from the build output when the build printed it (no extra container)', async () => {
     const sb = versionBackend('unused', { logMarker: '[porterclaude] PORTERCLAUDE_CLAUDE_VERSION=2.1.233' });
     const { service } = makeService(sb);
-    const job = await service.buildRecipe('node');
+    const job = await service.buildRecipe(TEST_HOST_ID, 'node');
     await settle(service, job.id);
 
     expect(sb.calls).not.toContain('createContainer');
-    expect((await service.recipeStatuses()).find((s) => s.name === 'node')?.claudeVersion).toBe('2.1.233');
+    expect((await service.recipeStatuses(TEST_HOST_ID)).find((s) => s.name === 'node')?.claudeVersion).toBe('2.1.233');
   });
 
   it('reads an image built by an earlier process in the background', async () => {
@@ -295,26 +296,26 @@ describe('the claude version an image really ships (INT-02)', () => {
     sb.images.set('porterclaude/node:latest', imageInspect({ id: 'sha256:old-build' }));
 
     // the first call must not block on a container: it answers null and starts the read
-    expect((await service.recipeStatuses()).find((s) => s.name === 'node')?.claudeVersion).toBeNull();
+    expect((await service.recipeStatuses(TEST_HOST_ID)).find((s) => s.name === 'node')?.claudeVersion).toBeNull();
 
     let version: string | null = null;
     for (let i = 0; i < 50 && version === null; i += 1) {
       await new Promise((r) => setTimeout(r, 10));
-      version = (await service.recipeStatuses()).find((s) => s.name === 'node')?.claudeVersion ?? null;
+      version = (await service.recipeStatuses(TEST_HOST_ID)).find((s) => s.name === 'node')?.claudeVersion ?? null;
     }
     expect(version).toBe('2.1.233');
     // …and it is cached: repeated polling does not start a container per poll
     const containers = sb.calls.filter((c) => c === 'createContainer').length;
-    await service.recipeStatuses();
+    await service.recipeStatuses(TEST_HOST_ID);
     expect(sb.calls.filter((c) => c === 'createContainer').length).toBe(containers);
   });
 
   it('stays null when the image records no version', async () => {
     const sb = versionBackend('cat: /etc/porterclaude/claude-version: No such file');
     const { service } = makeService(sb);
-    const job = await service.buildRecipe('node');
+    const job = await service.buildRecipe(TEST_HOST_ID, 'node');
     await settle(service, job.id);
-    expect((await service.recipeStatuses()).find((s) => s.name === 'node')?.claudeVersion).toBeNull();
+    expect((await service.recipeStatuses(TEST_HOST_ID)).find((s) => s.name === 'node')?.claudeVersion).toBeNull();
     expect(service.getJobLines(job.id).lines.join(' ')).toContain('could not read the claude version');
   });
 });
@@ -345,7 +346,7 @@ describe('job registry', () => {
         },
       }),
     );
-    const job = await service.buildRecipe('node');
+    const job = await service.buildRecipe(TEST_HOST_ID, 'node');
     await settle(service, job.id);
 
     const all = service.getJobLines(job.id, 0);
@@ -368,7 +369,7 @@ describe('job registry', () => {
         },
       }),
     );
-    const job = await service.buildRecipe('node');
+    const job = await service.buildRecipe(TEST_HOST_ID, 'node');
     await settle(service, job.id);
     const result = service.getJobLines(job.id, 0);
     expect(result.lines.length).toBeLessThanOrEqual(2000);
@@ -382,7 +383,7 @@ describe('job registry', () => {
       release = r;
     });
     const { service } = makeService(stubBackend({ buildImage: async () => gate }));
-    const job = await service.buildRecipe('node');
+    const job = await service.buildRecipe(TEST_HOST_ID, 'node');
     expect(service.cancelJob(job.id).status).toBe('cancelled');
     release();
     expect(() => service.cancelJob('missing')).toThrow();
@@ -392,9 +393,9 @@ describe('job registry', () => {
 
   it('lists jobs newest first', async () => {
     const { service } = makeService();
-    const first = await service.buildRecipe('node');
+    const first = await service.buildRecipe(TEST_HOST_ID, 'node');
     await settle(service, first.id);
-    const second = await service.pull('nginx:1.27');
+    const second = await service.pull(TEST_HOST_ID, 'nginx:1.27');
     await settle(service, second.id);
     const jobs = service.listJobs();
     expect(jobs[0]?.id).toBe(second.id);
@@ -405,7 +406,7 @@ describe('job registry', () => {
 describe('syncTools', () => {
   it('builds the tools image, ensures the volume and runs a one-shot container', async () => {
     const { service, sb } = makeService();
-    const job = await service.syncTools();
+    const job = await service.syncTools(TEST_HOST_ID);
     await settle(service, job.id);
 
     expect(service.getJob(job.id)?.status).toBe('success');
@@ -429,7 +430,7 @@ describe('syncTools', () => {
   it('fails the job when the one-shot container exits non-zero and still removes it', async () => {
     const backend = stubBackend({ waitContainer: async () => ({ statusCode: 3 }) });
     const { service, sb } = makeService(backend);
-    const job = await service.syncTools();
+    const job = await service.syncTools(TEST_HOST_ID);
     await settle(service, job.id);
     expect(service.getJob(job.id)?.status).toBe('error');
     expect(service.getJob(job.id)?.error).toContain('exited with code 3');
@@ -445,7 +446,7 @@ describe('syncTools', () => {
       imageInspect({ labels: { [IMAGE_LABELS.contextHash]: 'stale-hash' } }),
     );
 
-    const job = await service.syncTools();
+    const job = await service.syncTools(TEST_HOST_ID);
     await settle(service, job.id);
 
     expect(service.getJob(job.id)?.status).toBe('success');
@@ -465,14 +466,14 @@ describe('syncTools', () => {
     const hash = await hashContext({ dir: path.join(dockerDir, 'tools') });
     sb.images.set('porterclaude/tools:latest', imageInspect({ labels: { [IMAGE_LABELS.contextHash]: hash } }));
 
-    const job = await service.syncTools();
+    const job = await service.syncTools(TEST_HOST_ID);
     await settle(service, job.id);
     expect(sb.calls).not.toContain('buildImage');
     expect(service.getJobLines(job.id).lines.some((l) => l.includes('reusing existing image'))).toBe(true);
     // the volume is still re-populated from the (current) image
     expect(sb.calls).toContain('createContainer');
 
-    const forced = await service.syncTools({ force: true });
+    const forced = await service.syncTools(TEST_HOST_ID, { force: true });
     await settle(service, forced.id);
     const build = sb.log.find((c) => c.method === 'buildImage');
     const opts = build?.args[0] as { pull: boolean; noCache: boolean };
@@ -486,20 +487,20 @@ describe('syncTools', () => {
     sb.volumes.push({ name: 'porterclaude-tools', driver: 'local', labels: {} });
 
     // populated volume, no image at all -> the next sync has to build one
-    expect(await service.toolsStatus()).toMatchObject({ outdated: true, contextHash: hash });
+    expect(await service.toolsStatus(TEST_HOST_ID)).toMatchObject({ outdated: true, contextHash: hash });
 
     sb.images.set('porterclaude/tools:latest', imageInspect({ labels: { [IMAGE_LABELS.contextHash]: 'stale' } }));
-    expect((await service.toolsStatus()).outdated).toBe(true);
+    expect((await service.toolsStatus(TEST_HOST_ID)).outdated).toBe(true);
 
     sb.images.set('porterclaude/tools:latest', imageInspect({ labels: { [IMAGE_LABELS.contextHash]: hash } }));
-    expect((await service.toolsStatus()).outdated).toBe(false);
+    expect((await service.toolsStatus(TEST_HOST_ID)).outdated).toBe(false);
   });
 
   it('reports the tools volume status', async () => {
     const { service, sb } = makeService();
-    expect((await service.toolsStatus()).present).toBe(false);
+    expect((await service.toolsStatus(TEST_HOST_ID)).present).toBe(false);
     sb.volumes.push({ name: 'porterclaude-tools', driver: 'local', labels: {} });
-    const status = await service.toolsStatus();
+    const status = await service.toolsStatus(TEST_HOST_ID);
     expect(status).toMatchObject({
       volume: 'porterclaude-tools',
       imageRef: 'porterclaude/tools:latest',
@@ -522,7 +523,7 @@ describe('validateCustomImage', () => {
     });
     const { service } = makeService(backend);
 
-    const result = await service.validateCustomImage('nginx:1.27');
+    const result = await service.validateCustomImage(TEST_HOST_ID, 'nginx:1.27');
     expect(result.ok).toBe(true);
     expect(result.existsLocally).toBe(false);
     expect(result.pulled).toBe(true);
@@ -538,7 +539,7 @@ describe('validateCustomImage', () => {
       },
     });
     const { service } = makeService(backend);
-    const result = await service.validateCustomImage('nope:latest');
+    const result = await service.validateCustomImage(TEST_HOST_ID, 'nope:latest');
     expect(result.ok).toBe(false);
     expect(result.error).toContain('manifest unknown');
   });

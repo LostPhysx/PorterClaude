@@ -1,8 +1,6 @@
 # PorterClaude recipe: python (python:3.13-bookworm). OWNER: O1.
 FROM python:3.13-bookworm
-ARG CLAUDE_VERSION=stable
-LABEL porterclaude.recipe="python" \
-      porterclaude.claude-version="${CLAUDE_VERSION}"
+LABEL porterclaude.recipe="python"
 ENV LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
     PORTERCLAUDE_RECIPE=python \

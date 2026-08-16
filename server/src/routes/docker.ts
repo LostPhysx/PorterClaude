@@ -1,10 +1,14 @@
 // OWNER: B1. Thin read-only passthroughs the UI needs outside of Sessions/Images.
+// v0.2: host-scoped — mounted at /api/hosts/:hostId/docker (routes/index.ts), so the router
+// is created with `mergeParams: true` and resolves the host on every call.
 import { Router } from 'express';
+import type { Request } from 'express';
 import { z } from 'zod';
 import type { AppContext } from '../context.js';
 import { asyncHandler } from '../http/async.js';
-import { parseQuery } from '../http/validate.js';
+import { parseParams, parseQuery } from '../http/validate.js';
 import { CONTAINER_LABELS } from '../sessions/model.js';
+import { HostIdParamsSchema } from '../hosts/model.js';
 
 const flag = z
   .union([z.string(), z.boolean()])
@@ -18,20 +22,24 @@ const flag = z
 const ContainersQuerySchema = z.object({ all: flag, managed: flag });
 
 /**
- * GET /api/docker/info        -> { info: DockerInfo }
- * GET /api/docker/containers  -> { containers: ContainerSummary[] }   (?all=1, ?managed=1)
- * GET /api/docker/volumes     -> { volumes: VolumeSummary[] }
- * GET /api/docker/networks    -> { networks: NetworkSummary[] }
- * All require auth (mounted behind the gate) and 409 backend_not_configured when there is
- * no backend.
+ * GET /api/hosts/:hostId/docker/info        -> { info: DockerInfo }
+ * GET /api/hosts/:hostId/docker/containers  -> { containers: ContainerSummary[] }  (?all=1, ?managed=1)
+ * GET /api/hosts/:hostId/docker/volumes     -> { volumes: VolumeSummary[] }
+ * GET /api/hosts/:hostId/docker/networks    -> { networks: NetworkSummary[] }
+ * 404 for an unknown host, 409 backend_not_configured when the host connection is incomplete.
  */
 export function createDockerRouter(ctx: AppContext): Router {
-  const router = Router();
+  const router = Router({ mergeParams: true });
+
+  const backend = (req: Request) => {
+    const { hostId } = parseParams(HostIdParamsSchema, req);
+    return ctx.hosts.backendFor(hostId);
+  };
 
   router.get(
     '/info',
-    asyncHandler(async (_req, res) => {
-      res.json({ info: await ctx.backends.get().info() });
+    asyncHandler(async (req, res) => {
+      res.json({ info: await backend(req).info() });
     }),
   );
 
@@ -39,7 +47,7 @@ export function createDockerRouter(ctx: AppContext): Router {
     '/containers',
     asyncHandler(async (req, res) => {
       const q = parseQuery(ContainersQuerySchema, req);
-      const containers = await ctx.backends.get().listContainers({
+      const containers = await backend(req).listContainers({
         all: q.all ?? true,
         labelFilters: q.managed ? { [CONTAINER_LABELS.managed]: 'true' } : undefined,
       });
@@ -49,15 +57,15 @@ export function createDockerRouter(ctx: AppContext): Router {
 
   router.get(
     '/volumes',
-    asyncHandler(async (_req, res) => {
-      res.json({ volumes: await ctx.backends.get().listVolumes() });
+    asyncHandler(async (req, res) => {
+      res.json({ volumes: await backend(req).listVolumes() });
     }),
   );
 
   router.get(
     '/networks',
-    asyncHandler(async (_req, res) => {
-      res.json({ networks: await ctx.backends.get().listNetworks() });
+    asyncHandler(async (req, res) => {
+      res.json({ networks: await backend(req).listNetworks() });
     }),
   );
 

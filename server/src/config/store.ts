@@ -7,6 +7,8 @@ import path from 'node:path';
 import { AppConfigSchema, CONFIG_VERSION, defaultConfig } from './schema.js';
 import type { AppConfig, GeneralConfig, SanitizedSettings } from './schema.js';
 import type { SessionConfig } from '../sessions/model.js';
+import type { HostConfig, PortainerCredentialConfig } from '../hosts/model.js';
+import type { AgentDefinition } from '../agents/model.js';
 import type { SecretBox } from './crypto.js';
 import { hashPassword } from './crypto.js';
 import type { Env } from '../env.js';
@@ -50,9 +52,10 @@ export class ConfigStore extends EventEmitter {
   }
 
   /**
-   * Read config.json (or create it from defaults), migrate old versions, then apply env
-   * seeds: APP_PASSWORD (only when no password is set), PORTERCLAUDE_BACKEND / PORTAINER_*
-   * (only when backend.kind is 'none'). Must be called exactly once at boot.
+   * Read config.json (or create it from defaults), migrate old versions (v1 -> v2, see
+   * `migrate`), then apply env seeds: APP_PASSWORD (only when no password is set),
+   * PORTERCLAUDE_BACKEND / PORTAINER_* (only when NO host exists yet). Must be called
+   * exactly once at boot.
    */
   async init(): Promise<void> {
     const { paths, log } = this.deps;
@@ -111,37 +114,61 @@ export class ConfigStore extends EventEmitter {
     return parsed.data;
   }
 
-  /** Version-based migrations. v1 is the first shipped shape. */
+  /**
+   * Version-based migrations, applied to the RAW json before AppConfigSchema parses it.
+   *
+   * v1 -> v2 (v0.1 single backend -> hosts). MUST be lossless:
+   *   1. write <configFile>.v1.bak (best effort, once) before returning the new shape, so
+   *      an operator can always go back to the v0.1 image;
+   *   2. backend.kind === 'portainer' -> credentials.portainer = [{
+   *        id: 'portainer-1', name: <hostname of backend.portainer.url>,
+   *        url, apiKeyEnc (COPIED verbatim - it is already encrypted with the same key),
+   *        insecureTls, createdAt/updatedAt: now }]
+   *      and hosts = [{ id: LEGACY_HOST_ID, name: 'Default',
+   *        connection: { type:'portainer', credentialId:'portainer-1',
+   *                      endpointId: backend.portainer.endpointId ?? 0 } }];
+   *   3. backend.kind === 'socket' -> hosts = [{ id: LEGACY_HOST_ID, name: 'Local docker',
+   *        connection: { type:'socket', socketPath: backend.socket.socketPath } }];
+   *   4. backend.kind === 'none' -> hosts = [] (the first-run state is preserved as such);
+   *   5. every created host gets agents:{ enabled: DEFAULT_ENABLED_AGENT_IDS } and
+   *      overrides:{}; defaultHostId = the created host id (or null);
+   *   6. every stored session gets hostId: LEGACY_HOST_ID and agents: null (the schema
+   *      defaults do the same, but writing them makes the file self-describing);
+   *   7. general is carried over unchanged - including sharedClaudeVolume /
+   *      sharedClaudeHomeVolume, which the one-time claude auth import still needs;
+   *   8. backend is DROPPED from the parsed shape (the .v1.bak file keeps it) and
+   *      version becomes 2.
+   *
+   * A file that is already v2 passes through. A file from a NEWER version is used as-is
+   * with a warning (same rule as v0.1).
+   *
+   * TODO(B1): implement. config-store.test.ts must cover a v1 portainer file, a v1 socket
+   * file, a v1 file with sessions (incl. shareHistory:false) and an empty v1 file.
+   */
   private migrate(raw: unknown): unknown {
     if (!raw || typeof raw !== 'object') return raw;
     const obj = raw as Record<string, unknown>;
     const version = typeof obj.version === 'number' ? obj.version : 0;
-    if (version < 1) obj.version = CONFIG_VERSION;
     if (version > CONFIG_VERSION) {
       this.deps.log.warn({ version }, 'config.json was written by a newer version; using it as-is');
     }
     return obj;
   }
 
+  /**
+   * Unattended install seeds, applied ONLY while no host exists yet (hosts.length === 0):
+   *   PORTERCLAUDE_BACKEND=socket   -> one socket host (id 'default', name 'Local docker')
+   *   PORTERCLAUDE_BACKEND=portainer, or PORTAINER_URL + PORTAINER_API_KEY
+   *                                 -> one portainer credential ('portainer-1') plus one
+   *                                    host (id 'default') for PORTAINER_ENDPOINT_ID ?? 0
+   * The created host becomes defaultHostId and enables DEFAULT_ENABLED_AGENT_IDS. The env
+   * is never re-applied once a host exists - the UI is the source of truth then.
+   *
+   * TODO(B1): implement (v0.1 seeded backend.*; the variable names stay the same so
+   * existing deploy/.env files keep working).
+   */
   private applyEnvSeeds(draft: AppConfig): void {
-    const { env, secrets, log } = this.deps;
-    if (draft.backend.kind !== 'none') return;
-
-    const wantPortainer =
-      env.PORTERCLAUDE_BACKEND === 'portainer' || (!!env.PORTAINER_URL && !!env.PORTAINER_API_KEY);
-    const wantSocket = env.PORTERCLAUDE_BACKEND === 'socket';
-
-    if (wantPortainer) {
-      if (env.PORTAINER_URL) draft.backend.portainer.url = env.PORTAINER_URL.replace(/\/+$/, '');
-      if (env.PORTAINER_API_KEY) draft.backend.portainer.apiKeyEnc = secrets.encrypt(env.PORTAINER_API_KEY);
-      if (env.PORTAINER_ENDPOINT_ID !== undefined) draft.backend.portainer.endpointId = env.PORTAINER_ENDPOINT_ID;
-      draft.backend.kind = 'portainer';
-      log.info('seeded the portainer backend from the environment');
-    } else if (wantSocket) {
-      draft.backend.socket.socketPath = env.DOCKER_SOCKET;
-      draft.backend.kind = 'socket';
-      log.info('seeded the socket backend from the environment');
-    }
+    void draft;
   }
 
   /** Current config (deep-frozen snapshot; never mutate). */
@@ -192,52 +219,128 @@ export class ConfigStore extends EventEmitter {
     await fs.chmod(file, 0o600).catch(() => undefined);
   }
 
-  // --- secrets -------------------------------------------------------------
+  // --- hosts ---------------------------------------------------------------
 
-  /** Decrypted Portainer api key, or null. Never log the result. */
-  getPortainerApiKey(): string | null {
-    const enc = this.get().backend.portainer.apiKeyEnc;
-    if (!enc) return null;
-    try {
-      return this.deps.secrets.decrypt(enc);
-    } catch {
-      if (!this.decryptWarned) {
-        this.decryptWarned = true;
-        this.deps.log.warn('the stored portainer api key cannot be decrypted (APP_SECRET changed?)');
-      }
-      return null;
-    }
+  listHosts(): HostConfig[] {
+    return this.get().hosts.map((h) => structuredClone(h) as HostConfig);
   }
 
-  async setPortainerApiKey(plain: string | null): Promise<void> {
-    const enc = plain === null ? null : this.deps.secrets.encrypt(plain);
+  getHost(id: string): HostConfig | null {
+    const found = this.get().hosts.find((h) => h.id === id);
+    return found ? (structuredClone(found) as HostConfig) : null;
+  }
+
+  /** Insert or replace by id; persists. The first host also becomes the default. */
+  async putHost(host: HostConfig): Promise<HostConfig> {
     await this.update((draft) => {
-      draft.backend.portainer.apiKeyEnc = enc;
+      const idx = draft.hosts.findIndex((h) => h.id === host.id);
+      if (idx >= 0) draft.hosts[idx] = host;
+      else draft.hosts.push(host);
+      if (!draft.defaultHostId) draft.defaultHostId = host.id;
     });
+    return this.getHost(host.id) as HostConfig;
+  }
+
+  /** Returns true when a host was removed; promotes a new default when needed. */
+  async deleteHost(id: string): Promise<boolean> {
+    let removed = false;
+    await this.update((draft) => {
+      const idx = draft.hosts.findIndex((h) => h.id === id);
+      if (idx >= 0) {
+        draft.hosts.splice(idx, 1);
+        removed = true;
+      }
+      if (draft.defaultHostId === id) draft.defaultHostId = draft.hosts[0]?.id ?? null;
+    });
+    return removed;
+  }
+
+  async setDefaultHostId(id: string | null): Promise<void> {
+    await this.update((draft) => {
+      draft.defaultHostId = id;
+    });
+  }
+
+  // --- portainer credentials ------------------------------------------------
+
+  listPortainerCredentials(): PortainerCredentialConfig[] {
+    return this.get().credentials.portainer.map((c) => structuredClone(c) as PortainerCredentialConfig);
+  }
+
+  getPortainerCredential(id: string): PortainerCredentialConfig | null {
+    const found = this.get().credentials.portainer.find((c) => c.id === id);
+    return found ? (structuredClone(found) as PortainerCredentialConfig) : null;
+  }
+
+  async putPortainerCredential(cred: PortainerCredentialConfig): Promise<PortainerCredentialConfig> {
+    await this.update((draft) => {
+      const idx = draft.credentials.portainer.findIndex((c) => c.id === cred.id);
+      if (idx >= 0) draft.credentials.portainer[idx] = cred;
+      else draft.credentials.portainer.push(cred);
+    });
+    return this.getPortainerCredential(cred.id) as PortainerCredentialConfig;
+  }
+
+  async deletePortainerCredential(id: string): Promise<boolean> {
+    let removed = false;
+    await this.update((draft) => {
+      const idx = draft.credentials.portainer.findIndex((c) => c.id === id);
+      if (idx >= 0) {
+        draft.credentials.portainer.splice(idx, 1);
+        removed = true;
+      }
+    });
+    return removed;
+  }
+
+  // --- custom agents --------------------------------------------------------
+
+  listCustomAgents(): AgentDefinition[] {
+    return this.get().agents.custom.map((a) => structuredClone(a) as AgentDefinition);
+  }
+
+  async putCustomAgent(def: AgentDefinition): Promise<AgentDefinition> {
+    await this.update((draft) => {
+      const idx = draft.agents.custom.findIndex((a) => a.id === def.id);
+      if (idx >= 0) draft.agents.custom[idx] = def;
+      else draft.agents.custom.push(def);
+    });
+    return this.listCustomAgents().find((a) => a.id === def.id) as AgentDefinition;
+  }
+
+  async deleteCustomAgent(id: string): Promise<boolean> {
+    let removed = false;
+    await this.update((draft) => {
+      const idx = draft.agents.custom.findIndex((a) => a.id === id);
+      if (idx >= 0) {
+        draft.agents.custom.splice(idx, 1);
+        removed = true;
+      }
+    });
+    return removed;
   }
 
   // --- views ---------------------------------------------------------------
 
-  /** Secret-free projection for GET /api/settings. */
+  /**
+   * Secret-free projection for GET /api/settings. v0.2: there is no backend section any
+   * more - hosts (and their credentials) live at GET /api/hosts and /api/credentials.
+   *
+   * TODO(B1): set hosts.socketHostId to the id of the single host whose connection.type is
+   * 'socket' (null when there is none).
+   */
   sanitized(extra: { socketAvailable: boolean }): SanitizedSettings {
     const cfg = this.get();
-    const key = this.getPortainerApiKey();
     return {
-      backend: {
-        kind: cfg.backend.kind,
-        portainer: {
-          url: cfg.backend.portainer.url,
-          endpointId: cfg.backend.portainer.endpointId,
-          insecureTls: cfg.backend.portainer.insecureTls,
-          apiKeySet: !!key,
-          apiKeyHint: key ? key.slice(-4) : null,
-        },
-        socket: { ...cfg.backend.socket },
-        socketAvailable: extra.socketAvailable,
-      },
       general: { ...cfg.general },
       ui: { layout: cfg.ui.layout ?? null, theme: cfg.ui.theme },
       auth: { passwordSet: !!cfg.auth.passwordHash },
+      hosts: {
+        count: cfg.hosts.length,
+        defaultHostId: cfg.defaultHostId,
+        socketAvailable: extra.socketAvailable,
+        socketHostId: null,
+      },
     };
   }
 

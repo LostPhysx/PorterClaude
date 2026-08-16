@@ -1,204 +1,93 @@
-// OWNER: B1. Public API FROZEN: B2 (sessions/terminals/images) only ever calls
-// `backends.get()` / `backends.tryGet()`. Everything else is B1 internals.
-import { createHash } from 'node:crypto';
-import type { ConfigStore } from '../config/store.js';
-import type { Env } from '../env.js';
+// OWNER: B1. v0.2: the single global `BackendManager` is GONE — hosts own their backends
+// (hosts/manager.ts, per-host instance cache). What is left here is the transport factory
+// plus the two probe helpers that need to know about Portainer specifics.
+//
+// ADDING A CONNECTION TYPE is local to two places: `HostConnectionSchema` (hosts/model.ts)
+// and the switch in `createBackend()` below. Nothing else in the server branches on it.
 import type { Logger } from '../logger.js';
 import { AppError } from '../http/errors.js';
 import { PortainerBackend } from './portainer.js';
 import { SocketBackend } from './socket.js';
-import type { BackendKind, BackendTestResult, DockerBackend, PortainerEndpoint } from './types.js';
+import type { BackendTestResult, DockerBackend, PortainerEndpoint } from './types.js';
 
 export * from './types.js';
 
-export interface BackendProbeInput {
-  kind: BackendKind;
-  portainer?: { url: string; apiKey?: string; endpointId?: number; insecureTls?: boolean };
-  socket?: { socketPath?: string };
+/**
+ * A host connection with every secret already resolved. `HostManager` builds this from
+ * `HostConfig.connection` + the referenced credential; nothing below it reads the config.
+ */
+export type ResolvedConnection =
+  | { type: 'socket'; socketPath: string }
+  | { type: 'portainer'; url: string; apiKey: string; endpointId: number; insecureTls: boolean }
+  /** RESERVED (hosts/model.ts): accepted by the schema, refused here with `not_implemented` */
+  | { type: 'tcp'; url: string; insecureTls: boolean }
+  | { type: 'ssh'; url: string; socketPath: string };
+
+/**
+ * Build a transport for one resolved connection. Never cached here — `HostManager` owns the
+ * per-host cache and the lifecycle (invalidate on config change, close on shutdown).
+ *
+ * @throws AppError.notImplemented for a connection type this version cannot talk to.
+ */
+export function createBackend(conn: ResolvedConnection): DockerBackend {
+  switch (conn.type) {
+    case 'socket':
+      return new SocketBackend({ socketPath: conn.socketPath });
+    case 'portainer':
+      return new PortainerBackend({
+        url: conn.url,
+        apiKey: conn.apiKey,
+        endpointId: conn.endpointId,
+        insecureTls: conn.insecureTls,
+      });
+    case 'tcp':
+    case 'ssh':
+      throw AppError.notImplemented(
+        `connection type '${conn.type}' is reserved for a later release and cannot be used yet`,
+      );
+    default: {
+      const exhaustive: never = conn;
+      throw AppError.badRequest(`unknown connection type ${JSON.stringify(exhaustive)}`);
+    }
+  }
 }
 
 /**
- * Owns the single live DockerBackend instance. Rebuilds it whenever backend settings
- * change (ConfigStore emits 'change'); callers must not cache the returned instance
- * across awaits of unrelated work.
+ * `info()` (and, for portainer, the endpoint list) on a throw-away transport. NEVER throws
+ * for connection problems: a failure is reported as `{ ok:false, error }` so the Settings /
+ * Hosts screens can show it inline. Always closes the backend it built.
+ *
+ * TODO(B1): move the body of the old `BackendManager.test()` here (it already had the
+ * portainer-endpoint fallback and the "log the message, never the api key" rule).
  */
-export class BackendManager {
-  private cached: DockerBackend | null = null;
-  /** fingerprint of the backend settings the cached instance was built from */
-  private cachedFingerprint: string | null = null;
-  /** backends built for a one-off test(); closed as soon as the probe finishes */
-  private closing: Promise<void>[] = [];
-
-  constructor(
-    private readonly deps: { config: ConfigStore; env: Env; log: Logger },
-  ) {}
-
-  /** Throws AppError.backendNotConfigured() when settings are incomplete/invalid. */
-  get(): DockerBackend {
-    const backend = this.tryGet();
-    if (!backend) throw AppError.backendNotConfigured();
-    return backend;
-  }
-
-  /** null instead of throwing (used by /api/health and the Settings screen). */
-  tryGet(): DockerBackend | null {
-    if (this.cached) return this.cached;
-    const cfg = this.deps.config.get().backend;
-
-    if (cfg.kind === 'socket') {
-      const socketPath = cfg.socket.socketPath || this.deps.env.DOCKER_SOCKET;
-      if (!socketPath) return null;
-      this.cached = new SocketBackend({ socketPath });
-      this.cachedFingerprint = this.fingerprint();
-      this.deps.log.info({ backend: this.cached.id }, 'docker backend ready');
-      return this.cached;
-    }
-
-    if (cfg.kind === 'portainer') {
-      const apiKey = this.deps.config.getPortainerApiKey();
-      if (!cfg.portainer.url || !apiKey || cfg.portainer.endpointId === null) return null;
-      this.cached = new PortainerBackend({
-        url: cfg.portainer.url,
-        apiKey,
-        endpointId: cfg.portainer.endpointId,
-        insecureTls: cfg.portainer.insecureTls,
-      });
-      this.cachedFingerprint = this.fingerprint();
-      this.deps.log.info({ backend: this.cached.id }, 'docker backend ready');
-      return this.cached;
-    }
-
-    return null;
-  }
-
-  /**
-   * Stable digest of everything tryGet() reads out of the config. The encrypted api key
-   * is hashed, never kept verbatim, and the digest is never logged.
-   */
-  private fingerprint(): string {
-    const cfg = this.deps.config.get().backend;
-    const h = createHash('sha256');
-    h.update(
-      JSON.stringify([
-        cfg.kind,
-        cfg.portainer.url,
-        cfg.portainer.endpointId,
-        cfg.portainer.insecureTls,
-        cfg.portainer.apiKeyEnc ?? '',
-        cfg.socket.socketPath,
-        this.deps.env.DOCKER_SOCKET ?? '',
-      ]),
-    );
-    return h.digest('hex');
-  }
-
-  /** True when a usable backend is configured (does not touch the network). */
-  isConfigured(): boolean {
-    return this.tryGet() !== null;
-  }
-
-  /** Drop the cached instance; next get() rebuilds from config. Call on settings change. */
-  invalidate(): void {
-    const old = this.cached;
-    this.cached = null;
-    this.cachedFingerprint = null;
-    if (old) {
-      this.closing.push(old.close().catch(() => undefined));
-      this.deps.log.debug({ backend: old.id }, 'docker backend invalidated');
-    }
-  }
-
-  /**
-   * Invalidate ONLY when the backend section of the config actually changed. The
-   * ConfigStore emits 'change' for every write -- UI layout autosave (~every 1.5s),
-   * session create/update, password change -- and rebuilding the backend on those is
-   * both pointless and disruptive (it tears down the transport used by running
-   * builds/pulls/execs). Returns true when the backend was dropped.
-   */
-  invalidateIfChanged(): boolean {
-    if (!this.cached) {
-      this.cachedFingerprint = null;
-      return false;
-    }
-    if (this.fingerprint() === this.cachedFingerprint) return false;
-    this.invalidate();
-    return true;
-  }
-
-  /** Build a throw-away backend from an explicit probe input (never cached). */
-  private buildProbe(input: BackendProbeInput): DockerBackend {
-    if (input.kind === 'socket') {
-      const socketPath = input.socket?.socketPath || this.deps.config.get().backend.socket.socketPath || this.deps.env.DOCKER_SOCKET;
-      return new SocketBackend({ socketPath });
-    }
-    const stored = this.deps.config.get().backend.portainer;
-    const url = input.portainer?.url ?? stored.url;
-    const apiKey = input.portainer?.apiKey ?? this.deps.config.getPortainerApiKey() ?? '';
-    const endpointId = input.portainer?.endpointId ?? stored.endpointId ?? 0;
-    const insecureTls = input.portainer?.insecureTls ?? stored.insecureTls;
-    if (!url) throw AppError.badRequest('a portainer url is required');
-    if (!apiKey) throw AppError.badRequest('a portainer api key is required');
-    return new PortainerBackend({ url, apiKey, endpointId, insecureTls });
-  }
-
-  /**
-   * Test a candidate configuration WITHOUT saving it. When `portainer.apiKey` is omitted
-   * the currently stored key is used, so the UI can re-test without re-typing it.
-   * Never throws for connection problems: returns { ok:false, error }.
-   */
-  async test(input: BackendProbeInput): Promise<BackendTestResult> {
-    let backend: DockerBackend | null = null;
-    try {
-      backend = this.buildProbe(input);
-      const info = await backend.info();
-      const result: BackendTestResult = { ok: true, info };
-      if (input.kind === 'portainer' && backend instanceof PortainerBackend) {
-        try {
-          result.endpoints = await backend.listEndpoints();
-        } catch (err) {
-          this.deps.log.warn({ err: (err as Error).message }, 'portainer endpoint listing failed during test');
-          result.endpoints = [];
-        }
-      }
-      return result;
-    } catch (err) {
-      const e = err as { code?: string; message?: string };
-      this.deps.log.warn({ kind: input.kind, err: e.message }, 'backend test failed');
-      return {
-        ok: false,
-        error: { code: typeof e.code === 'string' ? e.code : 'backend_error', message: e.message ?? String(err) },
-      };
-    } finally {
-      await backend?.close().catch(() => undefined);
-    }
-  }
-
-  /** Portainer endpoint picker. Same api-key fallback rule as test(). */
-  async listPortainerEndpoints(input: { url: string; apiKey?: string; insecureTls?: boolean }): Promise<PortainerEndpoint[]> {
-    const stored = this.deps.config.get().backend.portainer;
-    const url = input.url || stored.url;
-    const apiKey = input.apiKey ?? this.deps.config.getPortainerApiKey() ?? '';
-    if (!url) throw AppError.badRequest('a portainer url is required');
-    if (!apiKey) throw AppError.badRequest('a portainer api key is required');
-    const backend = new PortainerBackend({
-      url,
-      apiKey,
-      endpointId: stored.endpointId ?? 0,
-      insecureTls: input.insecureTls ?? stored.insecureTls,
-    });
-    try {
-      return await backend.listEndpoints();
-    } finally {
-      await backend.close().catch(() => undefined);
-    }
-  }
-
-  async close(): Promise<void> {
-    const pending = this.closing;
-    this.closing = [];
-    const current = this.cached;
-    this.cached = null;
-    this.cachedFingerprint = null;
-    await Promise.all([...pending, current ? current.close().catch(() => undefined) : Promise.resolve()]);
-  }
+export async function testConnection(
+  conn: ResolvedConnection,
+  deps: { log: Logger },
+): Promise<BackendTestResult> {
+  void conn;
+  void deps;
+  throw new Error('TODO(B1): testConnection');
 }
+
+/**
+ * Portainer endpoint picker used by the credentials screen and by
+ * `POST /api/credentials/portainer/:id/import`.
+ *
+ * TODO(B1): build a PortainerBackend (endpointId 0 is fine, the call does not use it),
+ * `listEndpoints()`, close it in a finally.
+ */
+export async function listPortainerEndpoints(cred: {
+  url: string;
+  apiKey: string;
+  insecureTls?: boolean;
+}): Promise<PortainerEndpoint[]> {
+  void cred;
+  throw new Error('TODO(B1): listPortainerEndpoints');
+}
+
+/** `SocketBackend.isAvailable`, re-exported so routes do not import the transport directly. */
+export async function socketAvailable(socketPath: string): Promise<boolean> {
+  return SocketBackend.isAvailable(socketPath);
+}
+
+export { PortainerBackend, SocketBackend };

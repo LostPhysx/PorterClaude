@@ -9,10 +9,7 @@ import {
   SocketBackend,
 } from '../../src/backends/socket.js';
 import { PortainerBackend, splitImageRef } from '../../src/backends/portainer.js';
-import { buildContext, makeDataDir } from './helpers.js';
-import { AppError } from '../../src/http/errors.js';
 import type { CreateContainerSpec, DockerBackend } from '../../src/backends/types.js';
-import type { AppConfig } from '../../src/config/schema.js';
 
 const dirs: string[] = [];
 afterEach(async () => {
@@ -231,120 +228,15 @@ describe('both backends implement the DockerBackend surface', () => {
   });
 });
 
-describe('BackendManager', () => {
-  it('throws backend_not_configured until a backend is set, then caches and invalidates', async () => {
-    const dir = await makeDataDir();
-    dirs.push(dir);
-    const { ctx } = await buildContext({ DATA_DIR: dir });
-
-    expect(ctx.backends.tryGet()).toBeNull();
-    expect(ctx.backends.isConfigured()).toBe(false);
-    try {
-      ctx.backends.get();
-      throw new Error('should have thrown');
-    } catch (err) {
-      expect(err).toBeInstanceOf(AppError);
-      expect((err as AppError).code).toBe('backend_not_configured');
-      expect((err as AppError).status).toBe(409);
-    }
-
-    await ctx.config.update((draft) => {
-      draft.backend.kind = 'socket';
-      draft.backend.socket.socketPath = '/var/run/docker.sock';
-    });
-    ctx.backends.invalidate();
-    const first = ctx.backends.get();
-    expect(first.kind).toBe('socket');
-    expect(ctx.backends.get()).toBe(first); // cached
-    ctx.backends.invalidate();
-    expect(ctx.backends.get()).not.toBe(first);
-  });
-
-  // Regression (QA BE-1): the ConfigStore emits 'change' for EVERY write -- the UI layout
-  // autosave fires one every ~1.5s while a panel is dragged -- and rebuilding the backend
-  // there tore down the transport of running builds/pulls/execs.
-  it('keeps the cached backend across config writes that do not touch backend settings', async () => {
-    const dir = await makeDataDir();
-    dirs.push(dir);
-    const { ctx } = await buildContext({ DATA_DIR: dir });
-
-    await ctx.config.update((draft) => {
-      draft.backend.kind = 'socket';
-      draft.backend.socket.socketPath = '/var/run/docker.sock';
-    });
-    const first = ctx.backends.get();
-
-    // unrelated writes: ui layout/theme, general settings, a session, the password hash
-    await ctx.config.update((draft) => { draft.ui.theme = 'dark'; });
-    await ctx.config.update((draft) => { draft.ui.layout = { root: { type: 'row' } }; });
-    await ctx.config.update((draft) => { draft.general.defaultRecipe = 'python'; });
-    await ctx.config.update((draft) => { draft.auth.tokenVersion += 1; });
-    expect(ctx.backends.get()).toBe(first);
-    expect(ctx.backends.invalidateIfChanged()).toBe(false);
-    expect(ctx.backends.get()).toBe(first);
-
-    // a real backend change does rebuild
-    await ctx.config.update((draft) => { draft.backend.socket.socketPath = '/var/run/other.sock'; });
-    expect(ctx.backends.get()).not.toBe(first);
-  });
-
-  it('rebuilds when any backend field changes (kind, url, endpoint, tls, key)', async () => {
-    const dir = await makeDataDir();
-    dirs.push(dir);
-    const { ctx } = await buildContext({ DATA_DIR: dir });
-
-    await ctx.config.update((draft) => {
-      draft.backend.kind = 'portainer';
-      draft.backend.portainer.url = 'https://p.example.com';
-      draft.backend.portainer.endpointId = 2;
-      draft.backend.portainer.apiKeyEnc = ctx.secrets.encrypt('ptr_one');
-    });
-    let current = ctx.backends.get();
-
-    const mutations: ((draft: AppConfig) => void)[] = [
-      (d) => { d.backend.portainer.url = 'https://p2.example.com'; },
-      (d) => { d.backend.portainer.endpointId = 3; },
-      (d) => { d.backend.portainer.insecureTls = true; },
-      (d) => { d.backend.portainer.apiKeyEnc = ctx.secrets.encrypt('ptr_two'); },
-    ];
-    for (const mutate of mutations) {
-      await ctx.config.update(mutate);
-      const next = ctx.backends.get();
-      expect(next).not.toBe(current);
-      current = next;
-    }
-
-    await ctx.config.update((draft) => { draft.backend.kind = 'socket'; });
-    expect(ctx.backends.get().kind).toBe('socket');
-    await ctx.backends.close();
-  });
-
-  it('treats an incomplete portainer config as not configured', async () => {
-    const dir = await makeDataDir();
-    dirs.push(dir);
-    const { ctx } = await buildContext({ DATA_DIR: dir });
-    await ctx.config.update((draft) => {
-      draft.backend.kind = 'portainer';
-      draft.backend.portainer.url = 'https://p.example.com';
-      draft.backend.portainer.endpointId = null;
-    });
-    ctx.backends.invalidate();
-    expect(ctx.backends.tryGet()).toBeNull();
-  });
-
-  it('test() never throws for an unreachable host', async () => {
-    const dir = await makeDataDir();
-    dirs.push(dir);
-    const { ctx } = await buildContext({ DATA_DIR: dir });
-    const result = await ctx.backends.test({
-      kind: 'portainer',
-      portainer: { url: 'https://127.0.0.1:9/', apiKey: 'ptr_nope', endpointId: 1 },
-    });
-    expect(result.ok).toBe(false);
-    expect(result.error?.message).toBeTruthy();
-    expect(JSON.stringify(result)).not.toContain('ptr_nope');
-  }, 30_000);
-});
+// TODO(B1): the v0.1 `BackendManager` suite lived here. Rewrite it against HostManager:
+//   * no host configured           -> backendFor() throws backend_not_configured (409),
+//                                     tryBackendFor() is null, isConfigured() is false;
+//   * one socket host + one portainer host  -> two DIFFERENT cached instances, and
+//     backendFor() returns the same instance on a second call;
+//   * changing host A's connection invalidates ONLY A (invalidateChanged() returns ['a']),
+//     a PUT /api/settings/ui write invalidates nothing;
+//   * an unimplemented connection type (tcp/ssh) -> not_implemented (501);
+//   * testConnection() never throws and never echoes the api key (grep the JSON).
 
 /**
  * PortainerBackend.startContainer falls back to /restart.

@@ -1,9 +1,11 @@
-// OWNER: F1. CONTRACT: the method surface below is FROZEN - F2 calls api.sessions.list(),
-// api.settings.get(), api.settings.putUi() and terminalWsUrl(). Do not rename/remove; adding
-// is fine. Every path/shape comes from docs/design/api.md (authoritative).
+// OWNER: F1. CONTRACT: the method surface below is FROZEN and fully implemented by the
+// planner - F1 does NOT rewrite it, F2 only calls it. Adding a helper is fine; renaming or
+// changing a signature is a cross-package change (docs/design/frontend.md section 12).
 //
-// `request()` and the ApiError plumbing are implemented below; every endpoint helper is
-// already wired and must keep working exactly as written.
+// v0.2: every Docker-facing call is HOST SCOPED (`/api/hosts/:hostId/...`); the old
+// `/api/settings/backend*` endpoints are gone. Sessions stay flat - a session name is unique
+// across hosts, which is also what lets the terminal websocket route session -> host.
+// Every path/shape comes from docs/design/api.md (authoritative).
 import { bus, EVENTS } from './bus.js';
 
 export const API_BASE = '/api';
@@ -28,8 +30,14 @@ export class ApiError extends Error {
     return this.status === 401 || this.code === 'unauthorized';
   }
 
+  /** v0.2: "this host has no usable connection yet" (was: no global backend). */
   get isBackendMissing() {
     return this.code === 'backend_not_configured';
+  }
+
+  /** v0.2: a reserved connection type (tcp/ssh) the server cannot talk to yet. */
+  get isNotImplemented() {
+    return this.code === 'not_implemented' || this.status === 501;
   }
 }
 
@@ -138,8 +146,18 @@ const post = (p, body) => request('POST', p, { body });
 const put = (p, body) => request('PUT', p, { body });
 const del = (p, query) => request('DELETE', p, { query });
 
+/** Path segment encoder used for every id/name that reaches a URL. */
+const enc = encodeURIComponent;
+
+/** `/hosts/<id>` prefix of every host-scoped route. FROZEN (api.md "Host-scoped URLs"). */
+export function hostPath(hostId, suffix = '') {
+  return `/hosts/${enc(String(hostId || ''))}${suffix}`;
+}
+
 export const api = {
   // ---- health / auth ----------------------------------------------------
+  /** @returns {Promise<{status:'ok', version:string, uptimeSec:number,
+   *                     hosts:{count:number, configured:boolean, defaultHostId:string|null}}>} */
   health: () => get('/health'),
   auth: {
     /** @returns {Promise<{authenticated:boolean, needsSetup:boolean}>} */
@@ -149,16 +167,11 @@ export const api = {
     logout: () => post('/auth/logout', {}),
   },
 
-  // ---- settings ---------------------------------------------------------
+  // ---- settings (v0.2: NO `backend` section any more) --------------------
   settings: {
-    /** @returns {Promise<{backend:any, general:any, ui:{layout:any, theme:string}, auth:{passwordSet:boolean}}>} */
+    /** @returns {Promise<{general:any, ui:{layout:any, theme:string}, auth:{passwordSet:boolean},
+     *   hosts:{count:number, defaultHostId:string|null, socketAvailable:boolean, socketHostId:string|null}}>} */
     get: () => get('/settings'),
-    /** @param {{kind:'portainer'|'socket'|'none', portainer?:object, socket?:object}} input */
-    putBackend: (input) => put('/settings/backend', input),
-    /** @param {{kind:'portainer'|'socket', portainer?:object, socket?:object}} input */
-    testBackend: (input) => post('/settings/backend/test', input),
-    /** @param {{url?:string, apiKey?:string, insecureTls?:boolean}} [input] */
-    endpoints: (input = {}) => post('/settings/backend/endpoints', input),
     putGeneral: (partial) => put('/settings/general', partial),
     /** @param {{layout?:unknown, theme?:'auto'|'light'|'dark'}} ui */
     putUi: (ui) => put('/settings/ui', ui),
@@ -172,52 +185,124 @@ export const api = {
     vendor: () => get('/settings/vendor'),
   },
 
-  // ---- docker read-only helpers ----------------------------------------
-  docker: {
-    info: () => get('/docker/info'),
-    /** @param {{all?:boolean, managed?:boolean}} [opts] */
-    containers: (opts = {}) =>
-      get('/docker/containers', { all: opts.all ? 1 : undefined, managed: opts.managed ? 1 : undefined }),
-    volumes: () => get('/docker/volumes'),
-    networks: () => get('/docker/networks'),
+  // ---- hosts (v0.2) ------------------------------------------------------
+  hosts: {
+    /** @param {{probe?:boolean}} [opts] probe=1 refreshes every host in parallel
+     *  @returns {Promise<{hosts:any[], defaultHostId:string|null}>} */
+    list: (opts = {}) => get('/hosts', { probe: opts.probe ? 1 : undefined }),
+    /** always probes @returns {Promise<{host:any}>} */
+    get: (hostId) => get(hostPath(hostId)),
+    /** @param {any} input HostInput @returns {Promise<{host:any}>} */
+    create: (input) => post('/hosts', input),
+    /** @param {any} input HostUpdateInput (partial; `id` is immutable) */
+    update: (hostId, input) => put(hostPath(hostId), input),
+    /** @param {{force?:boolean}} [opts] force=1 deletes a host that still has sessions */
+    remove: (hostId, opts = {}) => del(hostPath(hostId), { force: opts.force ? 1 : undefined }),
+    /** Probe UNSAVED form values. @param {any} connection @param {string} [apiKey]
+     *  @returns {Promise<{ok:boolean, info?:any, endpoints?:any[], error?:{code:string,message:string}}>} */
+    test: (connection, apiKey) => post('/hosts/test', apiKey ? { connection, apiKey } : { connection }),
+    /** Probe a STORED host (always 200 + BackendTestResult). */
+    testStored: (hostId) => post(hostPath(hostId, '/test'), {}),
+    /** @returns {Promise<{host:any, defaultHostId:string}>} */
+    makeDefault: (hostId) => post(hostPath(hostId, '/default'), {}),
+    /** @returns {Promise<{info:any}>} */
+    info: (hostId) => get(hostPath(hostId, '/info')),
+    /** @returns {Promise<{agents:any[], enabled:string[]}>} HostAgentView[] */
+    agents: (hostId) => get(hostPath(hostId, '/agents')),
+    /** @param {string[]} enabled agent ids @returns {Promise<{agents:any[], enabled:string[]}>} */
+    setAgents: (hostId, enabled) => put(hostPath(hostId, '/agents'), { enabled }),
   },
 
-  // ---- sessions ---------------------------------------------------------
+  // ---- stored credentials (v0.2) ----------------------------------------
+  credentials: {
+    portainer: {
+      /** @returns {Promise<{credentials:any[]}>} SanitizedPortainerCredential[] */
+      list: () => get('/credentials/portainer'),
+      /** @param {{name:string, url:string, apiKey:string, insecureTls?:boolean}} input */
+      create: (input) => post('/credentials/portainer', input),
+      /** partial; OMIT `apiKey` to keep the stored one (never send "") */
+      update: (id, input) => put(`/credentials/portainer/${enc(id)}`, input),
+      remove: (id) => del(`/credentials/portainer/${enc(id)}`),
+      /** unsaved probe @param {{url:string, apiKey:string, insecureTls?:boolean}} input */
+      test: (input) => post('/credentials/portainer/test', input),
+      /** probe a stored credential, optionally overriding fields from the form */
+      testStored: (id, input = {}) => post(`/credentials/portainer/${enc(id)}/test`, input),
+      /** @returns {Promise<{endpoints:{id:number,name:string,type:number,status:number,url?:string}[]}>} */
+      endpoints: (id) => get(`/credentials/portainer/${enc(id)}/endpoints`),
+      /** one host per endpoint
+       *  @param {{endpointIds?:number[], nameTemplate?:string, update?:boolean}} [input]
+       *  @returns {Promise<{result:{created:string[], updated:string[], skipped:any[], hosts:any[]}}>} */
+      importEndpoints: (id, input = {}) => post(`/credentials/portainer/${enc(id)}/import`, input),
+    },
+  },
+
+  // ---- agent definitions (v0.2) -----------------------------------------
+  agents: {
+    /** @returns {Promise<{agents:any[]}>} AgentView[] (built-in + custom) */
+    list: () => get('/agents'),
+    get: (id) => get(`/agents/${enc(id)}`),
+    /** @param {any} definition AgentDefinition (custom only) */
+    create: (definition) => post('/agents', definition),
+    update: (id, definition) => put(`/agents/${enc(id)}`, definition),
+    /** @param {{force?:boolean}} [opts] force=1 also strips it from hosts/sessions */
+    remove: (id, opts = {}) => del(`/agents/${enc(id)}`, { force: opts.force ? 1 : undefined }),
+  },
+
+  // ---- docker read-only helpers (host scoped) ---------------------------
+  docker: {
+    info: (hostId) => get(hostPath(hostId, '/docker/info')),
+    /** @param {{all?:boolean, managed?:boolean}} [opts] */
+    containers: (hostId, opts = {}) =>
+      get(hostPath(hostId, '/docker/containers'), {
+        all: opts.all ? 1 : undefined,
+        managed: opts.managed ? 1 : undefined,
+      }),
+    volumes: (hostId) => get(hostPath(hostId, '/docker/volumes')),
+    networks: (hostId) => get(hostPath(hostId, '/docker/networks')),
+  },
+
+  // ---- images / recipes / jobs / tools (host scoped) ---------------------
+  images: {
+    list: (hostId) => get(hostPath(hostId, '/images')),
+    recipes: (hostId) => get(hostPath(hostId, '/images/recipes')),
+    /** @param {{noCache?:boolean, pull?:boolean}} [opts] */
+    buildRecipe: (hostId, name, opts = {}) =>
+      post(hostPath(hostId, `/images/recipes/${enc(name)}/build`), opts),
+    jobs: (hostId) => get(hostPath(hostId, '/images/jobs')),
+    /** @param {number} since append-only cursor (use the previous nextIndex) */
+    job: (hostId, id, since = 0) => get(hostPath(hostId, `/images/jobs/${enc(id)}`), { since }),
+    cancelJob: (hostId, id) => post(hostPath(hostId, `/images/jobs/${enc(id)}/cancel`), {}),
+    /** @returns {Promise<{status:any}>} ToolsStatus incl. `agents: AgentToolStatus[]` */
+    tools: (hostId) => get(hostPath(hostId, '/images/tools')),
+    /** installs every agent enabled on this host into its tools volume */
+    syncTools: (hostId, force = false) => post(hostPath(hostId, '/images/tools/sync'), { force }),
+    validateCustom: (hostId, image) => post(hostPath(hostId, '/images/custom/validate'), { image }),
+    pull: (hostId, image) => post(hostPath(hostId, '/images/pull'), { image }),
+  },
+
+  // ---- sessions (FLAT: names are unique across hosts) --------------------
   sessions: {
-    /** @returns {Promise<{sessions: SessionView[]}>} */
-    list: () => get('/sessions'),
-    get: (name) => get(`/sessions/${encodeURIComponent(name)}`),
+    /** @param {{hostId?:string}} [opts] optional server-side filter
+     *  @returns {Promise<{sessions: any[]}>} SessionView[] (with hostId/hostName/resolvedAgents) */
+    list: (opts = {}) => get('/sessions', { hostId: opts.hostId }),
+    get: (name) => get(`/sessions/${enc(name)}`),
+    /** @param {any} input SessionInput (+ `hostId` on create, `agents`) */
     create: (input) => post('/sessions', input),
-    update: (name, input) => put(`/sessions/${encodeURIComponent(name)}`, input),
-    /** @param {{removeVolumes?:boolean}} [opts] */
+    /** `hostId` must not change - the server answers 422 */
+    update: (name, input) => put(`/sessions/${enc(name)}`, input),
+    /** @param {{removeVolumes?:boolean}} [opts] never removes an agent auth volume */
     remove: (name, opts = {}) =>
-      del(`/sessions/${encodeURIComponent(name)}`, { removeVolumes: opts.removeVolumes ? 1 : undefined }),
-    start: (name) => post(`/sessions/${encodeURIComponent(name)}/start`, {}),
-    stop: (name) => post(`/sessions/${encodeURIComponent(name)}/stop`, {}),
-    restart: (name) => post(`/sessions/${encodeURIComponent(name)}/restart`, {}),
-    recreate: (name) => post(`/sessions/${encodeURIComponent(name)}/recreate`, {}),
+      del(`/sessions/${enc(name)}`, { removeVolumes: opts.removeVolumes ? 1 : undefined }),
+    start: (name) => post(`/sessions/${enc(name)}/start`, {}),
+    stop: (name) => post(`/sessions/${enc(name)}/stop`, {}),
+    restart: (name) => post(`/sessions/${enc(name)}/restart`, {}),
+    recreate: (name) => post(`/sessions/${enc(name)}/recreate`, {}),
     /** @param {{tail?:number, timestamps?:boolean}} [opts] */
     logs: (name, opts = {}) =>
-      get(`/sessions/${encodeURIComponent(name)}/logs`, {
+      get(`/sessions/${enc(name)}/logs`, {
         tail: opts.tail, timestamps: opts.timestamps ? 1 : undefined,
       }),
     reconcile: () => post('/sessions/reconcile', {}),
-  },
-
-  // ---- images / recipes / jobs / tools ----------------------------------
-  images: {
-    list: () => get('/images'),
-    recipes: () => get('/images/recipes'),
-    /** @param {{noCache?:boolean, pull?:boolean}} [opts] */
-    buildRecipe: (name, opts = {}) => post(`/images/recipes/${encodeURIComponent(name)}/build`, opts),
-    jobs: () => get('/images/jobs'),
-    /** @param {number} since append-only cursor (use the previous nextIndex) */
-    job: (id, since = 0) => get(`/images/jobs/${encodeURIComponent(id)}`, { since }),
-    cancelJob: (id) => post(`/images/jobs/${encodeURIComponent(id)}/cancel`, {}),
-    tools: () => get('/images/tools'),
-    syncTools: (force = false) => post('/images/tools/sync', { force }),
-    validateCustom: (image) => post('/images/custom/validate', { image }),
-    pull: (image) => post('/images/pull', { image }),
   },
 };
 
@@ -228,10 +313,48 @@ export const api = {
 /** Pane names must match this so the derived tmux name `pc_<name>` is safe. */
 export const TERMINAL_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,39}$/;
 
+/** Agent ids are slugs (server/src/agents/model.ts AGENT_ID_RE). */
+export const AGENT_ID_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
+
+/**
+ * Build the wire value of the `shell` query parameter (server/src/terminals/protocol.ts
+ * `parseTerminalShell`). FROZEN.
+ *   ('bash')              -> 'bash'
+ *   ('sh')                -> 'sh'
+ *   ('agent', 'claude')   -> 'agent:claude'
+ * The legacy v0.1 value 'claude' is still accepted by the server but the UI never sends it.
+ * @param {'bash'|'sh'|'agent'} shell
+ * @param {string|null} [agentId]
+ * @returns {string}
+ */
+export function formatShellParam(shell, agentId = null) {
+  if (shell === 'agent') {
+    if (!agentId || !AGENT_ID_RE.test(String(agentId))) throw new Error(`invalid agent id: ${agentId}`);
+    return `agent:${agentId}`;
+  }
+  return shell === 'sh' ? 'sh' : 'bash';
+}
+
+/**
+ * Inverse of {@link formatShellParam}: parse a persisted/legacy wire value. FROZEN.
+ * Returns null when the value is not understood.
+ * @param {string} raw
+ * @returns {{shell:'bash'|'sh'|'agent', agentId:string|null}|null}
+ */
+export function parseShellParam(raw) {
+  const value = String(raw || '');
+  if (value === 'bash' || value === 'sh') return { shell: value, agentId: null };
+  if (value === 'claude') return { shell: 'agent', agentId: 'claude' }; // v0.1 layout blobs
+  const match = /^agent:([a-z0-9][a-z0-9-]{0,31})$/.exec(value);
+  return match ? { shell: 'agent', agentId: match[1] } : null;
+}
+
 /**
  * Build the terminal websocket URL. The pc_session cookie rides along automatically
- * because this is same-origin.
- * @param {{session:string, shell:'bash'|'claude'|'sh', name:string, cols?:number, rows?:number}} opts
+ * because this is same-origin. There is NO host parameter: the server resolves
+ * session -> host (api.md "WebSocket: terminals").
+ * @param {{session:string, shell:string, name:string, cols?:number, rows?:number}} opts
+ *        `shell` is the WIRE value: 'bash' | 'sh' | 'agent:<agentId>' (formatShellParam)
  * @returns {string}
  */
 export function terminalWsUrl(opts) {

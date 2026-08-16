@@ -146,3 +146,28 @@
 [data-bs-theme="light"] .lm_header .lm_tab .lm_close_tab { filter: invert(1); }
 [data-bs-theme="light"] .lm_controls > li { filter: invert(1); }
 [data-bs-theme="light"] .pc-pane-note { border-bottom-color: rgba(0, 0, 0, .1); }
+
+/* ------------------------------------------------- v0.2: hosts in the rail */
+/* Seeded by the planner so F2 has the class names; extend, do not rename.
+   The rail groups sessions by host; with a single host no group header is rendered. */
+.pc-rail-group + .pc-rail-group { margin-top: .25rem; }
+.pc-rail-group-head {
+  display: flex;
+  align-items: center;
+  gap: .35rem;
+  padding: .2rem .5rem;
+  font-size: .7rem;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  color: var(--bs-secondary-color);
+  background: var(--bs-secondary-bg);
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+.pc-rail-group-head .pc-rail-group-count { margin-left: auto; opacity: .7; }
+.pc-rail-group.is-missing .pc-rail-group-head { color: var(--bs-danger-text-emphasis); }
+
+.pc-code-toolbar #code-host-filter { max-width: 12rem; }
+#new-agent-menu { --bs-dropdown-font-size: .85rem; }
+#new-agent-menu .dropdown-item i { width: 1rem; }

@@ -1,5 +1,8 @@
 # PorterClaude — orchestration / CI / CD design (`docker/`, `deploy/`, `.github/`)
 
+> **v0.2 (uniform agent delivery): the [v0.2 section](#v02--uniform-agent-delivery-authoritative-from-here-down)
+> at the end of this file wins wherever it contradicts the v0.1 text above it.**
+
 Companion to [`api.md`](api.md) (wire contract) and [`backend.md`](backend.md) (server
 internals). This topic owns everything that *produces or ships images and deployments*:
 the session recipe images, the tools volume payload, the PorterClaude app image, the
@@ -585,3 +588,438 @@ Integration QA (needs the reference host):
 12. `php` recipe: session with port 80 published → the sample page renders.
 13. `deploy/deploy.sh` end-to-end → image built on the arm64 host → stack created, then a
     second run updates the same stack → `https://$APP_HOSTNAME/api/health` is `{"status":"ok"}`.
+
+---
+
+# v0.2 — uniform agent delivery (AUTHORITATIVE from here down)
+
+Everything above describes v0.1 and stays true unless this section contradicts it; **where
+they disagree, this section wins**. Companions: `backend.md` §11–16 (server internals) and
+`api.md` §"v0.2" (wire contract). This section is planner-owned: **do not edit it**; report
+instead of rewriting.
+
+## 11 What v0.2 changes, in one paragraph
+
+Coding agents (claude, opencode, gemini, codex, aider, plus custom ones) are no longer baked
+into the recipe images. **Every** session — recipe *and* custom — mounts the per-host tools
+volume read-only and is started with `<toolsMount>/entrypoint.sh` as its entrypoint. The
+tools volume is populated per host by the tools image, which now installs the host's
+**enabled agents** at *populate* time (not build time) from the `PORTERCLAUDE_AGENTS` spec
+the server passes in, records the result in `<toolsMount>/AGENTS.json`, and ships the
+runtimes those agents need (a standalone Node for npm agents, `uv` + a managed CPython for
+pip agents). The entrypoint wires `PATH`, the per-agent `HOME`/config **symlinks** into the
+mounted auth volumes (`PORTERCLAUDE_AGENT_LINKS`), and the ownership repair. Recipes become
+pure language-toolchain images. Nothing about `docker/Dockerfile`, `docker-compose.yml`,
+`deploy/**` or the workflows changes functionally — only their documentation and CI's static
+checks.
+
+### Change list
+
+| # | Change | Owner |
+|---|---|---|
+| 1 | `docker/recipes/common.sh` no longer installs Claude Code; no `/etc/porterclaude/claude-version`; no `~/.claude*` seeding; it creates `~/.porterclaude/agents` instead | O1 |
+| 2 | Recipe Dockerfiles drop `ARG CLAUDE_VERSION` and the `porterclaude.claude-version` label; `pc-entrypoint.sh` shrinks to "HOME/TERM + `exec "$@"` + idle fallback" | O1 |
+| 3 | `docker/tools/` becomes a manifest-driven **agent installer**: `install-agents.sh` + `lib/*.sh` + per-agent overrides in `agents/<id>.sh` | O1 |
+| 4 | `docker/tools/fetch-claude.sh` is folded into `docker/tools/agents/claude.sh` and **deleted** | O1 |
+| 5 | The tools image no longer downloads anything at build time; the populate container does the work and needs network on the host | O1 |
+| 6 | `docker/tools/entrypoint.sh` becomes agent-generic (link table from `PORTERCLAUDE_AGENT_LINKS`, ownership over `~/.porterclaude`, wrappers per agent command) | O1 |
+| 7 | New payload layout (`agents/`, `bin/`, `lib/`, `runtime/`, `AGENTS.json`); `bin/claude-linux-*` moves to `agents/claude/bin/` | O1 |
+| 8 | `docker/README.md` + `docker/tools/README.md` rewritten for agents; the "add a recipe" section gains "recipes must not install an agent" | O1 |
+| 9 | `docs/DEPLOYMENT.md`: multi-host, per-host tools volume + auth volumes, upgrade procedure, disk/network expectations | O2 |
+| 10 | New `docs/AGENTS.md`: what an agent is, the built-ins, and **how to add a custom agent** | O2 |
+| 11 | `README.md`: agent-neutral copy, v0.2 feature list, hosts | O2 |
+| 12 | Root `docker-compose.yml` + `deploy/**`: comment/doc updates only (`PORTERCLAUDE_BACKEND`/`PORTAINER_*` now seed the **first host**) | O2 |
+| 13 | CI: deletion-proof shell lint loop, `install-agents.sh --plan` contract test, agent-id parity with `server/src/agents/builtin.ts`, "no agent in a recipe" guard | O2 |
+
+### Ownership (v0.2, disjoint)
+
+```
+O1  docker/**            (tools, recipes, app Dockerfile, docker/README.md), .dockerignore
+O2  docker-compose.yml (root), deploy/**, .github/**, docs/** (except docs/design/*.md),
+    README.md
+```
+`docs/design/orchestration.md` stays planner-owned. `docs/design/api.md`, `backend.md` and
+`frontend.md` belong to the other topics — **do not edit them**.
+
+---
+
+## 12 Contracts with the backend topic (frozen, from `backend.md` §12.3)
+
+| Direction | Item | Value |
+|---|---|---|
+| server → tools container | env `PORTERCLAUDE_AGENTS` | JSON array of `AgentInstallSpec` = `{id, command, install, versionCommand}` (`server/src/agents/model.ts`) |
+| server → tools container | mount | the host's tools volume, **rw at `/out`** |
+| tools → volume | `<toolsMount>/AGENTS.json` | `{ syncedAt, agents:[{id,command,installed,version,error}] }` = `ToolsAgentManifest` |
+| tools → volume | `<toolsMount>/agents/<id>/…` | the agent's files |
+| tools → volume | `<toolsMount>/bin/<command>` | the executable shim that ends up on `PATH` |
+| tools → volume | `<toolsMount>/runtime/node/bin/node`, `<toolsMount>/runtime/python` | bundled runtimes |
+| tools → volume | `<toolsMount>/entrypoint.sh` | 0755, the entrypoint of **every** session |
+| server → session | env `PORTERCLAUDE_AGENT_IDS` | `claude,opencode` |
+| server → session | env `PORTERCLAUDE_AGENT_LINKS` | `target\|source\|kind;target\|source\|kind` (`encodeAgentLinks`) |
+| server → session | env `PORTERCLAUDE_TOOLS`, `PORTERCLAUDE_HOME`, `HOME`, `PATH`, `PORTERCLAUDE_SESSION`, `PORTERCLAUDE_HOST`, `TERM` | as v0.1, plus `PORTERCLAUDE_HOST` |
+| server → session | entrypoint | `["<toolsMount>/entrypoint.sh"]` for **every** session; `cmd ["sleep","infinity"]` only for custom images (recipes keep their image CMD) |
+| server → container | `<toolsMount>/entrypoint.sh --porterclaude-bootstrap` | root exec after start: re-run the steps that need a writable `$HOME` |
+| server → container | `<toolsMount>/entrypoint.sh --porterclaude-share` | root exec / shim call: hand the agent dirs back to their owner |
+
+`AgentInstallSpec.install` is one of four kinds (`agents/model.ts`):
+
+```jsonc
+{"kind":"script","url":"https://…","args":[],"binPath":"bin/claude","env":{}}
+{"kind":"npm","package":"@google/gemini-cli","version":"latest","bin":"gemini"}
+{"kind":"pip","package":"aider-chat","version":"…","bin":"aider","preferUv":true}
+{"kind":"binary","urls":{"linux-x64":"https://…","linux-arm64":"https://…"},"archive":"tar.gz","path":"dist/foo"}
+```
+
+**Additive, optional env** the tools image reads and defaults itself — the server MAY pass
+them, nothing breaks when it does not:
+
+| Env | Default | Meaning |
+|---|---|---|
+| `PORTERCLAUDE_TOOLS_MOUNT` | `/opt/porterclaude` | the path sessions mount the volume at (§13.2 — the reason absolute paths baked by `npm`/`uv` are correct) |
+| `PORTERCLAUDE_TOOLS_FORCE` | `0` | `1` = reinstall every agent even when `SPEC.json` is unchanged |
+| `PORTERCLAUDE_AGENT_TIMEOUT` | `900` | per-agent install timeout in seconds |
+| `PORTERCLAUDE_NODE_VERSION` | pinned in `lib/runtime.sh` | Node runtime for npm agents |
+| `PORTERCLAUDE_UV_VERSION` | `latest` | uv release for pip agents |
+| `CLAUDE_DIST_BASE`, `PORTERCLAUDE_CLAUDE_VERSION` | as v0.1 | claude binary source / channel |
+
+**Exit code of the populate container**: `0` unless the *payload itself* (entrypoint, shims,
+libs, manifest) could not be published. A single agent failing to install is a **warning**:
+it is recorded as `installed:false` + `error` in `AGENTS.json`, printed as
+`[tools][warn] …`, and the job still succeeds (`backend.md` §15).
+
+---
+
+## 13 The tools volume, v2
+
+### 13.1 Payload layout (frozen)
+
+```
+<toolsMount>/entrypoint.sh                    0755  session bootstrap (POSIX sh)
+<toolsMount>/AGENTS.json                      0644  ToolsAgentManifest
+<toolsMount>/VERSION                          0644  claude's version, or empty (v0.1 compat)
+<toolsMount>/lib/pc-common.sh                 0644  sh helpers shared by shims + entrypoint
+<toolsMount>/bin/pc-agent                     0755  the one shim implementation
+<toolsMount>/bin/<command>                    0755  per-agent shim (execs pc-agent)
+<toolsMount>/agents/<id>/run.sh               0755  generated launcher for that agent
+<toolsMount>/agents/<id>/VERSION              0644  `versionCommand` output, or empty
+<toolsMount>/agents/<id>/SPEC.json            0644  the AgentInstallSpec this dir was built from
+<toolsMount>/agents/<id>/ERROR                0644  install error (absent on success)
+<toolsMount>/agents/<id>/…                          kind-specific payload (prefix/, node_modules/, tools/)
+<toolsMount>/runtime/node/bin/node            0755  libc dispatcher (POSIX sh)
+<toolsMount>/runtime/node/<glibc|musl>/…            unpacked Node distribution
+<toolsMount>/runtime/uv/bin/uv                0755  static uv (runs on glibc and musl)
+<toolsMount>/runtime/python/…                       uv-managed CPython (glibc; musl best effort)
+```
+
+Everything is world-readable/executable (`chmod -R a+rX`, `0755` on executables): sessions
+mount the volume **read-only** and run as arbitrary uids. `bin/claude-linux-*` of v0.1 is
+gone — `bin/claude` is now the generic shim, so v0.1 containers keep working after an
+upgrade.
+
+### 13.2 The `/opt/porterclaude` symlink trick (why absolute paths survive)
+
+The populate container mounts the volume at **`/out`**, sessions mount it at
+**`<toolsMount>`** (`/opt/porterclaude` by default). `npm` bin shims, `uv` tool scripts and
+`pyvenv.cfg` bake **absolute** paths at install time, so installing under `/out/...` would
+produce launchers that point at a path no session has.
+
+Rule: before installing anything, `populate.sh` creates the staging directory and points the
+runtime path at it **inside the populate container only**:
+
+```sh
+STAGE="$OUT/.pc-stage.$$"
+MOUNT="${PORTERCLAUDE_TOOLS_MOUNT:-/opt/porterclaude}"
+mkdir -p "$STAGE"
+rm -rf "$MOUNT"; mkdir -p "$(dirname "$MOUNT")"; ln -sfn "$STAGE" "$MOUNT"
+```
+
+Every installer then works with `$MOUNT/agents/<id>`, `$MOUNT/runtime/...` paths, so every
+absolute path any third-party installer records is already the path the sessions will see.
+Promotion (§13.4) moves the staged trees into `$OUT` and drops the symlink.
+
+### 13.3 Install-time vs populate-time
+
+| Stage | Does |
+|---|---|
+| image build (`docker/tools/Dockerfile`) | installs `ca-certificates curl jq tar xz-utils unzip` and copies the scripts into `/payload` + `/usr/local/bin`. **No downloads** — the image is small and its context hash only changes when *our* scripts change |
+| populate run (`CMD populate.sh`) | publishes the static payload, then installs/updates the agents named in `PORTERCLAUDE_AGENTS`, writes `AGENTS.json`, promotes everything into the volume |
+
+Consequences, to be documented by O2: a tools sync needs **network access from the docker
+host**, takes minutes on the first run, and the tools volume grows (Node ≈ 60 MB, a uv
+CPython ≈ 90 MB, aider's dependencies ≈ 250 MB).
+
+**Idempotency**: an agent whose `SPEC.json` equals the incoming spec, whose `VERSION` is
+non-empty and which has no `ERROR` file is *carried over* (`cp -a` from the volume into the
+stage) instead of reinstalled, unless `PORTERCLAUDE_TOOLS_FORCE=1`. Agents that are no
+longer in the spec are dropped from the volume (their **auth volume is never touched** —
+disabling an agent must not destroy a login).
+
+### 13.4 Promotion (ETXTBSY, still the rule)
+
+Sessions execute binaries straight off this volume, so nothing may be written in place.
+* **files** (`entrypoint.sh`, `AGENTS.json`, `bin/*`, `lib/*`, `VERSION`): staged, then
+  `mv -f` over the target — `rename(2)` is allowed on a busy executable.
+* **directories** (`agents/<id>`, `runtime/<name>`): staged, then swapped —
+  `mv "$OUT/agents/<id>" "$OUT/agents/.<id>.old"` → `mv "$STAGE/agents/<id>" "$OUT/agents/<id>"`
+  → `rm -rf "$OUT/agents/.<id>.old"`. Unlinking a running executable is legal on Linux; the
+  running process keeps its inode and the next start picks up the new tree.
+* Stale `$OUT/.pc-stage.*` and `$OUT/**/.*.old` directories are removed at the start of the
+  next run.
+
+### 13.5 `AGENTS.json`
+
+Written with `jq -n` (never string concatenation) and matching
+`ToolsAgentManifest` in `server/src/agents/model.ts` **exactly** — no extra keys:
+
+```json
+{
+  "syncedAt": "2026-08-16T10:11:12Z",
+  "agents": [
+    { "id": "claude", "command": "claude", "installed": true,  "version": "2.1.5", "error": null },
+    { "id": "aider",  "command": "aider",  "installed": false, "version": null,    "error": "uv tool install failed (see the job log)" }
+  ]
+}
+```
+
+`version` is the first line of `versionCommand` output, trimmed, or `null`.
+`<toolsMount>/VERSION` mirrors the `claude` entry (empty file when claude is not installed)
+so the v0.1 `cat /payload/VERSION` probe keeps working.
+
+### 13.6 Shims and launchers
+
+`bin/<command>` (generated, POSIX sh, 3 lines) sets `PORTERCLAUDE_AGENT_ID=<id>` and execs
+`bin/pc-agent`, which:
+1. resolves `TOOLS` from `$PORTERCLAUDE_TOOLS` or `dirname $0/..`;
+2. errors with a clear "agent `<id>` is not installed on this host — Settings → Images →
+   Sync tools" when `agents/<id>/run.sh` is missing (exit 127);
+3. calls `entrypoint.sh --porterclaude-share` **before and after** the run (the v0.1
+   ownership hand-back, now for every agent, not just claude);
+4. runs `agents/<id>/run.sh "$@"` and propagates its exit status.
+
+`agents/<id>/run.sh` is generated per kind and **never** contains a `/out` path:
+
+| kind | `run.sh` execs |
+|---|---|
+| `script` / `binary` | the installed executable (claude: the arch+libc dispatch of §13.7) |
+| `npm` | `"$TOOLS/runtime/node/bin/node" "$AGENT_DIR/node_modules/<pkg>/<binjs>" "$@"` (the bin path is resolved from the package's `package.json` at install time) |
+| `pip` | `"$AGENT_DIR/tools/<pkg>/bin/<bin>" "$@"` (uv tool script, shebang → `$MOUNT/runtime/python/...`) |
+
+Two agents claiming the same `command`: the **first** spec in `PORTERCLAUDE_AGENTS` wins;
+the later one is installed but gets no shim and is recorded with
+`error:"command '<cmd>' is already provided by agent '<id>'"`.
+
+### 13.7 Architecture and libc matrix
+
+`uname -m` in the populate container is the host architecture (`x86*64|amd64 → x64`,
+`aarch*64|arm64 → arm64`); **never** hardcode an architecture literal anywhere under
+`docker/`. The libc of a *session* is not known at install time — an arm64 host can run
+`debian:bookworm` (glibc) and `alpine:3.20` (musl) sessions side by side — so anything that
+can cover both must:
+
+| Agent kind | glibc sessions | musl sessions |
+|---|---|---|
+| `claude` (override) | native binary `linux-<arch>` | native binary `linux-<arch>-musl` |
+| `script` (generic, e.g. opencode) | installer output | works when the installer produces a static/musl-compatible binary — **best effort** |
+| `npm` | bundled Node (nodejs.org) | bundled Node musl build (unofficial-builds.nodejs.org; may be missing for arm64) — **best effort** |
+| `pip` | uv-managed CPython | **not supported** (documented; the shim prints a clear error) |
+| `binary` | the `linux-<arch>` URL | the `linux-<arch>-musl` URL when the definition provides one |
+
+Detection at runtime (`lib/pc-common.sh`, mirrored in every generated launcher):
+`ls /lib/ld-musl-* >/dev/null 2>&1 || ldd --version 2>&1 | grep -qi musl` → musl. A missing
+musl artefact falls back to the glibc one **only** when it is known to be static (claude's
+musl build is static and is therefore also the glibc fallback, as in v0.1).
+
+### 13.8 File layout of `docker/tools/` (O1)
+
+```
+docker/tools/
+  Dockerfile            build: packages + copy scripts into /payload, CMD populate.sh
+  populate.sh           CMD: stage → publish payload → install agents → promote  (bash)
+  install-agents.sh     the agent driver: parse PORTERCLAUDE_AGENTS, install, manifest (bash)
+  entrypoint.sh         RUNTIME, strict POSIX sh, ships in the payload
+  lib/pc-common.sh      RUNTIME + build: log/warn, arch/libc detection (POSIX sh, ships)
+  lib/common.sh         build-only helpers: download, retry, timeout, json (bash)
+  lib/kinds.sh          pc_install_script / _npm / _pip / _binary (bash)
+  lib/runtime.sh        pc_ensure_node / pc_ensure_uv / pc_ensure_python (bash)
+  agents/<id>.sh        optional per-agent override (currently only claude.sh)
+  README.md
+```
+Only `entrypoint.sh` and `lib/pc-common.sh` run **inside session images**: strict POSIX sh,
+no bashisms, no GNU-only flags. Everything else runs only in the Debian-based tools image and
+may use bash + `jq`.
+
+**Per-agent override protocol**: if `docker/tools/agents/<id>.sh` exists it is sourced and
+its `pc_agent_install_<id>` function is called *instead of* the kind installer, with the same
+contract (see §13.9). It exists so a built-in can do better than the generic path — today
+only `claude` does (multi-libc native binaries + installer fallback, i.e. what
+`fetch-claude.sh` did in v0.1).
+
+### 13.9 Installer contract (every kind, every override)
+
+```
+in :  $AGENT_ID  $AGENT_COMMAND  $AGENT_DIR (=$MOUNT/agents/<id>, empty, exists)
+      $AGENT_SPEC (the spec object as JSON)  $TOOLS_MOUNT (=$MOUNT)  $ARCH  $TARGET
+out:  0  → $AGENT_DIR/run.sh exists and is executable
+      >0 → the agent is recorded installed:false; the reason was printed to stderr
+never: exit the calling script, write outside $AGENT_DIR / $MOUNT/runtime, prompt, take
+      longer than $PORTERCLAUDE_AGENT_TIMEOUT (the driver wraps the call in `timeout`)
+```
+The driver writes `SPEC.json`, `VERSION` (by running `versionCommand` through the shim) and
+`ERROR`; installers never write those three.
+
+---
+
+## 14 `entrypoint.sh`, v2 (runtime, every session)
+
+Still PID 1 in every managed container, still strict POSIX `sh`, still **nothing in it may
+abort the container**. What changes: it is agent-generic and reads its work from the
+environment instead of hardcoding `~/.claude`.
+
+1. `TOOLS`, `HOME`/`PORTERCLAUDE_HOME`/`IMAGE_HOME` resolution: **unchanged from v0.1** (the
+   passwd lookup, the `/` guard, `ORIG_PATH`).
+2. `setup_path()`: unchanged (`$TOOLS/bin` first, image PATH preserved, snippets persisted
+   into `/etc/profile.d/porterclaude.sh`, `$HOME/.profile`, `$HOME/.bashrc` and the image
+   home's copies, guarded by a marker). Bump the marker to `porterclaude (generated v3)` so
+   containers bootstrapped by a v0.1 volume get the new block appended.
+3. `link_agents()` **(new, replaces `link_claude_config`)** — for every entry of
+   `PORTERCLAUDE_AGENT_LINKS` (`target|source|kind;…`):
+   * `mkdir -p` the parent of `target` and, for `kind=dir`, `source` itself; for
+     `kind=file`, seed `source` when absent — `{}` when its name ends in `.json`, otherwise
+     an empty file;
+   * park an existing regular file/directory at `target` aside to `<target>.pc-backup`
+     (never delete user data — the v0.1 `park_aside` is reused verbatim);
+   * `ln -s "$source" "$target"`.
+   Failures warn and continue (a read-only auth volume, a not-yet-chowned mountpoint).
+4. `claim_agents()` **(new, replaces `claim_shared`)** — root only: determine the owner as
+   the first non-root owner among `<home>/.porterclaude/agents/*`, falling back to
+   `1000:1000` (the recipe user), then `chown -R` `<home>/.porterclaude` and every link
+   target it created. Non-root sessions only warn when an agent dir belongs to a foreign uid.
+5. `install_agent_wrappers()` **(new, replaces `install_claude_wrapper`)** — root only:
+   for every `$TOOLS/bin/*` shim whose name does not already resolve to something outside
+   `$TOOLS`, write a 3-line `/usr/local/bin/<name>` that execs it (covers non-login shells).
+   `pc-agent` itself is skipped.
+6. `bridge_image_home()` — generic: for every link target under `$HOME`, create the same
+   relative path under `$IMAGE_HOME` pointing at the same `source`.
+7. `bootstrap_packages()` (git + tmux, root only, best effort) and the idle loop: unchanged.
+8. Modes: `--porterclaude-share` → step 4 only; `--porterclaude-bootstrap` → steps 2–6
+   (the server's root exec after start); no flag → the full sequence, then `exec "$@"` /
+   idle loop.
+
+Ordering note for QA: on a **fresh** auth volume the mountpoint is `root:root`, so a recipe
+session (uid 1000) cannot create the link sources — step 3 warns, the server chowns and
+re-runs `--porterclaude-bootstrap`, and only then are the links complete. That is by design;
+the session is usable either way.
+
+---
+
+## 15 Recipes, v0.2
+
+Recipes are **language-toolchain images only**. `common.sh`:
+
+* keeps: apt toolchain, `gh`, the `dev` user (uid 1000), `/etc/profile.d/porterclaude.sh`,
+  `/etc/porterclaude/recipe`, cleanup;
+* **drops** `install_claude()` entirely (no `/opt/claude`, no `/usr/local/bin/claude`, no
+  `/etc/porterclaude/claude-version`, no `PORTERCLAUDE_CLAUDE_VERSION=` build-log marker);
+* **drops** the `~/.claude`, `~/.claude/projects` and `~/.claude-home` seeding, and creates
+  `/home/dev/.porterclaude/agents` (0755, `1000:1000`) instead — the parent of every agent
+  mount, so docker's copy-up has an owner to work with;
+* `write_entrypoint()` shrinks: `pc-entrypoint.sh` sets `HOME`/`TERM`, writes
+  `/tmp/porterclaude-ready` and `exec "$@"` (idle-loop fallback). It exists only for people
+  running a recipe image by hand — PorterClaude always overrides the entrypoint with the
+  tools volume's.
+
+Recipe Dockerfiles: drop `ARG CLAUDE_VERSION` and the `porterclaude.claude-version` label;
+everything else (base images, `USER dev`, `WORKDIR /workspace`, `ENTRYPOINT`, `CMD`, the php
+supervisord stack, the arch-neutrality rules) is unchanged. `RecipeStatus.claudeVersion` is
+now sourced from the tools volume (`backend.md` §15) — a recipe image that still carries the
+old label is simply reporting a stale hint.
+
+Changing `common.sh` re-hashes all six recipe contexts (`outdated` flips) — intended, and
+this time it is *required*: an operator who does not rebuild keeps images with a stale
+`claude` inside, which is harmless (the tools volume shadows it on `PATH`) but confusing.
+
+---
+
+## 16 App image, compose, deploy, CI
+
+* `docker/Dockerfile`, `.dockerignore`: **unchanged**. `COPY docker ./docker` already ships
+  the new `docker/tools/lib` and `docker/tools/agents` subdirectories, and both the build
+  context tar and the context hash walk directories recursively
+  (`server/src/images/tarContext.ts`) — no change needed there either.
+* Root `docker-compose.yml`, `deploy/docker-compose.yml`, `deploy/deploy.sh`,
+  `deploy/lib/*.py`, `.env.example`: **no functional change**. Comments/docs only:
+  `PORTERCLAUDE_BACKEND` / `PORTAINER_*` / `DOCKER_SOCKET` now seed the **first host** and
+  only while no host exists; everything else is configured in the app.
+* `.github/workflows/release.yml`: unchanged.
+* `.github/workflows/ci.yml` (O2):
+  * replace the fixed `bash -n` / `shellcheck` file list with a loop over
+    `docker/tools/*.sh docker/tools/lib/*.sh docker/tools/agents/*.sh docker/recipes/*.sh
+    deploy/*.sh deploy/lib/*.sh` that picks `sh -n` or `bash -n` from the shebang — so
+    adding or deleting a script needs no CI change;
+  * `install-agents.sh --plan` with a canned `PORTERCLAUDE_AGENTS` (one spec per kind) must
+    exit 0, print one plan line per agent, touch **no** files and reach **no** network;
+  * `--plan` with malformed JSON must exit non-zero;
+  * parity: every `docker/tools/agents/<id>.sh` id exists in `server/src/agents/builtin.ts`;
+  * guard: `grep -R "claude.ai/install.sh" docker/recipes/` finds nothing, and no recipe
+    Dockerfile mentions `claude`;
+  * guard: `docker/tools/entrypoint.sh` mentions `PORTERCLAUDE_AGENT_LINKS`, and the keys in
+    the `AGENTS.json` writer match `ToolsAgentManifest` (`grep` both files);
+  * the existing jobs (`node`, `compose`, `image`, the deploy dry-run and secret-hygiene
+    assertions) stay exactly as they are.
+
+---
+
+## 17 Failure modes (v0.2 additions)
+
+| Failure | Expected behaviour |
+|---|---|
+| `PORTERCLAUDE_AGENTS` missing/empty | payload is published, `AGENTS.json` gets `agents: []`, exit 0 (a host with no agents is legal) |
+| `PORTERCLAUDE_AGENTS` is not valid JSON | exit **non-zero** before touching the volume (a broken spec is a server bug, not an agent problem) |
+| one agent's download/install fails | warning + `installed:false` + `error` in the manifest; the job succeeds; the shim is still written and prints the error when invoked |
+| an agent times out | same as a failure, with `error:"timed out after Ns"` |
+| the Node/uv runtime cannot be fetched | every agent of that kind fails with a shared error; other kinds are unaffected |
+| an agent's `versionCommand` fails | `installed:true`, `version:null` (it may need credentials to start) |
+| a musl session starts a pip agent | the shim exits non-zero with "aider requires a glibc image on this host" |
+| the auth volume mountpoint is still `root:root` | `link_agents` warns; the server's chown + `--porterclaude-bootstrap` completes the wiring |
+| an upgraded install has never re-synced tools | sessions come up, `PATH` has no agents, the shims are absent; the UI shows "no agents installed on this host" |
+
+---
+
+## 18 Test plan (v0.2)
+
+Static, on the dev box (no docker CLI):
+
+1. Shebang-aware `sh -n` / `bash -n` over every script under `docker/` and `deploy/`;
+   `shellcheck -S warning` clean.
+2. `docker/tools/install-agents.sh --plan` with a canned four-kind spec: exit 0, one line per
+   agent, no network, no writes (run it with `OUT` pointing at an empty temp dir and assert
+   the directory is still empty).
+3. `docker/tools/entrypoint.sh` link parsing: a harness that sets
+   `PORTERCLAUDE_AGENT_LINKS='/tmp/h/.claude|/tmp/h/.porterclaude/agents/claude/claude|dir;/tmp/h/.claude.json|/tmp/h/.porterclaude/agents/claude/claude.json|file'`,
+   `PORTERCLAUDE_HOME=/tmp/h`, runs `entrypoint.sh --porterclaude-bootstrap` and asserts both
+   symlinks, the `{}` seed and that a pre-existing `/tmp/h/.claude` directory was parked to
+   `.pc-backup` instead of being deleted. Runs on the dev box under Git Bash.
+4. Grep guards: no arch literal (`x86_64`, `aarch64`, a bare `amd64`/`arm64` in a URL) under
+   `docker/`; no `claude` in `docker/recipes/**`; no `/out` in any generated `run.sh` writer.
+5. Recipe assertions of v0.1 §10.2 minus the claude ones, plus: every recipe Dockerfile has
+   no `ARG CLAUDE_VERSION`.
+6. `AGENTS.json` key parity with `server/src/agents/model.ts` (`ToolsAgentManifest`).
+7. The v0.1 static suite (`deploy.sh --dry-run`, context-tar security sweep, compose
+   validation, secret hygiene) must still pass untouched.
+
+Integration (reference host, after a real sync):
+
+8. Sync tools on a migrated v0.1 host → `AGENTS.json` lists `claude` installed with a
+   version → a recipe session opens an `agent:claude` terminal → **no** `/login` prompt (the
+   legacy import worked) → `which claude` resolves into `/opt/porterclaude/bin`.
+9. Enable `opencode` + `gemini` → sync → both `installed:true` with versions; the Node
+   runtime exists; a session recreate later `agent:gemini` starts.
+10. A session on `alpine:3.20` (musl): `claude` works, `gemini` works or fails with a clear
+    message, `aider` fails with the documented glibc message — the container stays up either
+    way.
+11. Re-sync while a session is running `claude`: no `ETXTBSY`, the running agent keeps
+    working, a newly started one is the new version.
+12. Disable an agent → sync → its `agents/<id>` directory disappears from the volume, its
+    **auth volume still exists**, re-enabling + syncing restores it with the login intact.
+13. Second host (Portainer): its tools volume is populated independently; a login on host A
+    does **not** authenticate host B.

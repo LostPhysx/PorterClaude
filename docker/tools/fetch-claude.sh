@@ -1,4 +1,13 @@
 #!/usr/bin/env bash
+# DEPRECATED in v0.2 — DELETE ME. OWNER: O1.
+#
+# v0.2 installs every agent at POPULATE time through docker/tools/install-agents.sh; the
+# claude-specific multi-libc download below is the reference implementation for
+# docker/tools/agents/claude.sh (docs/design/orchestration.md §13.7). Nothing calls this file
+# any more: the tools Dockerfile no longer runs it and the payload no longer contains
+# bin/claude-linux-*. O1: port the download + dispatcher logic into agents/claude.sh and
+# `git rm` this file (CI's shell lint iterates over a glob, so no workflow change is needed).
+#
 # PorterClaude — download the native `claude` binaries into /payload. OWNER: O1. BUILD TIME.
 #
 # Produces (see docs/design/orchestration.md §4.1):

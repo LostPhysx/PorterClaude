@@ -41,17 +41,24 @@ jobs:
       - uses: actions/checkout@v4
       - name: syntax floor
         run: |
-          bash -n deploy/deploy.sh
-          bash -n deploy/host-prep.sh
-          bash -n deploy/lib/common.sh
-          bash -n docker/recipes/common.sh
-          sh -n docker/tools/entrypoint.sh
-          sh -n docker/tools/populate.sh
-          bash -n docker/tools/fetch-claude.sh
+          # v0.2: deletion-proof. Every shell script under deploy/ and docker/ is checked
+          # with the interpreter its shebang names, so adding or removing an agent
+          # installer needs no workflow change (orchestration.md §16).
+          fail=0
+          while IFS= read -r f; do
+            case "$(head -n1 "$f")" in
+              *"/bin/sh"*)  echo "sh   -n $f"; sh   -n "$f" || fail=1 ;;
+              *bash*)       echo "bash -n $f"; bash -n "$f" || fail=1 ;;
+              *)            echo "sh   -n $f (no shebang)"; sh -n "$f" || fail=1 ;;
+            esac
+          done < <(find deploy docker -type f -name '*.sh' | sort)
+          exit $fail
       - name: shellcheck
         run: |
           shellcheck --version
-          shellcheck -S warning deploy/deploy.sh deploy/host-prep.sh deploy/lib/common.sh docker/recipes/common.sh docker/tools/*.sh
+          # -x so the `. "$PC_TOOLS_SRC/lib/*.sh"` sources are followed via the
+          # `# shellcheck source=` directives in the tools scripts.
+          find deploy docker -type f -name '*.sh' -print0             | sort -z | xargs -0 shellcheck -x -S warning
       - name: python helpers compile
         run: |
           python3 -m compileall -q deploy/lib
@@ -125,6 +132,35 @@ jobs:
           if bash deploy/host-prep.sh --dry-run --env-file deploy/.env.ci; then
             echo "host-prep.sh without an action should have failed"; exit 1
           fi
+      - name: tools installer plan mode (no network, no writes)
+        run: |
+          # orchestration.md §16/§18.2: --plan parses PORTERCLAUDE_AGENTS, prints the plan and
+          # touches nothing. Run it against an empty OUT and assert the directory stays empty.
+          out="$(mktemp -d)"
+          PORTERCLAUDE_AGENTS='[{"id":"claude","command":"claude","versionCommand":["claude","--version"],"install":{"kind":"script","url":"https://claude.ai/install.sh","binPath":"bin/claude"}},{"id":"gemini","command":"gemini","versionCommand":["gemini","--version"],"install":{"kind":"npm","package":"@google/gemini-cli","version":"latest","bin":"gemini"}},{"id":"aider","command":"aider","versionCommand":["aider","--version"],"install":{"kind":"pip","package":"aider-chat","bin":"aider","preferUv":true}}]'             OUT="$out" PORTERCLAUDE_TOOLS_MOUNT="$out/mount"             bash docker/tools/install-agents.sh --plan
+          if [ -n "$(ls -A "$out")" ]; then
+            echo "--plan wrote into OUT"; ls -la "$out"; exit 1
+          fi
+          # TODO(O2, once install-agents.sh is implemented): assert one plan line per agent and
+          # that malformed JSON exits non-zero.
+      - name: recipes ship no coding agent
+        run: |
+          # v0.2: agents come from the tools volume only (orchestration.md §15).
+          if grep -RniE 'claude\.ai/install|install\.sh[[:space:]]*\|[[:space:]]*(ba)?sh' docker/recipes/; then
+            echo "a recipe installs a coding agent"; exit 1
+          fi
+          if grep -RniE 'ARG[[:space:]]+CLAUDE_VERSION' docker/recipes/; then
+            echo "a recipe still declares ARG CLAUDE_VERSION"; exit 1
+          fi
+      - name: tools payload contracts
+        run: |
+          # the session bootstrap must consume the server's link table …
+          grep -q 'PORTERCLAUDE_AGENT_LINKS' docker/tools/entrypoint.sh
+          # … and every per-agent override must name an id the server actually ships
+          for f in docker/tools/agents/*.sh; do
+            id="$(basename "$f" .sh)"
+            grep -q "id: '$id'" server/src/agents/builtin.ts               || { echo "unknown agent override: $f"; exit 1; }
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: rendered-stack

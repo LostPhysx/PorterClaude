@@ -5,8 +5,9 @@
 //   2. createLogger(env)                  -> Logger
 //   3. resolvePaths(env), mkdir -p dataDir
 //   4. loadOrCreateMasterSecret() -> new SecretBox()
-//   5. new ConfigStore({...}); await store.init()      (seeds APP_PASSWORD / PORTAINER_*)
-//   6. new BackendManager({ config, env, log }); config.on('change', () => backends.invalidateIfChanged())
+//   5. new ConfigStore({...}); await store.init()      (migrates v1 -> v2, seeds APP_PASSWORD / PORTAINER_*)
+//   6. new CredentialStore(...), new HostManager(...), new AgentRegistry(...)
+//      config.on('change', () => hosts.invalidateChanged())
 //   7. new SessionService(deps), new ImageService(deps), new TerminalService(deps, sessions)
 //   8. createAuthService(...) -> AppContext
 //   9. createApp(ctx) -> http.createServer(app)
@@ -28,7 +29,9 @@ import { createLogger } from './logger.js';
 import { resolvePaths, SERVER_ROOT } from './paths.js';
 import { loadOrCreateMasterSecret, SecretBox } from './config/crypto.js';
 import { ConfigStore } from './config/store.js';
-import { BackendManager } from './backends/index.js';
+import { CredentialStore } from './hosts/credentials.js';
+import { HostManager } from './hosts/manager.js';
+import { AgentRegistry } from './agents/registry.js';
 import { createAuthService } from './auth/index.js';
 import { SessionService } from './sessions/service.js';
 import { ImageService } from './images/service.js';
@@ -64,13 +67,15 @@ export async function start(): Promise<StartedServer> {
   const config = new ConfigStore({ paths, env, log, secrets });
   await config.init();
 
-  const backends = new BackendManager({ config, env, log });
-  // only rebuild the backend when its own settings changed: 'change' also fires for UI
-  // layout autosave / session writes / password changes, and tearing the transport down
-  // there would abort in-flight builds, pulls and execs.
-  config.on('change', () => backends.invalidateIfChanged());
+  const credentials = new CredentialStore({ config, secrets, log });
+  const hosts = new HostManager({ config, env, log, credentials });
+  const agents = new AgentRegistry({ config, log });
+  // only rebuild a host transport when THAT host's connection changed: 'change' also fires
+  // for UI layout autosave / session writes / password changes, and tearing a transport
+  // down there would abort in-flight builds, pulls and execs.
+  config.on('change', () => hosts.invalidateChanged());
 
-  const deps: ServiceDeps = { env, log, paths, config, backends };
+  const deps: ServiceDeps = { env, log, paths, config, hosts, agents, backends: hosts.legacyAccess() };
   const sessions = new SessionService(deps);
   const images = new ImageService(deps);
   const terminals = new TerminalService(deps, sessions);
@@ -80,6 +85,7 @@ export async function start(): Promise<StartedServer> {
     ...deps,
     secrets,
     auth,
+    credentials,
     sessions,
     images,
     terminals,
@@ -104,8 +110,8 @@ export async function start(): Promise<StartedServer> {
     'porterclaude is listening',
   );
 
-  if (!backends.isConfigured()) {
-    log.warn('no docker backend configured yet -- open Settings to connect one');
+  if (!hosts.isConfigured()) {
+    log.warn('no docker host configured yet -- open Settings > Hosts and add one');
   }
 
   // 12. best-effort reconcile; a broken/absent backend must never block startup
@@ -134,9 +140,9 @@ export async function start(): Promise<StartedServer> {
     }
     await new Promise<void>((resolve) => server.close(() => resolve()));
     try {
-      await backends.close();
+      await hosts.close();
     } catch (err) {
-      log.debug({ err: (err as Error).message }, 'closing the docker backend failed');
+      log.debug({ err: (err as Error).message }, 'closing the docker host transports failed');
     }
   };
 

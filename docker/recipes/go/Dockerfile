@@ -1,8 +1,6 @@
 # PorterClaude recipe: go (golang:1.23-bookworm). OWNER: O1.
 FROM golang:1.23-bookworm
-ARG CLAUDE_VERSION=stable
-LABEL porterclaude.recipe="go" \
-      porterclaude.claude-version="${CLAUDE_VERSION}"
+LABEL porterclaude.recipe="go"
 ENV LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
     PORTERCLAUDE_RECIPE=go \

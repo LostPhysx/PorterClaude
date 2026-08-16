@@ -283,3 +283,45 @@ Run it with `--dry-run` first: it prints every image and its size.
 - Sessions share one Claude login through `porterclaude-claude`: log in once in any session.
 - Backups: back up the `porterclaude-data` volume (settings + encrypted key) and any
   workspace volumes you care about.
+
+---
+
+# v0.2 — hosts and agents (TODO(O2): fold into the sections above)
+
+> **PLANNER SKELETON.** O2 owns this file: work the points below into the existing sections
+> (do not leave this block standing as an appendix). Sources of truth:
+> `docs/design/orchestration.md` §11–§18, `docs/design/backend.md` §11–§16,
+> `docs/design/api.md` §v0.2, and `docs/AGENTS.md` for the agent-facing half.
+
+1. **Hosts.** PorterClaude now talks to *several* Docker engines. A host is
+   `socket` (the engine the app runs on, at most one) or `portainer` (a stored credential +
+   an endpoint id); `tcp`/`ssh` are reserved. Portainer credentials are stored once and
+   "Import endpoints" creates one host per endpoint. Everything below — images, the tools
+   volume, the agent auth volumes, sessions — is **per host**; nothing is shared between
+   hosts, including logins.
+2. **Env vars.** `PORTERCLAUDE_BACKEND`, `PORTAINER_URL`, `PORTAINER_API_KEY`,
+   `PORTAINER_ENDPOINT_ID` and `DOCKER_SOCKET` now **seed the first host**, and only while no
+   host exists. No new environment variable; the compose files are unchanged.
+3. **Upgrade procedure (v0.1 → v0.2).** Pull the new image → the config is migrated in place
+   (a `config.json.v1.bak` is written and the existing backend becomes the host `default`;
+   every session gets `hostId: default`) → open **Settings → Images → Sync tools** for each
+   host → the one-time import copies the old `porterclaude-claude` / `-claude-home` volumes
+   into `porterclaude-auth-claude`, so **nobody has to log in again** → recreate sessions to
+   pick up the new mounts. The old volumes are never deleted (rollback stays possible).
+4. **Agents.** Recipes no longer contain Claude Code: every agent is installed into the
+   per-host tools volume by the sync and mounted into every session. Point at
+   [AGENTS.md](AGENTS.md).
+5. **What a sync needs.** Outbound HTTPS **from the docker host** (nodejs.org,
+   github.com/astral-sh, the agents' own installers), several minutes on the first run, and
+   disk: the tools volume grows to roughly 100 MB (claude only) … 500 MB (with a Node runtime
+   and a Python toolchain).
+6. **Volumes on a managed host** — update the existing table:
+   `porterclaude-tools` (per host, read-only in sessions), `porterclaude-auth-<agentId>`
+   (one per agent per host, **holds the logins — back these up**),
+   `porterclaude-ws-<session>`, `porterclaude-hist-<session>[-<agentId>]`. The v0.1
+   `porterclaude-claude` / `porterclaude-claude-home` volumes stay behind after the import
+   and can be removed once the upgrade is confirmed.
+7. **Troubleshooting additions.** "no agents installed on this host" (sync never ran), a
+   terminal closing with 4410 (`agent_not_available` — recreate the session) or 4411
+   (`host_unavailable` — the engine is unreachable), and a host that shows as unreachable
+   without affecting the other hosts.

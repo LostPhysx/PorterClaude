@@ -4,7 +4,11 @@ import type { ServiceDeps } from '../../src/context.js';
 import type { ConfigStore } from '../../src/config/store.js';
 import type { GeneralConfig } from '../../src/config/schema.js';
 import { GeneralConfigSchema } from '../../src/config/schema.js';
-import type { BackendManager } from '../../src/backends/index.js';
+import type { HostManager } from '../../src/hosts/manager.js';
+import type { AgentRegistry } from '../../src/agents/registry.js';
+import type { HostConfig } from '../../src/hosts/model.js';
+import type { AgentDefinition } from '../../src/agents/model.js';
+import { BUILTIN_AGENTS } from '../../src/agents/builtin.js';
 import type {
   ContainerInspect,
   ContainerSummary,
@@ -41,18 +45,36 @@ export function testPaths(overrides: Partial<Paths> = {}): Paths {
   };
 }
 
+export const TEST_HOST_ID = 'default';
+
 export function sessionInput(overrides: Partial<SessionInput> = {}): SessionInput {
   return SessionInputSchema.parse({
     name: 'web',
+    hostId: TEST_HOST_ID,
     image: { type: 'recipe', recipe: 'node' },
     ...overrides,
   });
 }
 
+export function hostConfig(overrides: Partial<HostConfig> = {}): HostConfig {
+  return {
+    id: TEST_HOST_ID,
+    name: 'Local docker',
+    connection: { type: 'socket', socketPath: '/var/run/docker.sock' },
+    overrides: {},
+    agents: { enabled: ['claude'] },
+    notes: null,
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+    ...overrides,
+  };
+}
+
 export function sessionConfig(overrides: Partial<SessionConfig> = {}): SessionConfig {
-  const { createdAt, updatedAt, specHash, ...rest } = overrides;
+  const { createdAt, updatedAt, specHash, hostId, ...rest } = overrides;
   return {
     ...sessionInput(rest),
+    hostId: hostId ?? TEST_HOST_ID,
     createdAt: createdAt ?? '2026-01-01T00:00:00.000Z',
     updatedAt: updatedAt ?? '2026-01-01T00:00:00.000Z',
     ...(specHash ? { specHash } : {}),
@@ -258,28 +280,83 @@ export function stubExecStream(execId = 'exec-1'): ExecStream {
   return stream as unknown as ExecStream;
 }
 
-export function stubBackendManager(backend: DockerBackend | null): BackendManager {
+/**
+ * A HostManager stub with ONE host (`TEST_HOST_ID`) whose transport is `backend`.
+ * TODO(B2): extend with a multi-host variant once SessionService lists every host.
+ */
+export function stubHostManager(
+  backend: DockerBackend | null,
+  opts: { host?: HostConfig; general?: GeneralConfig } = {},
+): HostManager {
+  const host = opts.host ?? hostConfig();
+  const general = opts.general ?? generalConfig();
+  const need = () => {
+    if (!backend) throw new Error('no docker backend configured');
+    return backend;
+  };
   return {
-    get: () => {
-      if (!backend) throw new Error('no docker backend configured');
-      return backend;
+    list: () => [host],
+    get: (id: string) => (id === host.id ? host : null),
+    require: (id: string) => {
+      if (id !== host.id) throw new Error(`host '${id}' does not exist`);
+      return host;
     },
-    tryGet: () => backend,
+    defaultHostId: () => host.id,
+    requireHostId: (id?: string | null) => id ?? host.id,
+    hostForSession: () => host,
+    settingsFor: () => general,
+    settingsForHost: () => general,
+    backendFor: () => need(),
+    tryBackendFor: () => backend,
+    legacyAccess: () => ({ get: need, tryGet: () => backend }),
     isConfigured: () => Boolean(backend),
     invalidate: () => undefined,
-  } as unknown as BackendManager;
+    invalidateChanged: () => [],
+    close: async () => undefined,
+  } as unknown as HostManager;
+}
+
+/** @deprecated v0.1 name kept so the existing feature tests keep compiling. */
+export const stubBackendManager = stubHostManager;
+
+/** Registry stub over the built-in agents (no config access). */
+export function stubAgentRegistry(agents: AgentDefinition[] = BUILTIN_AGENTS): AgentRegistry {
+  const byId = new Map(agents.map((a) => [a.id, a]));
+  return {
+    list: () => agents.map((a) => ({ ...a, builtin: true })),
+    get: (id: string) => byId.get(id) ?? null,
+    require: (id: string) => {
+      const found = byId.get(id);
+      if (!found) throw new Error(`unknown agent '${id}'`);
+      return found;
+    },
+    isBuiltin: (id: string) => byId.has(id),
+    enabledForHost: (host: HostConfig) =>
+      host.agents.enabled.map((id) => byId.get(id)).filter((a): a is AgentDefinition => Boolean(a)),
+    resolveForSession: (host: HostConfig, session: { agents: string[] | null }) =>
+      (session.agents ?? host.agents.enabled)
+        .map((id) => byId.get(id))
+        .filter((a): a is AgentDefinition => Boolean(a)),
+    installSpecsForHost: () => [],
+  } as unknown as AgentRegistry;
 }
 
 export function serviceDeps(opts: {
   config: ConfigStore;
-  backends: BackendManager;
+  /** v0.1 name, still accepted: the same stub object also satisfies HostManager */
+  backends?: HostManager;
+  hosts?: HostManager;
+  agents?: AgentRegistry;
   paths?: Paths;
 }): ServiceDeps {
+  const hosts = (opts.hosts ?? opts.backends ?? stubHostManager(null)) as HostManager;
   return {
     env: {} as ServiceDeps['env'],
     log: silentLog,
     paths: opts.paths ?? testPaths(),
     config: opts.config,
-    backends: opts.backends,
+    hosts,
+    agents: opts.agents ?? stubAgentRegistry(),
+    backends: hosts.legacyAccess(),
   };
 }

@@ -108,3 +108,41 @@ html, body { height: 100%; }
 #login-modal .modal-content { border-radius: .6rem; }
 .pc-view .alert a { text-decoration: underline; }
 
+
+/* ---------------------------------------------------- v0.2: hosts + agents */
+/* Seeded by the planner so F1 has the class names; extend, do not rename. */
+#hosts-table { font-size: .9rem; }
+#hosts-table td { vertical-align: middle; }
+#hosts-table thead th {
+  font-size: .75rem;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  color: var(--bs-secondary-color);
+  white-space: nowrap;
+}
+#hosts-table .pc-host-id,
+#sessions-table .pc-host-id { font-family: var(--pc-mono); font-size: .72rem; }
+
+/* one chip per agent id (sessions table, hosts table, agent cards) */
+.pc-agent-chip {
+  font-weight: 500;
+  font-size: .7rem;
+  margin-right: .15rem;
+}
+
+/* Settings -> Agents cards */
+.pc-agent-card .card-title { font-size: .95rem; }
+.pc-agent-card .card-body { padding: .75rem .9rem; }
+.pc-agent-card code { font-size: .75rem; }
+.pc-agent-card .form-switch { min-height: 1.4rem; }
+
+/* Portainer credential cards */
+.pc-credential-card .card-body { padding: .75rem .9rem; }
+.pc-credential-card .pc-cred-url { font-family: var(--pc-mono); font-size: .75rem; }
+
+/* host + agent pickers inside the session dialog */
+#sf-agents .form-check { margin-bottom: .15rem; }
+#sf-host-note { font-size: .75rem; }
+#hf-overrides .form-control { font-family: var(--pc-mono); font-size: .8rem; }
+#af-json { font-size: .78rem; line-height: 1.35; }
+#sessions-host-filter, #images-host-select, #agents-host-select { max-width: 16rem; }

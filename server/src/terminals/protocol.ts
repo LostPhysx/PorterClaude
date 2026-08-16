@@ -1,7 +1,10 @@
 // FROZEN (planner-authored). THE terminal websocket wire protocol. The web topic mirrors
 // these shapes; changing anything here breaks the frontend. See docs/design/api.md.
 //
-//   URL:  /api/terminals?session=<slug>&shell=bash|claude|sh&name=<terminal>&cols=<n>&rows=<n>
+//   URL:  /api/terminals?session=<slug>&shell=bash|sh|agent:<agentId>&name=<terminal>&cols=<n>&rows=<n>
+//         (v0.1 `shell=claude` is still accepted and means `agent:claude`)
+//   The host is NOT part of the query: session names are unique across hosts and the server
+//   routes session -> host -> backend.
 //   Auth: the pc_session cookie (browsers send it automatically on same-origin WS).
 //
 //   Client -> server
@@ -13,15 +16,49 @@
 //
 //   The browser MUST set ws.binaryType = 'arraybuffer'.
 
-export type TerminalShell = 'bash' | 'claude' | 'sh';
+/**
+ * What a pane runs. v0.2 replaced the hard-wired `claude` row with `agent`, which carries
+ * the agent id separately (`TerminalQuery.agentId`) — the wire value is `agent:<agentId>`.
+ */
+export type TerminalShell = 'bash' | 'sh' | 'agent';
+
+/** the raw `shell` query value, e.g. 'bash' | 'sh' | 'agent:claude' | 'claude' (legacy) */
+export type TerminalShellParam = string;
 
 export interface TerminalQuery {
   session: string;
   shell: TerminalShell;
+  /** set exactly when `shell === 'agent'` */
+  agentId: string | null;
   /** stable per-pane name; drives the tmux session name, so reconnecting reattaches */
   name: string;
   cols?: number;
   rows?: number;
+}
+
+/** agent ids are slugs (agents/model.ts AGENT_ID_RE); kept local to avoid an import cycle */
+const AGENT_SHELL_RE = /^agent:([a-z0-9][a-z0-9-]{0,31})$/;
+
+/**
+ * Parse the `shell` query parameter. Returns null for anything else (=> close 4400).
+ *
+ *   'bash'          -> { shell: 'bash',  agentId: null }
+ *   'sh'            -> { shell: 'sh',    agentId: null }
+ *   'agent:claude'  -> { shell: 'agent', agentId: 'claude' }
+ *   'claude'        -> { shell: 'agent', agentId: 'claude' }   (v0.1 alias, deprecated)
+ */
+export function parseTerminalShell(
+  raw: TerminalShellParam,
+): { shell: TerminalShell; agentId: string | null } | null {
+  if (raw === 'bash' || raw === 'sh') return { shell: raw, agentId: null };
+  if (raw === 'claude') return { shell: 'agent', agentId: 'claude' };
+  const match = AGENT_SHELL_RE.exec(raw);
+  return match ? { shell: 'agent', agentId: match[1] as string } : null;
+}
+
+/** Inverse of parseTerminalShell — what the UI puts into the query. */
+export function formatTerminalShell(shell: TerminalShell, agentId?: string | null): TerminalShellParam {
+  return shell === 'agent' ? `agent:${agentId ?? ''}` : shell;
 }
 
 export type ClientMessage =
@@ -42,7 +79,11 @@ export type ServerMessage =
       type: 'ready';
       terminalId: string;
       session: string;
+      /** the host the session runs on (v0.2) */
+      hostId: string;
       shell: TerminalShell;
+      /** the agent this pane started, null for a plain shell (v0.2) */
+      agentId: string | null;
       name: string;
       /** false => no tmux in the image: output is not reconnect-safe (UI shows a warning) */
       tmux: boolean;
@@ -61,6 +102,10 @@ export type TerminalErrorCode =
   | 'bad_request'
   | 'session_not_found'
   | 'session_not_running'
+  /** the requested agent is unknown, or not mounted into this session (v0.2) */
+  | 'agent_not_available'
+  /** the session's host is gone or its connection type is not supported (v0.2) */
+  | 'host_unavailable'
   | 'backend_error'
   | 'exec_failed'
   | 'internal';
@@ -75,6 +120,10 @@ export const TERMINAL_CLOSE = {
   badRequest: 4400,
   sessionNotFound: 4404,
   sessionNotRunning: 4409,
+  /** v0.2: the requested agent is not available in this session (do not auto-reconnect) */
+  agentNotAvailable: 4410,
+  /** v0.2: the session's host is unusable (missing host, unsupported connection) */
+  hostUnavailable: 4411,
   backendError: 4502,
   internal: 4500,
 } as const;

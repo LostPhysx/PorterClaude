@@ -20,6 +20,8 @@ async function freshDir(): Promise<string> {
 function sampleSession(name: string): SessionConfig {
   return {
     name,
+    hostId: 'default',
+    agents: null,
     image: { type: 'recipe', recipe: 'node' },
     workspace: { type: 'volume' },
     env: {},
@@ -60,38 +62,15 @@ describe('ConfigStore', () => {
     expect(await verifyPassword('a-different-password', hash)).toBe(false);
   });
 
-  it('seeds the portainer backend from the environment and encrypts the key at rest', async () => {
-    const dir = await freshDir();
-    const { ctx } = await buildContext({
-      DATA_DIR: dir,
-      PORTERCLAUDE_BACKEND: 'portainer',
-      PORTAINER_URL: 'https://portainer.example.com/',
-      PORTAINER_API_KEY: 'ptr_seeded_key_1234',
-      PORTAINER_ENDPOINT_ID: '2',
-    });
-
-    const cfg = ctx.config.get();
-    expect(cfg.backend.kind).toBe('portainer');
-    expect(cfg.backend.portainer.url).toBe('https://portainer.example.com');
-    expect(cfg.backend.portainer.endpointId).toBe(2);
-    expect(cfg.backend.portainer.apiKeyEnc?.startsWith('enc:v1:')).toBe(true);
-    expect(ctx.config.getPortainerApiKey()).toBe('ptr_seeded_key_1234');
-
-    const raw = await readFile(path.join(dir, 'config.json'), 'utf8');
-    expect(raw).not.toContain('ptr_seeded_key_1234');
-
-    const sanitized = ctx.config.sanitized({ socketAvailable: false });
-    expect(JSON.stringify(sanitized)).not.toContain('ptr_seeded_key_1234');
-    expect(sanitized.backend.portainer.apiKeySet).toBe(true);
-    expect(sanitized.backend.portainer.apiKeyHint).toBe('1234');
-  });
-
-  it('seeds the socket backend when asked', async () => {
-    const dir = await freshDir();
-    const { ctx } = await buildContext({ DATA_DIR: dir, PORTERCLAUDE_BACKEND: 'socket', DOCKER_SOCKET: '/tmp/docker.sock' });
-    expect(ctx.config.get().backend.kind).toBe('socket');
-    expect(ctx.config.get().backend.socket.socketPath).toBe('/tmp/docker.sock');
-  });
+  // TODO(B1): v0.2 replacements for the two removed v0.1 seed tests plus the migration:
+  //   * PORTERCLAUDE_BACKEND=portainer + PORTAINER_* -> ONE portainer credential (key
+  //     encrypted at rest: grep the raw file for the plaintext) + ONE host 'default'
+  //     whose connection references it, and defaultHostId === 'default';
+  //   * PORTERCLAUDE_BACKEND=socket -> one socket host, no credential;
+  //   * the seeds are NOT re-applied when a host already exists;
+  //   * migrate v1 -> v2: a v0.1 config.json (portainer and socket variants, with and
+  //     without sessions) becomes hosts + credentials + sessions[].hostId==='default',
+  //     `config.json.v1.bak` is written, and the api key is still decryptable afterwards.
 
   it('emits change and never leaves a partial file under concurrent writes', async () => {
     const dir = await freshDir();
@@ -123,7 +102,7 @@ describe('ConfigStore', () => {
     await writeFile(path.join(dir, 'config.json'), '{ this is not json', 'utf8');
 
     const { ctx } = await buildContext({ DATA_DIR: dir });
-    expect(ctx.config.get().backend.kind).toBe('none');
+    expect(ctx.config.get().hosts).toEqual([]);
     const files = await (await import('node:fs/promises')).readdir(dir);
     expect(files.some((f) => f.includes('corrupt'))).toBe(true);
   });

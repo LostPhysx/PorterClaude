@@ -20,12 +20,20 @@ export const EVENTS = Object.freeze({
   AUTH_LOST: 'auth:lost',
   /** emitted by settings.js (F1) after settings are saved/loaded. payload: { settings: SanitizedSettings } */
   SETTINGS_CHANGED: 'settings:changed',
+  /** v0.2: emitted by hosts.js (F1) after every host list/CRUD.
+   *  payload: { hosts: HostView[], defaultHostId: string|null } */
+  HOSTS_CHANGED: 'hosts:changed',
+  /** v0.2: emitted by agents.js (F1) after the agent registry is loaded/changed.
+   *  payload: { agents: AgentView[] } */
+  AGENTS_CHANGED: 'agents:changed',
   /** emitted by app.js (F1) when the effective theme changes. payload: { theme: 'dark'|'light' } */
   THEME_CHANGED: 'theme:changed',
   /** emitted by app.js (F1) on every route change. payload: { view: 'code'|'sessions'|'settings' } */
   VIEW_CHANGED: 'view:changed',
   /** emitted by sessions.js (F1) "open terminal" action -> code.js (F2) opens a pane.
-   *  payload: { session: string, shell: 'bash'|'claude'|'sh' } */
+   *  v0.2 payload: { session: string, shell: 'bash'|'sh'|'agent:<agentId>' }
+   *  (the WIRE value, api.js `formatShellParam`; the legacy 'claude' is still tolerated
+   *   by code.js but never emitted). */
   OPEN_TERMINAL: 'code:open-terminal',
   /** emitted by code.js (F2) when a pane count changes. payload: { count: number } */
   TERMINALS_CHANGED: 'terminals:changed',

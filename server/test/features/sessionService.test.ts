@@ -265,6 +265,7 @@ describe('SessionService.list', () => {
   it('does not flag needsRecreate when the hash matches', async () => {
     const stored = sessionConfig({ name: 'web' });
     const spec = buildContainerSpec({
+      agents: [],
       session: stored,
       general: generalConfig(),
       resolvedImage: 'porterclaude/node:latest',

@@ -3,29 +3,42 @@
 //
 // GoldenLayout 2 is an ES module served from node_modules through /vendor (see
 // server/src/vendor.ts). Its CSS is already linked in index.html.
-import { api } from './api.js';
+import { api, formatShellParam, parseShellParam } from './api.js';
 import { bus, EVENTS } from './bus.js';
 import { byId, toast, toastError, debounce, escapeHtml, storage, LS_PREFIX } from './util.js';
-import { TerminalPane, makeTerminalName } from './terminal.js';
+import { TerminalPane, makeTerminalName, terminalSlug } from './terminal.js';
 import { getSessions, reload as reloadSessions, imageOutdated } from './sessions.js';
 import { getSettings } from './settings.js';
+import { agentLabel, agentIcon } from './agents.js';
 
 /** localStorage key for the layout blob (server copy lives in settings.ui.layout). FROZEN. */
 export const LS_LAYOUT = `${LS_PREFIX}layout.v1`;
 /** localStorage key remembering the session picked in the toolbar. */
 export const LS_LAST_SESSION = `${LS_PREFIX}code.session`;
+/** localStorage key remembering the host filter of the rail/toolbar ('' = all hosts). */
+export const LS_CODE_HOST = `${LS_PREFIX}code.host`;
 /** Debounce before persisting the layout (both localStorage and PUT /api/settings/ui). */
 export const LAYOUT_SAVE_MS = 1500;
-/** Layout blob envelope. Bump `v` if the pane state shape changes. */
-export const LAYOUT_VERSION = 1;
+/**
+ * Layout blob envelope. v0.2 bumped this because PaneState changed shape
+ * (`shell:'claude'` -> `shell:'agent'` + `agentId`). A v1 blob is still ACCEPTED and migrated
+ * in place (see migrateLayoutBlob) so an upgrade never throws a user's panes away - the pane
+ * NAME is what tmux keys off, and migrating keeps it byte-identical.
+ */
+export const LAYOUT_VERSION = 2;
+/** Blob versions restoreLayout() accepts; anything else is ignored (and dropped). */
+export const ACCEPTED_LAYOUT_VERSIONS = [1, 2];
 /** Hard ceiling for the persisted blob - it must never contain terminal output. */
 export const LAYOUT_MAX_BYTES = 64 * 1024;
 
 /**
  * @typedef {Object} PaneState        component state stored in the GoldenLayout config
  * @property {string} session
- * @property {'bash'|'claude'|'sh'} shell
+ * @property {'bash'|'sh'|'agent'} shell
+ * @property {string|null} agentId    set exactly when shell === 'agent'
  * @property {string} name            stable pane/tmux name (makeTerminalName)
+ * @property {string} [hostId]        informational: the host the session lived on when the
+ *                                    pane was opened (the server always re-resolves it)
  * @property {string} [title]
  */
 
@@ -175,35 +188,68 @@ export async function loadGoldenLayout() {
 // helpers
 // ---------------------------------------------------------------------------
 
-const SHELLS = ['bash', 'claude', 'sh'];
-
-/** @param {any} raw @returns {PaneState|null} */
+/**
+ * Normalise a pane state coming from a (possibly v1) layout blob or from openTerminal().
+ * v0.1 wrote `shell:'claude'`; that migrates to `{shell:'agent', agentId:'claude'}`, which
+ * keeps the pane NAME (`<session>-claude-<n>`) and therefore the tmux session.
+ * TODO(F2): an `agent` state without a valid agentId (api.js AGENT_ID_RE) is unusable -
+ * return null so the pane renders the "unusable terminal state" placeholder.
+ * @param {any} raw @returns {PaneState|null}
+ */
 function normalizeState(raw) {
   if (!raw || typeof raw !== 'object') return null;
   const session = typeof raw.session === 'string' ? raw.session : '';
-  const shell = SHELLS.includes(raw.shell) ? raw.shell : 'bash';
   if (!session) return null;
-  let name = typeof raw.name === 'string' ? raw.name : '';
-  if (!name) {
+  // parseShellParam accepts 'bash' | 'sh' | 'agent:<id>' | 'claude' (v0.1 alias)
+  let wire = String(raw.shell || 'bash');
+  if (raw.shell === 'agent' && raw.agentId) {
     try {
-      name = makeTerminalName(session, shell, 1);
+      wire = formatShellParam('agent', raw.agentId);
     } catch {
       return null;
     }
   }
-  return { session, shell, name, title: typeof raw.title === 'string' ? raw.title : undefined };
+  const parsed = parseShellParam(wire);
+  if (!parsed) return null;
+  let name = typeof raw.name === 'string' ? raw.name : '';
+  if (!name) {
+    try {
+      name = makeTerminalName(session, terminalSlug(parsed.shell, parsed.agentId), 1);
+    } catch {
+      return null;
+    }
+  }
+  return {
+    session,
+    shell: parsed.shell,
+    agentId: parsed.agentId,
+    name,
+    hostId: typeof raw.hostId === 'string' ? raw.hostId : undefined,
+    title: typeof raw.title === 'string' ? raw.title : undefined,
+  };
 }
 
-/** Smallest free index for this session+shell, so pane names stay stable across reloads. */
-function nextFreeName(session, shell) {
+/**
+ * Smallest free index for this session + shell SLUG, so pane names stay stable across
+ * reloads. The slug is the AGENT ID for agent panes (`web-claude-1`), which is exactly the
+ * v0.1 name - an upgraded layout reattaches to its existing tmux sessions.
+ * @param {string} session @param {string} slug terminalSlug(shell, agentId)
+ */
+function nextFreeName(session, slug) {
   for (let n = 1; n < 1000; n += 1) {
-    const name = makeTerminalName(session, shell, n);
+    const name = makeTerminalName(session, slug, n);
     if (!panes.has(name)) return name;
   }
   throw new Error('too many terminals for this session');
 }
 
-/** @param {PaneState} state @param {string} [status] */
+/**
+ * Tab title.
+ * TODO(F2): agent panes show the agent NAME (agentLabel), not the id; bash/sh keep the shell
+ * word. When sessions of MORE THAN ONE host are on screen, prefix the host name:
+ * `prod/web · Claude Code`. Keep it short - GoldenLayout tabs are narrow.
+ * @param {PaneState} state @param {string} [status]
+ */
 function titleFor(state, status) {
   const index = /-(\d+)$/.exec(state.name);
   const suffix = index && index[1] !== '1' ? ` ${index[1]}` : '';
@@ -211,7 +257,8 @@ function titleFor(state, status) {
   if (status === 'connecting' || status === 'reconnecting') mark = ' ⟳';
   else if (status === 'fatal') mark = ' ⚠';
   else if (status === 'closed') mark = ' ●';
-  return `${state.session} · ${state.shell}${suffix}${mark}`;
+  const what = state.shell === 'agent' ? agentLabel(state.agentId) : state.shell;
+  return `${state.session} · ${what}${suffix}${mark}`;
 }
 
 function dotClass(status) {
@@ -373,12 +420,27 @@ export function persist() {
 
 const persistSoon = debounce(() => persist(), 250);
 
+/**
+ * Migrate a v1 layout blob to v2 in place: every `componentState` goes through
+ * normalizeState(), i.e. `shell:'claude'` becomes `{shell:'agent', agentId:'claude'}` while
+ * `name` is left untouched (that is the tmux identity).
+ * TODO(F2): walk `blob.root` recursively (`content[]` arrays + `componentState` objects),
+ * rewrite the states, set `v: LAYOUT_VERSION`, and return the blob. A state that does not
+ * normalise is DROPPED from the tree, not kept as a broken pane.
+ * @param {LayoutBlob} blob
+ * @returns {LayoutBlob|null}
+ */
+export function migrateLayoutBlob(blob) {
+  // TODO(F2)
+  return blob;
+}
+
 /** @param {any} blob @returns {LayoutBlob|null} */
 function validBlob(blob) {
   if (!blob || typeof blob !== 'object') return null;
-  if (blob.v !== LAYOUT_VERSION) return null;
+  if (!ACCEPTED_LAYOUT_VERSIONS.includes(blob.v)) return null;
   if (!blob.root || typeof blob.root !== 'object' || !blob.root.root) return null;
-  return blob;
+  return blob.v === LAYOUT_VERSION ? blob : migrateLayoutBlob(blob);
 }
 
 /**
@@ -562,8 +624,11 @@ function buildTerminalComponent(container, rawState) {
   const pane = new TerminalPane({
     session: state.session,
     shell: state.shell,
+    agentId: state.agentId ?? null,
     name: state.name,
     theme: currentTheme(),
+    // 4410 agent_not_available: the pane offers "Open bash instead" and calls this.
+    onOpenBash: () => openTerminal(state.session, 'bash'),
     onStatus: (status) => {
       try { container.setTitle(titleFor(state, status)); } catch { /* container gone */ }
       updateStatus();
@@ -602,9 +667,15 @@ function buildTerminalComponent(container, rawState) {
  * Open a new terminal pane for `session`.
  * A stopped session is started first (best effort); the pane itself shows a "start session"
  * action when the server answers 4409.
- * @param {string} session @param {'bash'|'claude'|'sh'} shell
+ *
+ * v0.2: `shellParam` is the WIRE value - 'bash' | 'sh' | 'agent:<agentId>' (api.js
+ * formatShellParam). The legacy 'claude' is accepted (parseShellParam maps it) so an old
+ * bookmark/bus payload still works. An agent that is not in the session's `resolvedAgents`
+ * must NOT be opened: toast "<agent> is not mounted into <session> - enable it on the host
+ * and recreate the session" and return (the server would close 4410 anyway).
+ * @param {string} session @param {string} shellParam
  */
-export function openTerminal(session, shell) {
+export function openTerminal(session, shellParam) {
   if (!session) {
     toast('Pick a session first.', { variant: 'warning' });
     return;
@@ -613,7 +684,10 @@ export function openTerminal(session, shell) {
     toast('The terminal layout could not be loaded.', { variant: 'danger' });
     return;
   }
-  const wanted = SHELLS.includes(shell) ? shell : 'bash';
+  const parsed = parseShellParam(shellParam) || { shell: 'bash', agentId: null };
+  const wanted = parsed.shell;
+  const agentId = parsed.agentId;
+  // TODO(F2): refuse an agent the session does not mount (see the doc comment above).
   const view = sessionByName(session);
   if (view && view.status !== 'running') {
     toast(`Session "${session}" is not running - starting it…`, { variant: 'info' });
@@ -625,7 +699,7 @@ export function openTerminal(session, shell) {
 
   let name;
   try {
-    name = nextFreeName(session, wanted);
+    name = nextFreeName(session, terminalSlug(wanted, agentId));
   } catch (err) {
     toastError(err, 'Could not name the terminal');
     return;
@@ -633,7 +707,13 @@ export function openTerminal(session, shell) {
   // The user is building a layout now - stop waiting for a server copy to arrive.
   restorePending = false;
   /** @type {PaneState} */
-  const state = { session, shell: wanted, name };
+  const state = {
+    session,
+    shell: wanted,
+    agentId,
+    name,
+    ...(view && view.hostId ? { hostId: view.hostId } : {}),
+  };
   try {
     layout.addComponent(COMPONENT_TERMINAL, state, titleFor(state, 'connecting'));
   } catch (err) {
@@ -652,7 +732,43 @@ export function openTerminal(session, shell) {
 // session rail + toolbar
 // ---------------------------------------------------------------------------
 
-/** Paint #session-rail-list. All API strings are HTML-escaped. */
+/**
+ * The host filter of the rail/toolbar ('' = all hosts). Persisted in LS_CODE_HOST.
+ * @returns {string}
+ */
+function codeHostFilter() {
+  return storage.get(LS_CODE_HOST, '') || '';
+}
+
+/**
+ * TODO(F2): fill #code-host-filter with one option per DISTINCT hostId present in
+ * `railSessions` (label = the session's `hostName`), plus a leading "All hosts" option.
+ * Hide the whole select while only one host is present (a single-host install must look
+ * exactly like v0.1). Persist the choice in LS_CODE_HOST and re-render rail + select.
+ * @param {any[]} sessions
+ */
+function renderHostFilter(sessions) {
+  void sessions;
+  void codeHostFilter;
+  // TODO(F2)
+}
+
+/**
+ * Paint #session-rail-list. All API strings are HTML-escaped.
+ *
+ * TODO(F2) v0.2: GROUP BY HOST. With more than one host, emit one
+ *   `<div class="pc-rail-group" data-host="<hostId>">`
+ *      `<div class="pc-rail-group-head">` + hostName + a muted session count + `</div>`
+ *      ...one `.pc-rail-item` per session of that host...
+ *   `</div>`
+ * (hosts sorted by name, the default host first; sessions sorted as today). With a single
+ * host, render the flat list exactly as v0.1 did - no group header at all.
+ * A session with `hostMissing === true` renders in a group headed "host gone" and its quick
+ * actions are disabled.
+ * The per-row quick actions become: bash (`data-open="bash"`) and the session's FIRST agent
+ * (`data-open="agent:<id>"`, icon agentIcon(id), title "Open <agentLabel(id)>"); a session
+ * without agents shows only bash.
+ */
 function renderRail(sessions) {
   const list = byId('session-rail-list');
   if (!list) return;
@@ -681,14 +797,21 @@ function renderRail(sessions) {
         `<span class="pc-rail-name text-truncate flex-grow-1">${name}${staleIcon}</span>` +
         '<span class="pc-rail-actions">' +
         `<button type="button" class="btn btn-sm btn-link p-0" data-open="bash" data-session="${name}" title="Open bash" aria-label="Open bash in ${name}"><i class="bi bi-terminal"></i></button>` +
-        `<button type="button" class="btn btn-sm btn-link p-0 ms-1" data-open="claude" data-session="${name}" title="Open claude" aria-label="Open claude in ${name}"><i class="bi bi-stars"></i></button>` +
+        // TODO(F2): the second quick action is the session's first resolvedAgent, not
+        // "claude": data-open="agent:<id>", icon agentIcon(id), title "Open <label>".
+        `<button type="button" class="btn btn-sm btn-link p-0 ms-1" data-open="agent:claude" data-session="${name}" title="Open the agent" aria-label="Open the agent in ${name}"><i class="bi ${escapeHtml(agentIcon('claude'))}"></i></button>` +
         '</span></div>'
       );
     })
     .join('');
 }
 
-/** Mirror the sessions into #code-session-select (running first, remembering the choice). */
+/**
+ * Mirror the sessions into #code-session-select (running first, remembering the choice).
+ * TODO(F2) v0.2: honour the host filter, and when more than one host is present render the
+ * option label as `<session> - <hostName>` so two hosts with similar names stay tellable
+ * apart. Changing the selection must also re-render the agent menu (renderAgentMenu).
+ */
 function renderSessionSelect(sessions) {
   const select = /** @type {HTMLSelectElement|null} */ (byId('code-session-select'));
   if (!select) return;
@@ -720,6 +843,22 @@ function renderSessionSelect(sessions) {
   storage.set(LS_LAST_SESSION, wanted);
 }
 
+/**
+ * Fill #new-agent-menu from the SELECTED session's `resolvedAgents`:
+ *   `<li><button class="dropdown-item" type="button" data-agent="<id>">`
+ *   `<i class="bi <agentIcon(id)> me-2"></i><agentLabel(id)></button></li>`
+ * TODO(F2): when the session has no agent, render a single disabled item
+ * "no coding agent in this session" plus a link item "Settings -> Agents"; when no session
+ * is selected at all, disable #btn-new-agent. Rebuild this on SESSIONS_CHANGED,
+ * AGENTS_CHANGED and on every #code-session-select change - it is what makes a freshly
+ * synced agent appear without a reload.
+ */
+function renderAgentMenu() {
+  void agentLabel;
+  void agentIcon;
+  // TODO(F2)
+}
+
 function selectedSession() {
   const select = /** @type {HTMLSelectElement|null} */ (byId('code-session-select'));
   const value = select && select.value ? select.value : storage.get(LS_LAST_SESSION, '');
@@ -727,13 +866,24 @@ function selectedSession() {
 }
 
 function wireToolbar() {
-  const openFrom = (shell) => () => openTerminal(selectedSession(), shell);
+  const openFrom = (shellParam) => () => openTerminal(selectedSession(), shellParam);
   const bash = byId('btn-new-bash');
   if (bash) bash.addEventListener('click', openFrom('bash'));
-  const claude = byId('btn-new-claude');
-  if (claude) claude.addEventListener('click', openFrom('claude'));
   const sh = byId('btn-new-sh');
   if (sh) sh.addEventListener('click', openFrom('sh'));
+
+  // TODO(F2): #new-agent-menu is a delegated click target - `[data-agent]` opens
+  // openTerminal(selectedSession(), formatShellParam('agent', id)). Also wire
+  // #code-host-filter (change -> storage.set(LS_CODE_HOST, value) + re-render rail/select).
+  const agentMenu = byId('new-agent-menu');
+  if (agentMenu) {
+    agentMenu.addEventListener('click', (event) => {
+      const item = event.target.closest('[data-agent]');
+      if (!item) return;
+      event.preventDefault();
+      openTerminal(selectedSession(), formatShellParam('agent', item.getAttribute('data-agent')));
+    });
+  }
 
   const reset = byId('btn-reset-layout');
   if (reset) reset.addEventListener('click', () => resetLayout());
@@ -799,15 +949,22 @@ async function init(ctx) {
   wireToolbar();
 
   railSessions = getSessions() || [];
+  renderHostFilter(railSessions);
   renderRail(railSessions);
   renderSessionSelect(railSessions);
+  renderAgentMenu();
 
   bus.on(EVENTS.SESSIONS_CHANGED, ({ sessions }) => {
     railSessions = Array.isArray(sessions) ? sessions : [];
+    renderHostFilter(railSessions);
     renderRail(railSessions);
     renderSessionSelect(railSessions);
+    renderAgentMenu();
   });
+  // v0.2: `shell` is the wire value ('bash' | 'sh' | 'agent:<id>'); 'claude' still parses.
   bus.on(EVENTS.OPEN_TERMINAL, ({ session, shell }) => openTerminal(session, shell || 'bash'));
+  // A newly installed/renamed agent must reach the menu and the tab titles without a reload.
+  bus.on(EVENTS.AGENTS_CHANGED, () => renderAgentMenu());
   bus.on(EVENTS.THEME_CHANGED, ({ theme }) => {
     for (const entry of panes.values()) entry.pane.setTheme(theme);
   });

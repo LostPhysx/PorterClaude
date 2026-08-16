@@ -1,9 +1,9 @@
 <!doctype html>
 <!--
-  PorterClaude web UI shell.
+  PorterClaude web UI shell (v0.2 - hosts + agents).
   OWNER: F1 (frontend package 1). F2 must NOT edit this file.
   FROZEN DOM: every element id below is a cross-package contract (docs/design/frontend.md
-  section 4 "DOM contract"). Ids may be ADDED, never renamed or removed.
+  section 4 "DOM contract" and section 12 "v0.2"). Ids may be ADDED, never renamed or removed.
   The whole #view-code subtree is authored for F2: F1 must not change its ids/structure.
 -->
 <html lang="en" data-bs-theme="dark">
@@ -47,7 +47,9 @@
       </ul>
 
       <div class="d-flex align-items-center gap-2">
-        <span id="backend-badge" class="badge text-bg-secondary" title="active Docker backend">backend: ...</span>
+        <!-- v0.2: this chip summarises the HOSTS, not one global backend. The id is kept so
+             no existing selector breaks; the text is rendered by app.js from settings.hosts. -->
+        <a id="backend-badge" class="badge text-bg-secondary text-decoration-none" href="#/settings" title="Docker hosts">hosts: ...</a>
         <button id="btn-logout" class="btn btn-sm btn-outline-secondary" type="button" title="Log out">
           <i class="bi bi-box-arrow-right"></i>
         </button>
@@ -66,7 +68,7 @@
             <span class="text-uppercase small text-secondary">Sessions</span>
             <button id="btn-rail-refresh" class="btn btn-sm btn-link p-0" type="button" title="Refresh"><i class="bi bi-arrow-clockwise"></i></button>
           </div>
-          <!-- F2 renders one .pc-rail-item per session in here -->
+          <!-- F2 renders one .pc-rail-group[data-host] per host (heading + .pc-rail-item rows) -->
           <div id="session-rail-list" class="pc-rail-list"></div>
           <div class="pc-rail-foot p-2 border-top">
             <button id="btn-reset-layout" class="btn btn-sm btn-outline-secondary w-100" type="button">
@@ -77,11 +79,17 @@
 
         <div class="pc-code-main">
           <div id="code-toolbar" class="pc-code-toolbar d-flex align-items-center gap-2 px-2 py-1 border-bottom">
+            <select id="code-host-filter" class="form-select form-select-sm w-auto" aria-label="Filter sessions by host"></select>
             <select id="code-session-select" class="form-select form-select-sm w-auto" aria-label="Session for new terminals"></select>
             <div class="btn-group btn-group-sm">
-              <button id="btn-new-bash" class="btn btn-outline-light" type="button"><i class="bi bi-terminal me-1"></i>bash</button>
-              <button id="btn-new-claude" class="btn btn-outline-light" type="button"><i class="bi bi-stars me-1"></i>claude</button>
-              <button id="btn-new-sh" class="btn btn-outline-light" type="button">sh</button>
+              <button id="btn-new-bash" class="btn btn-outline-light" type="button" title="Open a bash terminal"><i class="bi bi-terminal me-1"></i>bash</button>
+              <button id="btn-new-sh" class="btn btn-outline-light" type="button" title="Open a sh terminal">sh</button>
+              <button id="btn-new-agent" class="btn btn-outline-light dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" title="Open a coding agent">
+                <i class="bi bi-stars me-1"></i>Agent
+              </button>
+              <!-- F2 fills this from the selected session's resolvedAgents:
+                   <li><button class="dropdown-item" data-agent="ID">Claude Code</button></li> -->
+              <ul id="new-agent-menu" class="dropdown-menu dropdown-menu-end"></ul>
             </div>
             <span id="code-status" class="small text-secondary ms-auto"></span>
           </div>
@@ -92,7 +100,7 @@
           <div id="code-empty" class="pc-code-empty text-center text-secondary d-none">
             <p class="mb-2"><i class="bi bi-terminal display-6"></i></p>
             <p class="mb-1">No terminals open.</p>
-            <p class="small mb-0">Pick a running session on the left and open <code>bash</code> or <code>claude</code>.</p>
+            <p class="small mb-0">Pick a running session on the left and open <code>bash</code> or a coding agent.</p>
           </div>
         </div>
       </div>
@@ -103,6 +111,7 @@
       <div class="container-fluid py-3">
         <div class="d-flex align-items-center gap-2 mb-3">
           <h5 class="mb-0 me-auto">Sessions</h5>
+          <select id="sessions-host-filter" class="form-select form-select-sm w-auto" aria-label="Filter by host"></select>
           <button id="btn-reconcile" class="btn btn-sm btn-outline-secondary" type="button"><i class="bi bi-arrow-repeat me-1"></i>Reconcile</button>
           <button id="btn-sessions-refresh" class="btn btn-sm btn-outline-secondary" type="button"><i class="bi bi-arrow-clockwise"></i></button>
           <button id="btn-session-new" class="btn btn-sm btn-primary" type="button"><i class="bi bi-plus-lg me-1"></i>New session</button>
@@ -111,7 +120,7 @@
         <div class="table-responsive">
           <table class="table table-sm table-hover align-middle" id="sessions-table">
             <thead>
-              <tr><th>Name</th><th>Image</th><th>Workspace</th><th>Status</th><th>Ports</th><th>Uptime</th><th class="text-end">Actions</th></tr>
+              <tr><th>Name</th><th>Host</th><th>Image</th><th>Workspace</th><th>Status</th><th>Ports</th><th>Uptime</th><th class="text-end">Actions</th></tr>
             </thead>
             <!-- rows are rendered by js/sessions.js (one <tr> per SessionView) -->
             <tbody id="sessions-tbody"></tbody>
@@ -125,84 +134,88 @@
     <section id="view-settings" class="pc-view d-none" data-view="settings">
       <div class="container-fluid py-3">
         <ul class="nav nav-tabs mb-3" id="settings-subtabs" role="tablist">
-          <li class="nav-item"><button class="nav-link active" data-subtab="backend" type="button">Docker backend</button></li>
+          <li class="nav-item"><button class="nav-link active" data-subtab="hosts" type="button">Hosts</button></li>
+          <li class="nav-item"><button class="nav-link" data-subtab="agents" type="button">Agents</button></li>
           <li class="nav-item"><button class="nav-link" data-subtab="general" type="button">General</button></li>
           <li class="nav-item"><button class="nav-link" data-subtab="images" type="button">Images</button></li>
           <li class="nav-item"><button class="nav-link" data-subtab="account" type="button">Account</button></li>
         </ul>
 
-        <!-- backend picker -->
-        <div class="pc-subview" data-subtab="backend">
-          <form id="backend-form" class="row g-3" novalidate>
-            <div class="col-12">
-              <div class="form-check form-check-inline">
-                <input class="form-check-input" type="radio" name="backendKind" id="backend-kind-socket" value="socket">
-                <label class="form-check-label" for="backend-kind-socket">Docker socket</label>
-              </div>
-              <div class="form-check form-check-inline">
-                <input class="form-check-input" type="radio" name="backendKind" id="backend-kind-portainer" value="portainer">
-                <label class="form-check-label" for="backend-kind-portainer">Portainer</label>
-              </div>
-              <span id="socket-available-hint" class="small text-secondary ms-2"></span>
-            </div>
+        <!-- ---------- hosts + portainer credentials (js/hosts.js) ---------- -->
+        <div class="pc-subview" data-subtab="hosts">
+          <div id="hosts-alert"></div>
 
-            <div id="backend-socket-fields" class="col-12 d-none">
-              <label class="form-label" for="socket-path">Socket path</label>
-              <input class="form-control" id="socket-path" name="socketPath" placeholder="/var/run/docker.sock">
-            </div>
+          <div class="d-flex align-items-center gap-2 mb-2">
+            <h6 class="mb-0 me-auto">Docker hosts</h6>
+            <button id="btn-hosts-refresh" class="btn btn-sm btn-outline-secondary" type="button" title="Refresh"><i class="bi bi-arrow-clockwise"></i></button>
+            <button id="btn-host-new" class="btn btn-sm btn-primary" type="button"><i class="bi bi-plus-lg me-1"></i>Add host</button>
+          </div>
+          <div class="table-responsive">
+            <table class="table table-sm table-hover align-middle" id="hosts-table">
+              <thead>
+                <tr><th>Name</th><th>Connection</th><th>Status</th><th>Sessions</th><th>Agents</th><th class="text-end">Actions</th></tr>
+              </thead>
+              <tbody id="hosts-tbody"></tbody>
+            </table>
+          </div>
+          <div id="hosts-empty" class="text-secondary small d-none">
+            No hosts yet. Add the local Docker socket, or store a Portainer credential and import its endpoints.
+          </div>
 
-            <div id="backend-portainer-fields" class="col-12 d-none">
-              <div class="row g-3">
-                <div class="col-md-6">
-                  <label class="form-label" for="portainer-url">Portainer URL</label>
-                  <input class="form-control" id="portainer-url" name="url" placeholder="https://portainer.example.com">
-                </div>
-                <div class="col-md-6">
-                  <label class="form-label" for="portainer-api-key">API key <span id="portainer-key-hint" class="small text-secondary"></span></label>
-                  <input class="form-control" id="portainer-api-key" name="apiKey" type="password" autocomplete="off" placeholder="leave blank to keep the stored key">
-                </div>
-                <div class="col-md-6">
-                  <label class="form-label" for="portainer-endpoint">Endpoint</label>
-                  <select class="form-select" id="portainer-endpoint" name="endpointId"></select>
-                </div>
-                <div class="col-md-6 d-flex align-items-end">
-                  <div class="form-check">
-                    <input class="form-check-input" type="checkbox" id="portainer-insecure" name="insecureTls">
-                    <label class="form-check-label" for="portainer-insecure">Allow self-signed TLS</label>
-                  </div>
-                </div>
-              </div>
-            </div>
+          <hr class="my-4">
 
-            <div class="col-12 d-flex gap-2">
-              <button id="btn-backend-test" class="btn btn-outline-primary" type="button"><i class="bi bi-plug me-1"></i>Test connection</button>
-              <button id="btn-backend-save" class="btn btn-primary" type="submit"><i class="bi bi-save me-1"></i>Save</button>
-            </div>
-            <div class="col-12"><div id="backend-test-result"></div></div>
-          </form>
+          <div class="d-flex align-items-center gap-2 mb-2">
+            <h6 class="mb-0 me-auto">Portainer credentials</h6>
+            <button id="btn-credential-new" class="btn btn-sm btn-outline-primary" type="button"><i class="bi bi-key me-1"></i>Add credential</button>
+          </div>
+          <div class="form-text mb-2">
+            One credential can serve many hosts: store it once, then <em>Import endpoints</em> creates one host per Portainer endpoint.
+          </div>
+          <div id="credentials-list" class="row g-2"></div>
         </div>
 
-        <!-- general -->
+        <!-- ---------- coding agents (js/agents.js) ---------- -->
+        <div class="pc-subview d-none" data-subtab="agents">
+          <div class="d-flex align-items-center gap-2 mb-2">
+            <h6 class="mb-0 me-auto">Coding agents</h6>
+            <select id="agents-host-select" class="form-select form-select-sm w-auto" aria-label="Host"></select>
+            <button id="btn-agents-refresh" class="btn btn-sm btn-outline-secondary" type="button" title="Refresh"><i class="bi bi-arrow-clockwise"></i></button>
+            <button id="btn-agents-sync" class="btn btn-sm btn-outline-secondary" type="button"><i class="bi bi-download me-1"></i>Install / update on this host</button>
+            <button id="btn-agent-new" class="btn btn-sm btn-primary" type="button"><i class="bi bi-plus-lg me-1"></i>Custom agent</button>
+          </div>
+          <div id="agents-host-note" class="small text-secondary mb-2"></div>
+          <!-- one card per AgentView, rendered by js/agents.js -->
+          <div id="agents-list" class="row g-2"></div>
+        </div>
+
+        <!-- ---------- general ---------- -->
         <div class="pc-subview d-none" data-subtab="general">
+          <div class="form-text mb-2">
+            These are the defaults every host inherits. A host can override any of them
+            (Hosts &rarr; Edit &rarr; Overrides).
+          </div>
           <!-- inputs are generated by js/settings.js, one per GeneralConfig key -->
           <form id="general-form" class="row g-3" novalidate></form>
         </div>
 
-        <!-- images -->
+        <!-- ---------- images (js/images.js), per host ---------- -->
         <div class="pc-subview d-none" data-subtab="images">
           <div class="d-flex align-items-center gap-2 mb-2">
             <h6 class="mb-0 me-auto">Recipe images</h6>
+            <select id="images-host-select" class="form-select form-select-sm w-auto" aria-label="Host"></select>
             <button id="btn-tools-sync" class="btn btn-sm btn-outline-secondary" type="button"><i class="bi bi-download me-1"></i>Sync tools volume</button>
             <button id="btn-images-refresh" class="btn btn-sm btn-outline-secondary" type="button"><i class="bi bi-arrow-clockwise"></i></button>
           </div>
           <div id="tools-status" class="small text-secondary mb-2"></div>
+          <!-- installed agents + versions of THIS host's tools volume -->
+          <div id="tools-agents" class="mb-3"></div>
           <!-- one card per recipe, rendered by js/images.js -->
           <div id="recipes-list" class="row g-2"></div>
           <h6 class="mt-4">Jobs</h6>
           <div id="jobs-list" class="list-group list-group-flush"></div>
         </div>
 
-        <!-- account -->
+        <!-- ---------- account ---------- -->
         <div class="pc-subview d-none" data-subtab="account">
           <form id="password-form" class="row g-3" style="max-width:32rem" novalidate>
             <div class="col-12">
@@ -249,6 +262,148 @@
     </div>
   </div>
 
+  <!-- host create/edit (owner: F1, js/hosts.js) -->
+  <div class="modal fade" id="host-modal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-lg modal-dialog-scrollable">
+      <div class="modal-content">
+        <form id="host-form" novalidate>
+          <div class="modal-header"><h5 class="modal-title" id="host-modal-title">Add host</h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+          <!-- body is built by js/hosts.js: name, id, connection type, socket/portainer
+               fields, enabled agents, general overrides, notes, default flag -->
+          <div class="modal-body" id="host-form-body"></div>
+          <div class="modal-footer">
+            <span id="host-form-error" class="small text-danger me-auto"></span>
+            <button type="button" class="btn btn-outline-primary" id="btn-host-test"><i class="bi bi-plug me-1"></i>Test connection</button>
+            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+            <button type="submit" class="btn btn-primary" id="btn-host-save">Save</button>
+          </div>
+        </form>
+        <div class="px-3 pb-3"><div id="host-test-result"></div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- portainer credential create/edit (owner: F1, js/hosts.js) -->
+  <div class="modal fade" id="credential-modal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-lg">
+      <div class="modal-content">
+        <form id="credential-form" novalidate>
+          <div class="modal-header"><h5 class="modal-title" id="credential-modal-title">Add Portainer credential</h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+          <div class="modal-body">
+            <div class="row g-3">
+              <div class="col-md-6">
+                <label class="form-label" for="cf-name">Name</label>
+                <input class="form-control" id="cf-name" placeholder="portainer.example.com">
+              </div>
+              <div class="col-md-6">
+                <label class="form-label" for="cf-url">Portainer URL</label>
+                <input class="form-control" id="cf-url" placeholder="https://portainer.example.com">
+              </div>
+              <div class="col-md-6">
+                <label class="form-label" for="cf-apikey">API key <span id="cf-key-hint" class="small text-secondary"></span></label>
+                <input class="form-control" id="cf-apikey" type="password" autocomplete="off" placeholder="leave blank to keep the stored key">
+              </div>
+              <div class="col-md-6 d-flex align-items-end">
+                <div class="form-check">
+                  <input class="form-check-input" type="checkbox" id="cf-insecure">
+                  <label class="form-check-label" for="cf-insecure">Allow self-signed TLS</label>
+                </div>
+              </div>
+              <div class="col-12"><div id="credential-test-result"></div></div>
+            </div>
+          </div>
+          <div class="modal-footer">
+            <span id="credential-form-error" class="small text-danger me-auto"></span>
+            <button type="button" class="btn btn-outline-primary" id="btn-credential-test"><i class="bi bi-plug me-1"></i>Test</button>
+            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+            <button type="submit" class="btn btn-primary" id="btn-credential-save">Save</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <!-- import portainer endpoints, one host each (owner: F1, js/hosts.js) -->
+  <div class="modal fade" id="import-modal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-lg modal-dialog-scrollable">
+      <div class="modal-content">
+        <div class="modal-header"><h5 class="modal-title">Import endpoints as hosts</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+        <div class="modal-body">
+          <div class="small text-secondary mb-2">Credential: <span id="import-credential-name" class="fw-semibold"></span></div>
+          <div class="row g-3 mb-3">
+            <div class="col-md-8">
+              <label class="form-label" for="import-name-template">Host name template</label>
+              <input class="form-control form-control-sm" id="import-name-template" value="{name}">
+              <div class="form-text"><code>{name}</code> is replaced by the endpoint name.</div>
+            </div>
+            <div class="col-md-4 d-flex align-items-center">
+              <div class="form-check">
+                <input class="form-check-input" type="checkbox" id="import-update" checked>
+                <label class="form-check-label" for="import-update">Update already imported endpoints</label>
+              </div>
+            </div>
+          </div>
+          <!-- one checkbox per endpoint, rendered by js/hosts.js -->
+          <div id="import-endpoints"></div>
+          <div id="import-result" class="mt-3"></div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+          <button type="button" class="btn btn-primary" id="btn-import-run"><i class="bi bi-download me-1"></i>Import</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- host info (owner: F1, js/hosts.js) -->
+  <div class="modal fade" id="host-info-modal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-lg modal-dialog-scrollable">
+      <div class="modal-content">
+        <div class="modal-header"><h5 class="modal-title" id="host-info-title">Host</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+        <div class="modal-body" id="host-info-body"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- custom agent definition (owner: F1, js/agents.js) -->
+  <div class="modal fade" id="agent-modal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-lg modal-dialog-scrollable">
+      <div class="modal-content">
+        <form id="agent-form" novalidate>
+          <div class="modal-header"><h5 class="modal-title" id="agent-modal-title">Custom agent</h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+          <div class="modal-body">
+            <div class="row g-3">
+              <div class="col-md-6">
+                <label class="form-label" for="af-preset">Start from</label>
+                <select class="form-select form-select-sm" id="af-preset"></select>
+                <div class="form-text">Copies a built-in definition into the editor as a starting point.</div>
+              </div>
+              <div class="col-12">
+                <label class="form-label" for="af-json">Agent definition (JSON)</label>
+                <textarea class="form-control font-monospace" id="af-json" rows="20" spellcheck="false"></textarea>
+                <div class="form-text">
+                  Schema: <code>docs/design/api.md</code> &rarr; Agents. Required:
+                  <code>id</code>, <code>name</code>, <code>command</code>, <code>versionCommand</code>,
+                  <code>install</code>, <code>sharedPaths</code>.
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="modal-footer">
+            <span id="agent-form-error" class="small text-danger me-auto"></span>
+            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+            <button type="submit" class="btn btn-primary" id="btn-agent-save">Save</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
   <!-- session create/edit (owner: F1) -->
   <div class="modal fade" id="session-modal" tabindex="-1" aria-hidden="true">
     <div class="modal-dialog modal-lg modal-dialog-scrollable">
@@ -256,9 +411,9 @@
         <form id="session-form" novalidate>
           <div class="modal-header"><h5 class="modal-title" id="session-modal-title">New session</h5>
             <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
-          <!-- body is built by js/sessions.js: name, image (recipe|custom), workspace
-               (volume|bind|git), env rows, port rows, extra mount rows, limits,
-               shareHistory, autoStart, network, user -->
+          <!-- body is built by js/sessions.js: name, HOST (immutable after create), image
+               (recipe|custom), workspace (volume|bind|git), env rows, port rows, extra mount
+               rows, limits, AGENTS, shareHistory, autoStart, network, user -->
           <div class="modal-body" id="session-form-body"></div>
           <div class="modal-footer">
             <span id="session-form-error" class="small text-danger me-auto"></span>
@@ -318,7 +473,7 @@
   <!-- toasts (owner: F1, used by every module through util.toast) -->
   <div id="toast-area" class="toast-container position-fixed bottom-0 end-0 p-3"></div>
 
-  <!-- app entry (module graph: app.js -> api/util/bus/settings/sessions/images/code) -->
+  <!-- app entry (module graph: app.js -> api/util/bus/hosts/agents/settings/sessions/images/code) -->
   <script type="module" src="/js/app.js"></script>
 </body>
 </html>

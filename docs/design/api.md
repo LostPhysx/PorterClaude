@@ -1,5 +1,8 @@
 # PorterClaude HTTP + WebSocket API — THE contract
 
+> **v0.2 (hosts + agents): jump to the [v0.2 section](#v02--hosts-and-agents-authoritative-from-here-down)
+> at the bottom. It supersedes every v0.1 statement it contradicts.**
+
 Status: authoritative. Server (topic BACKEND) implements it; the web UI consumes it.
 Anything not listed here does not exist. Changes require a note in both design docs.
 
@@ -543,3 +546,384 @@ unless a bullet says otherwise.
    a ⟳ marker in the Code tab's session rail; it never renders `containerImage`. The
    digest-looking-`resolvedImage` derivation is kept only as an inert fallback for an older
    server, so the two sides can ship independently.
+
+---
+
+# v0.2 — hosts and agents (AUTHORITATIVE from here down)
+
+Everything above describes v0.1 and is kept for reference. **Where the two disagree, this
+section wins.** v0.2 is allowed to break the v0.1 API; every change is listed below.
+
+## v0.2 change list (one line each)
+
+| # | Change | v0.1 | v0.2 |
+|---|---|---|---|
+| 1 | Docker connections | one global backend in settings | N **hosts**, `/api/hosts` CRUD |
+| 2 | Portainer key | inline in `settings.backend.portainer` | a **credential** at `/api/credentials/portainer`, referenced by hosts |
+| 3 | Endpoint picker | `POST /api/settings/backend/endpoints` | `GET /api/credentials/portainer/:id/endpoints` + `POST …/import` (one host per endpoint) |
+| 4 | Backend settings routes | `PUT /api/settings/backend`, `POST /api/settings/backend/test` | **REMOVED** → `POST/PUT /api/hosts`, `POST /api/hosts/test`, `POST /api/hosts/:hostId/test` |
+| 5 | Docker helpers | `/api/docker/*` | `/api/hosts/:hostId/docker/*` |
+| 6 | Images / recipes / jobs / tools | `/api/images/*` | `/api/hosts/:hostId/images/*` |
+| 7 | Sessions | flat, one engine | still flat (names are globally unique) **+ `hostId` in the body (create only) and in every `SessionView`**, `GET /api/sessions?hostId=` filter |
+| 8 | Agents | Claude Code hard-wired | `AgentDefinition` registry: `/api/agents` (built-in + custom), `/api/hosts/:hostId/agents` (enable + install state) |
+| 9 | Terminal `shell` | `bash \| claude \| sh` | `bash \| sh \| agent:<agentId>` (`claude` still accepted = `agent:claude`) |
+| 10 | `ready` frame | – | adds `hostId` and `agentId` |
+| 11 | Close codes | – | adds `4410 agent_not_available`, `4411 host_unavailable` |
+| 12 | `GET /api/health` | `backend: {kind, configured}` | `hosts: {count, configured, defaultHostId}` |
+| 13 | `GET /api/settings` | had a `backend` section | `general` + `ui` + `auth` + `hosts` summary only |
+| 14 | Volumes | `porterclaude-claude`, `porterclaude-claude-home` | one **auth volume per agent per host**: `<volumePrefix>auth-<agentId>` |
+| 15 | Config file | version 1 | version 2, migrated losslessly on first boot (`config.json.v1.bak` kept) |
+
+Unchanged: auth (`/api/auth/*`, cookie, rate limit), the error envelope and codes, the
+static/vendor mounts, `PUT /api/settings/general|ui`, `POST /api/settings/password`,
+`GET /api/settings/vendor`, the terminal frame protocol and every other close code.
+
+## Vocabulary
+
+* **Host** — one docker engine PorterClaude manages. `{ id, name, connection }` with
+  `connection.type ∈ socket | portainer` (`tcp`, `ssh` are reserved: the schema accepts them,
+  every operation answers `501 not_implemented`). At most **one** socket host per install.
+  Per host: its own transport, images, recipes, tools volume, agent auth volumes, shared
+  volumes and optional overrides of the general settings. **Nothing is ever synced between
+  hosts** — an agent login on host A says nothing about host B.
+* **Credential** — a stored Portainer `{id, name, url, apiKey(encrypted), insecureTls}`. Any
+  number of hosts (one per endpoint) reference it.
+* **Agent** — a coding agent (`claude`, `opencode`, `gemini`, `codex`, `aider`, or a custom
+  one). Installed into a host's tools volume by the tools sync; its shared state lives in the
+  per-host volume `<volumePrefix>auth-<agentId>`.
+* **Default host** — `defaultHostId`; used when a request omits a host (session create).
+
+## Host-scoped URLs
+
+`:hostId` is a slug (`^[a-z0-9][a-z0-9-]{0,31}$`). An unknown id is `404 not_found`; a host
+whose connection is incomplete (missing credential/api key) is `409 backend_not_configured`;
+an unsupported connection type is `501 not_implemented`.
+
+```
+/api/hosts/:hostId/docker/{info,containers,volumes,networks}
+/api/hosts/:hostId/images/...        (everything the v0.1 /api/images had)
+/api/hosts/:hostId/agents            (per-host agent state)
+```
+
+Sessions deliberately stay flat at `/api/sessions/:name`: **session names are unique across
+hosts**, which is also what lets the terminal websocket route `session → host` with nothing
+but the name. Creating a name that exists on any host is `409 conflict`.
+
+---
+
+## Hosts
+
+`HostView`:
+
+```json
+{
+  "id": "default", "name": "Local docker",
+  "connection": { "type": "socket", "socketPath": "/var/run/docker.sock" },
+  "connectionLabel": "socket: /var/run/docker.sock",
+  "credentialName": null,
+  "isDefault": true,
+  "supported": true,
+  "status": "ok",                       // ok | unreachable | not_configured | unknown
+  "info": { "name": "docker-host", "serverVersion": "29.1.3", "architecture": "aarch64",
+            "ncpu": 4, "memTotalBytes": 24696061952, "containers": 12,
+            "containersRunning": 9, "images": 30, "os": "Ubuntu 24.04" },
+  "error": null,
+  "settings": { "...": "effective general settings of this host (general + overrides)" },
+  "overrides": { "workspacesRoot": "/srv/other" },
+  "agents": { "enabled": ["claude"] },
+  "sessionCount": 3,
+  "notes": null,
+  "createdAt": "…", "updatedAt": "…"
+}
+```
+
+`HostInput` (POST) / `HostUpdateInput` (PUT, all fields optional):
+
+```json
+{ "id": "prod",                       // optional; slugified from `name` when omitted
+  "name": "Prod (portainer)",
+  "connection": { "type": "portainer", "credentialId": "portainer-1", "endpointId": 2 },
+  "overrides": { "workspacesRoot": "/srv/porterclaude/ws" },   // any general field
+  "agents": ["claude", "opencode"],   // enabled agent ids (default: ["claude"])
+  "notes": null,
+  "makeDefault": false }
+```
+
+| Method | Path | Body | Response |
+|---|---|---|---|
+| GET | `/api/hosts?probe=1` | – | `{ "hosts": HostView[], "defaultHostId": string\|null }` |
+| POST | `/api/hosts` | `HostInput` | `201 { "host": HostView }` |
+| POST | `/api/hosts/test` | `{ "connection": …, "apiKey"?: "…" }` | `BackendTestResult` (always 200, nothing saved) |
+| GET | `/api/hosts/:hostId` | – | `{ "host": HostView }` (probes) |
+| PUT | `/api/hosts/:hostId` | `HostUpdateInput` | `{ "host": HostView }` |
+| DELETE | `/api/hosts/:hostId?force=1` | – | `204` |
+| POST | `/api/hosts/:hostId/default` | – | `{ "host": HostView, "defaultHostId": "…" }` |
+| POST | `/api/hosts/:hostId/test` | – | `BackendTestResult` (always 200) |
+| GET | `/api/hosts/:hostId/info` | – | `{ "info": DockerInfo }` |
+
+Rules
+* `id` is immutable. A second **socket** host is `409 conflict` ("the app runs on exactly one
+  machine"). A portainer connection whose `credentialId` is unknown is `404`.
+* `GET /api/hosts` without `probe=1` answers from a ≤15 s cached probe and never blocks on a
+  dead engine; `probe=1` refreshes every host in parallel.
+* `DELETE` is `409 conflict` while sessions still reference the host; `force=1` deletes the
+  host only — **containers, volumes and images on that engine are never touched**.
+* Deleting the default host promotes the first remaining host; the last host leaves
+  `defaultHostId: null` (first-run state).
+* `BackendTestResult` is the v0.1 shape: `{ ok, info?, endpoints?, error? }`.
+
+## Portainer credentials
+
+`SanitizedPortainerCredential`:
+
+```json
+{ "id": "portainer-1", "name": "portainer.example.com",
+  "url": "https://portainer.example.com", "insecureTls": false,
+  "apiKeySet": true, "apiKeyHint": "…a1b2",
+  "hostIds": ["prod", "staging"], "createdAt": "…", "updatedAt": "…" }
+```
+
+| Method | Path | Body | Response |
+|---|---|---|---|
+| GET | `/api/credentials/portainer` | – | `{ "credentials": SanitizedPortainerCredential[] }` |
+| POST | `/api/credentials/portainer` | `{ name, url, apiKey, insecureTls? }` | `201 { "credential": … }` |
+| PUT | `/api/credentials/portainer/:id` | partial (**omit `apiKey` to keep it**) | `{ "credential": … }` |
+| DELETE | `/api/credentials/portainer/:id` | – | `204` (`409` while a host references it) |
+| POST | `/api/credentials/portainer/test` | `{ url, apiKey, insecureTls? }` | `BackendTestResult` (unsaved) |
+| POST | `/api/credentials/portainer/:id/test` | `{ url?, apiKey?, insecureTls? }` | `BackendTestResult` |
+| GET | `/api/credentials/portainer/:id/endpoints` | – | `{ "endpoints": PortainerEndpoint[] }` |
+| POST | `/api/credentials/portainer/:id/import` | `{ endpointIds?, nameTemplate?, update? }` | `{ "result": PortainerImportResult }` |
+
+The api key is write-only exactly like in v0.1: it can be set and replaced, never read back,
+and never appears in any response or log.
+
+`PortainerImportResult`:
+
+```json
+{ "created": ["prod", "staging"], "updated": [],
+  "skipped": [ { "endpointId": 7, "name": "kube", "reason": "not a docker endpoint" } ],
+  "hosts": [ HostView, … ] }
+```
+
+Import rules: one host per endpoint, `id = uniqueHostId(slugify(endpoint.name))`, name from
+`nameTemplate` (`{name}` placeholder, default `{name}`); an existing host with the same
+`credentialId` + `endpointId` is **updated, never duplicated** (`update: false` skips it);
+non-docker endpoints are skipped with a reason; on an install without hosts the first
+imported host becomes the default.
+
+## Agents
+
+`AgentDefinition` (and `AgentView` = definition + `builtin: boolean`):
+
+```json
+{
+  "id": "claude", "name": "Claude Code",
+  "description": "Anthropic's terminal coding agent",
+  "command": "claude", "args": [],
+  "versionCommand": ["claude", "--version"],
+  "install": { "kind": "script", "url": "https://claude.ai/install.sh", "binPath": "bin/claude" },
+  "sharedPaths": [ { "path": "~/.claude", "kind": "dir" },
+                   { "path": "~/.claude.json", "kind": "file" } ],
+  "historyPath": "~/.claude/projects",
+  "env": {},
+  "loginHint": "Open an agent terminal and run /login once per host.",
+  "homepage": "https://claude.com/claude-code",
+  "builtin": true
+}
+```
+
+`install` is a discriminated union on `kind`:
+
+| kind | fields | notes |
+|---|---|---|
+| `script` | `url`, `args?`, `binPath?`, `env?` | curl \| sh with the tools payload as prefix (claude, opencode) |
+| `npm` | `package`, `version?`, `bin?` | uses the Node runtime the tools volume ships (gemini, codex) |
+| `pip` | `package`, `version?`, `bin?`, `preferUv?` | uv/pipx inside the tools volume (aider) |
+| `binary` | `urls{linux-x64,linux-arm64,linux-x64-musl,linux-arm64-musl}`, `archive`, `path?` | explicit per-target downloads |
+
+Built-ins: `claude`, `opencode`, `gemini`, `codex`, `aider` (server/src/agents/builtin.ts).
+Ids are part of the API (volume names, `shell=agent:<id>`) and never change.
+
+| Method | Path | Body | Response |
+|---|---|---|---|
+| GET | `/api/agents` | – | `{ "agents": AgentView[] }` |
+| POST | `/api/agents` | `AgentDefinition` | `201 { "agent": AgentView }` |
+| GET | `/api/agents/:id` | – | `{ "agent": AgentView }` |
+| PUT | `/api/agents/:id` | `AgentDefinition` | `{ "agent": AgentView }` (custom only) |
+| DELETE | `/api/agents/:id?force=1` | – | `204` (custom only) |
+
+* A custom id that collides with a built-in is `409 conflict`; a built-in is never editable
+  or deletable (`409`).
+* Two `sharedPaths` of one definition that produce the same slug (see below) are a
+  `422 validation_error` — they would be the same directory in the auth volume.
+* `DELETE` is `409` while a host enables the agent or a session pins it; `force=1` also
+  strips the id from those hosts/sessions (their containers keep the mount until recreated).
+
+### Per host
+
+```
+GET /api/hosts/:hostId/agents  -> { "agents": HostAgentView[], "enabled": ["claude"] }
+PUT /api/hosts/:hostId/agents  { "enabled": ["claude","opencode"] } -> same shape
+```
+
+`HostAgentView` = `AgentView` + `{ enabled, installed, version, installedAt, error,
+authVolume }`. `installed`/`version` come from `<toolsMount>/AGENTS.json` inside that host's
+tools volume (written by the last tools sync); an unreachable host answers `installed:false`
+plus an `error` string instead of a 502.
+
+Enabling an agent does **not** install it: run `POST /api/hosts/:hostId/images/tools/sync`
+afterwards (the UI offers it right there), and recreate the sessions that should mount it.
+
+## Sessions
+
+`SessionInput` gains two fields; everything else is unchanged:
+
+```json
+{ "name": "web",
+  "hostId": "prod",        // optional on create (=> defaultHostId); IMMUTABLE afterwards
+  "agents": null,          // null = every agent enabled on the host; or an explicit id list
+  "...": "image, workspace, env, ports, extraMounts, limits, shareHistory, autoStart, network, user" }
+```
+
+`SessionView` gains:
+
+```json
+{ "hostId": "prod", "hostName": "Prod (portainer)", "hostMissing": false,
+  "agents": null, "resolvedAgents": ["claude", "opencode"] }
+```
+
+* `PUT /api/sessions/:name` with a different `hostId` is `422 validation_error`
+  ("the host of a session is immutable"). Moving = create the session on the other host.
+* `GET /api/sessions?hostId=<id>` filters; without it every host's sessions are returned
+  (sorted by name). A host that is unreachable does not fail the call: its sessions come back
+  with `status:"absent"` and a warning.
+* `hostMissing: true` marks a session whose host was deleted with `force=1`: it is read-only
+  until it is deleted or a host with that id exists again.
+* `resolvedAgents` is what the container really mounts. Changing the host's enabled set makes
+  the stored sessions report `needsRecreate: true` (the spec hash covers the agent mounts) —
+  that is intentional: the new agent only appears after a recreate.
+* `shareHistory: false` now gives the session one private history volume **per agent that
+  declares a `historyPath`**: `<volumePrefix>hist-<slug>` for claude (the v0.1 name, so an
+  upgraded session keeps its history) and `<volumePrefix>hist-<slug>-<agentId>` for the rest.
+* `DELETE …?removeVolumes=1` removes the workspace volume and those history volumes — never
+  an auth volume (that would delete the login of every session on the host).
+
+## Images, jobs and the tools volume (per host)
+
+Every v0.1 `/api/images/...` route moved verbatim under `/api/hosts/:hostId/images/...`:
+
+```
+GET  /api/hosts/:hostId/images                      { images }
+GET  /api/hosts/:hostId/images/recipes              { recipes }
+POST /api/hosts/:hostId/images/recipes/:name/build  202 { job }
+GET  /api/hosts/:hostId/images/jobs                 { jobs }        (this host only)
+GET  /api/hosts/:hostId/images/jobs/:id?since=<n>   { job, lines, nextIndex }
+POST /api/hosts/:hostId/images/jobs/:id/cancel      { job }
+GET  /api/hosts/:hostId/images/tools                { status }
+POST /api/hosts/:hostId/images/tools/sync           202 { job }
+POST /api/hosts/:hostId/images/custom/validate      { result }
+POST /api/hosts/:hostId/images/pull                 202 { job }
+```
+
+* `JobSummary` gains `"hostId"`. Job ids stay globally unique, so `…/jobs/:id` is still a
+  direct lookup; a job of another host answers `404`.
+* "already running" conflicts are per host: building `node` on host A never blocks host B.
+* `ToolsStatus` gains `hostId` and `agents`:
+
+```json
+{ "status": { "hostId": "prod", "volume": "porterclaude-tools",
+              "imageRef": "porterclaude/tools:latest", "present": true,
+              "lastSyncedAt": "…", "contextHash": "9f86…", "outdated": false,
+              "syncing": false, "jobId": null,
+              "claudeVersion": "2.1.233", "claudeChannel": "stable",
+              "agents": [ { "id": "claude", "installed": true, "version": "2.1.233",
+                            "installedAt": "…", "error": null },
+                          { "id": "opencode", "installed": false, "version": null,
+                            "installedAt": null, "error": "download failed: 404" } ] } }
+```
+
+  `claudeVersion`/`claudeChannel` are kept for compatibility and mirror the `claude` entry of
+  `agents`.
+* `POST …/tools/sync` installs **every agent enabled on that host** into the volume and
+  writes `AGENTS.json`. A single agent that fails to install is a warning in the job log and
+  `installed:false` in the manifest — the job still succeeds.
+* The same sync performs the **one-time legacy claude import** on a migrated host: the
+  content of the v0.1 `sharedClaudeVolume` / `sharedClaudeHomeVolume` is copied into
+  `<volumePrefix>auth-claude` (marker `.pc-import-v1`). The old volumes are never deleted.
+
+## WebSocket: terminals
+
+```
+GET /api/terminals?session=<slug>&shell=bash|sh|agent:<agentId>&name=<terminal>&cols=<n>&rows=<n>
+```
+
+* No host parameter: the server resolves `session → hostId → backend`.
+* `shell=claude` is still accepted and means `agent:claude` (deprecated; the UI must send
+  `agent:claude`).
+* An unknown `shell` value is close `4400`.
+
+`ready` (first text frame) gains two fields:
+
+```json
+{ "type": "ready", "terminalId": "8f…", "session": "web", "hostId": "prod",
+  "shell": "agent", "agentId": "claude", "name": "main",
+  "tmux": true, "reattached": false, "cols": 120, "rows": 32 }
+```
+
+New error codes / close codes:
+
+| code | close | when |
+|---|---|---|
+| `agent_not_available` | `4410` | the agent is unknown, or not mounted into this session |
+| `host_unavailable` | `4411` | the session's host is gone or its connection type is unsupported |
+
+Both are **terminal** conditions: the client must not auto-reconnect on 4410/4411 (same rule
+as 4401), it shows the reason and offers "open a bash terminal" / "check the host".
+
+## Container contract (what the UI can rely on)
+
+```
+labels   porterclaude.managed=true
+         porterclaude.session=<slug>
+         porterclaude.host=<hostId>            (v0.2)
+         porterclaude.agents=<id,id,…>          (v0.2)
+         porterclaude.image-type=recipe|custom
+         porterclaude.recipe=<name>            (recipes only)
+         porterclaude.spec-hash=<sha256>
+         porterclaude.created-at=<iso>
+mounts   <volumePrefix>auth-<agentId> -> <containerHome>/.porterclaude/agents/<agentId>
+         <volumePrefix>hist-<slug>[-<agentId>] -> <agentDir>/<sharedPathSlug>/…  (shareHistory=false)
+         workspace                    -> <workspaceMount>
+         <toolsVolume> (read-only)    -> <toolsMount>          (EVERY session in v0.2)
+env      PORTERCLAUDE_SESSION, PORTERCLAUDE_HOST, PORTERCLAUDE_TOOLS, PORTERCLAUDE_HOME,
+         HOME, PATH, PORTERCLAUDE_AGENT_IDS, PORTERCLAUDE_AGENT_LINKS, TERM
+entrypoint ["<toolsMount>/entrypoint.sh"]      (recipes keep their image CMD)
+```
+
+The agent's own paths are **symlinks** into its auth volume, created by the bootstrap:
+`~/.claude -> <agentDir>/claude`, `~/.claude.json -> <agentDir>/claude.json`. The slug of a
+shared path is the whole path with `~/` and leading dots stripped and `/` replaced by `-`
+(`~/.local/share/opencode` → `local-share-opencode`).
+
+## Config file (v2)
+
+```json
+{ "version": 2,
+  "auth": { "...": "unchanged" },
+  "hosts": [ HostConfig ],
+  "defaultHostId": "default",
+  "credentials": { "portainer": [ PortainerCredentialConfig ] },
+  "agents": { "custom": [ AgentDefinition ] },
+  "general": { "...": "+ volumePrefix; sharedClaude*Volume are legacy-only now" },
+  "sessions": [ "SessionConfig + hostId + agents" ],
+  "ui": { "...": "unchanged" } }
+```
+
+Migration v1 → v2 runs on first boot, is lossless, and writes `config.json.v1.bak` before the
+first v2 write: the single backend becomes the host `default` (+ a `portainer-1` credential
+when it was a Portainer backend, re-using the already-encrypted key), every session gets
+`hostId: "default"` and `agents: null`, and `general` is carried over unchanged.
+
+Env seeds keep their v0.1 names (`PORTERCLAUDE_BACKEND`, `PORTAINER_URL`,
+`PORTAINER_API_KEY`, `PORTAINER_ENDPOINT_ID`, `DOCKER_SOCKET`) but now create the first host
+instead of a global backend, and only while no host exists.

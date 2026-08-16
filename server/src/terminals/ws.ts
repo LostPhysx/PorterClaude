@@ -9,6 +9,7 @@ import type { ExecStream } from '../backends/types.js';
 import { AppError, toAppError } from '../http/errors.js';
 import { SLUG_RE } from '../util/slug.js';
 import {
+  parseTerminalShell,
   TERMINAL_CLOSE,
   TERMINAL_HEARTBEAT_MS,
   TERMINAL_HEARTBEAT_TIMEOUT_MS,
@@ -27,9 +28,25 @@ export interface TerminalWsHandle {
 /** The pane name the UI generates: <session>-<shell>-<n>. */
 const TERMINAL_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,39}$/;
 
+/**
+ * v0.2: `shell` is a STRING on the wire (`bash` | `sh` | `agent:<id>`, plus the deprecated
+ * `claude` alias) and is decoded with `parseTerminalShell`, which also yields the agent id.
+ * An unparsable value is a 4400.
+ */
 const QuerySchema = z.object({
   session: z.string().regex(SLUG_RE, 'invalid session name'),
-  shell: z.enum(['bash', 'claude', 'sh']).default('bash'),
+  shell: z
+    .string()
+    .max(48)
+    .default('bash')
+    .transform((raw, ctx2) => {
+      const parsed = parseTerminalShell(raw);
+      if (!parsed) {
+        ctx2.addIssue({ code: z.ZodIssueCode.custom, message: 'invalid shell' });
+        return z.NEVER;
+      }
+      return parsed;
+    }),
   name: z.string().regex(TERMINAL_NAME_RE, 'invalid terminal name'),
   cols: z.coerce.number().int().min(1).max(1000).optional().default(80),
   rows: z.coerce.number().int().min(1).max(1000).optional().default(24),
@@ -261,7 +278,8 @@ async function handleConnection(ws: WebSocket, req: IncomingMessage, ctx: AppCon
   try {
     opened = await ctx.terminals.open({
       session: query.session,
-      shell: query.shell,
+      shell: query.shell.shell,
+      agentId: query.shell.agentId,
       name: query.name,
       cols: query.cols,
       rows: query.rows,
@@ -290,7 +308,9 @@ async function handleConnection(ws: WebSocket, req: IncomingMessage, ctx: AppCon
     type: 'ready',
     terminalId: opened.terminalId,
     session: query.session,
-    shell: query.shell,
+    hostId: opened.hostId,
+    shell: query.shell.shell,
+    agentId: opened.agentId,
     name: query.name,
     tmux: opened.tmux,
     reattached: opened.reattached,

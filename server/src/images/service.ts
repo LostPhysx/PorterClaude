@@ -1,4 +1,15 @@
 // OWNER: B2. Recipe builds, the shared tools volume, custom-image validation, job registry.
+//
+// v0.2 SKELETON STATE (planner). Every public method now takes the HOST it works on as its
+// first argument; the bodies still use the deprecated default-host shims so the repo
+// compiles. B2 owns:
+//   1. replacing `this.deps.config.general()` with `this.deps.hosts.settingsFor(hostId)` and
+//      `this.deps.backends.get()/tryGet()` with `this.deps.hosts.backendFor(hostId)` /
+//      `tryBackendFor(hostId)` — including in the private helpers (they need a hostId param);
+//   2. keying the job registry per host: `JobSummary.hostId`, the "already running" checks
+//      (`runningJobFor`) and `listJobs(hostId)` must all be host-scoped, so a build on host A
+//      never blocks the same recipe on host B;
+//   3. the AGENT half of the tools sync (see syncTools / agentStatuses below).
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import type { Readable } from 'node:stream';
@@ -17,6 +28,8 @@ export type JobStatus = 'queued' | 'running' | 'success' | 'error' | 'cancelled'
 
 export interface JobSummary {
   id: string;
+  /** the host this job runs against (v0.2) */
+  hostId: string;
   kind: JobKind;
   /** recipe name, image ref or volume name */
   target: string;
@@ -52,9 +65,22 @@ export interface RecipeStatus extends RecipeDef {
   jobId: string | null;
 }
 
+/** What the tools volume of a host really carries for one agent (from AGENTS.json). */
+export interface AgentToolStatus {
+  id: string;
+  installed: boolean;
+  version: string | null;
+  installedAt: string | null;
+  error: string | null;
+}
+
 export interface ToolsStatus {
+  /** the host this status describes (v0.2) */
+  hostId: string;
   volume: string;
   imageRef: string;
+  /** agents the tools volume carries, read from <toolsMount>/AGENTS.json (v0.2) */
+  agents: AgentToolStatus[];
   /** the tools volume exists on the engine */
   present: boolean;
   lastSyncedAt: string | null;
@@ -132,6 +158,8 @@ export function parseClaudeVersion(raw: string): string | null {
 
 interface JobRecord {
   id: string;
+  /** TODO(B2): set by startJob() from the hostId the operation runs against */
+  hostId: string;
   kind: JobKind;
   target: string;
   status: JobStatus;
@@ -177,13 +205,15 @@ export class ImageService {
   // -------------------------------------------------------------------------
 
   /** Plain docker image list for the picker. */
-  async listImages(): Promise<ImageSummary[]> {
+  async listImages(hostId: string): Promise<ImageSummary[]> {
+    void hostId; // TODO(B2): this.deps.hosts.backendFor(hostId)
     const backend = this.deps.backends.get();
     return backend.listImages();
   }
 
   /** RECIPES joined with inspectImage() + the current context hash. */
-  async recipeStatuses(): Promise<RecipeStatus[]> {
+  async recipeStatuses(hostId: string): Promise<RecipeStatus[]> {
+    void hostId; // TODO(B2): hosts.settingsFor(hostId) / hosts.tryBackendFor(hostId)
     const general = this.deps.config.general();
     const backend = this.deps.backends.tryGet();
 
@@ -240,9 +270,11 @@ export class ImageService {
    * real rebuild, e.g. to pick up a new base image) always builds.
    */
   async buildRecipe(
+    hostId: string,
     name: string,
     opts?: { noCache?: boolean; pull?: boolean; force?: boolean },
   ): Promise<JobSummary> {
+    void hostId; // TODO(B2): host-scoped settings, backend AND job key
     const recipe = getRecipe(name);
     if (!recipe) throw AppError.notFound(`unknown recipe '${name}'`);
     const running = this.runningJobFor('build', name);
@@ -304,7 +336,8 @@ export class ImageService {
     });
   }
 
-  async pull(image: string): Promise<JobSummary> {
+  async pull(hostId: string, image: string): Promise<JobSummary> {
+    void hostId; // TODO(B2)
     const backend = this.deps.backends.get();
     const running = this.runningJobFor('pull', image);
     if (running) throw AppError.conflict(`a pull for '${image}' is already running`, { jobId: running.id });
@@ -323,7 +356,8 @@ export class ImageService {
   // tools volume
   // -------------------------------------------------------------------------
 
-  async toolsStatus(): Promise<ToolsStatus> {
+  async toolsStatus(hostId: string): Promise<ToolsStatus> {
+    void hostId; // TODO(B2)
     const general = this.deps.config.general();
     const imageRef = toolsImageRef(general.imageNamespace);
     const job = this.runningJobFor('tools-sync', general.toolsVolume);
@@ -367,6 +401,9 @@ export class ImageService {
     const outdated = Boolean(contextHash) && (built ? imageHash !== contextHash : present);
 
     return {
+      // TODO(B2): hostId + agents (agentStatuses(hostId))
+      hostId: '',
+      agents: [],
       volume: general.toolsVolume,
       imageRef,
       present,
@@ -391,8 +428,23 @@ export class ImageService {
    *   2. createVolume(general.toolsVolume) if missing
    *   3. run a one-shot container from that image with the volume mounted rw at /out
    *   4. waitContainer -> non-zero exit fails the job; then removeContainer
+   *
+   * v0.2 TODO(B2) — the sync is what INSTALLS THE AGENTS of this host:
+   *   * pass `PORTERCLAUDE_AGENTS=<json>` (agents/model.ts TOOLS_AGENTS_ENV,
+   *     `agents.installSpecsForHost(host)`) into the populate container; it installs every
+   *     enabled agent into the volume and writes `<toolsMount>/AGENTS.json`;
+   *   * a single agent that fails to install is a WARNING in the job log, not a failed job
+   *     (the manifest records `installed:false` + the error, and the panel shows it);
+   *   * afterwards, ONE-TIME LEGACY IMPORT for the claude agent (only when the host has a
+   *     `general.sharedClaudeVolume` and the target auth volume has no marker yet):
+   *     run a one-shot root container mounting the old `sharedClaudeVolume` at /legacy,
+   *     `sharedClaudeHomeVolume` at /legacy-home and `<volumePrefix>auth-claude` at /auth,
+   *     then `cp -a /legacy/. /auth/claude/` and `cp -a /legacy-home/.claude.json
+   *     /auth/claude.json`, chown to the volume owner and touch `/auth/.pc-import-v1`.
+   *     Never delete the old volumes — the import must be repeatable and reversible.
    */
-  async syncTools(opts?: { force?: boolean }): Promise<JobSummary> {
+  async syncTools(hostId: string, opts?: { force?: boolean }): Promise<JobSummary> {
+    void hostId; // TODO(B2)
     const general = this.deps.config.general();
     const backend = this.deps.backends.get();
     const running = this.runningJobFor('tools-sync', general.toolsVolume);
@@ -610,7 +662,8 @@ export class ImageService {
   // -------------------------------------------------------------------------
 
   /** inspectImage, pull when missing, then report arch/user/warnings. */
-  async validateCustomImage(image: string): Promise<CustomImageCheck> {
+  async validateCustomImage(hostId: string, image: string): Promise<CustomImageCheck> {
+    void hostId; // TODO(B2)
     const backend = this.deps.backends.get();
     const result: CustomImageCheck = {
       image,
@@ -729,8 +782,26 @@ export class ImageService {
   // job registry (in-memory, capped at 2000 lines / job, 50 jobs)
   // -------------------------------------------------------------------------
 
-  listJobs(): JobSummary[] {
+  /** Newest first. `hostId` filters — the Images panel of one host must not show another's. */
+  listJobs(hostId?: string): JobSummary[] {
+    void hostId; // TODO(B2): filter on job.hostId
     return [...this.jobs.values()].reverse().map((j) => this.summary(j));
+  }
+
+  /**
+   * What the tools volume of `hostId` carries per agent — the second half of every
+   * `HostAgentView` (the first half is the definition + the host's enabled list, merged by
+   * B1's /api/hosts/:hostId/agents route).
+   *
+   * TODO(B2): read `<toolsMount>/AGENTS.json` (agents/model.ts TOOLS_AGENT_MANIFEST) out of
+   * the volume with a one-shot container (`cat`), exactly like readClaudeVersion() reads a
+   * file out of an image; cache it per host like the version probes and invalidate it after
+   * a tools sync. An unreachable host / missing volume answers `installed:false` for every
+   * enabled agent instead of throwing — the panel must render for a dead host too.
+   */
+  async agentStatuses(hostId: string): Promise<AgentToolStatus[]> {
+    void hostId;
+    return [];
   }
 
   getJob(id: string): JobSummary | null {
@@ -793,6 +864,8 @@ export class ImageService {
     }
   }
 
+  /** TODO(B2): add a hostId parameter and compare it too - a build on host A must not
+   *  block the same recipe on host B. */
   private runningJobFor(kind: JobKind, target: string): JobRecord | null {
     for (const job of this.jobs.values()) {
       if (job.kind === kind && job.target === target && (job.status === 'running' || job.status === 'queued')) {
@@ -802,9 +875,11 @@ export class ImageService {
     return null;
   }
 
+  /** TODO(B2): take the hostId as the first argument and store it on the record. */
   private startJob(kind: JobKind, target: string, run: (job: JobRecord) => Promise<void>): JobSummary {
     const job: JobRecord = {
       id: shortId(8),
+      hostId: '',
       kind,
       target,
       status: 'running',
@@ -881,6 +956,7 @@ export class ImageService {
   private summary(job: JobRecord): JobSummary {
     return {
       id: job.id,
+      hostId: job.hostId ?? '',
       kind: job.kind,
       target: job.target,
       status: job.status,

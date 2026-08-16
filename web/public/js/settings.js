@@ -1,5 +1,14 @@
-// OWNER: F1. Settings tab: backend picker (portainer|socket), general config, account,
-// plus the Images sub-panel which lives in ./images.js (same package, same owner).
+// OWNER: F1. Settings tab shell: sub-tab switching plus the two panels that live in this
+// file (General, Account). The other three panels are separate modules with the same
+// lifecycle contract: hosts.js (Hosts + Portainer credentials), agents.js (Coding agents),
+// images.js (recipe images, jobs, tools volume).
+//
+// v0.2: the "Docker backend" panel is GONE. `PUT /api/settings/backend`,
+// `POST /api/settings/backend/test` and `POST /api/settings/backend/endpoints` do not exist
+// any more - connections are hosts (`/api/hosts`) and credentials
+// (`/api/credentials/portainer`). `GET /api/settings` no longer has a `backend` section; it
+// carries `hosts: { count, defaultHostId, socketAvailable, socketHostId }` instead.
+//
 // CROSS-PACKAGE CONTRACT (FROZEN):
 //   * after every successful GET/PUT of settings, emit
 //     bus.emit(EVENTS.SETTINGS_CHANGED, { settings }) with the full SanitizedSettings object
@@ -7,25 +16,35 @@
 //     `settings.ui.layout` from it on first paint.
 import { api } from './api.js';
 import { bus, EVENTS } from './bus.js';
-import { byId, toast, toastError, escapeHtml, fmtBytes } from './util.js';
+import { byId, toast, toastError, escapeHtml } from './util.js';
 import imagesPanel from './images.js';
+import hostsPanel from './hosts.js';
+import agentsPanel from './agents.js';
 
 /** @type {any|null} */
 let settings = null;
 let initialised = false;
-let currentSubtab = 'backend';
+/** Sub-tab shown first. v0.2: hosts (a fresh install has to add one before anything works). */
+let currentSubtab = 'hosts';
+
+/** The sub-tabs of the Settings view, in display order. FROZEN (index.html data-subtab). */
+export const SUBTABS = ['hosts', 'agents', 'general', 'images', 'account'];
 
 /** FROZEN: F2 reads ui.layout / ui.theme from here. @returns {any|null} SanitizedSettings */
 export function getSettings() {
   return settings;
 }
 
-/** GeneralConfig keys in display order (mirrors server/src/config/schema.ts). */
-const GENERAL_FIELDS = [
+/**
+ * GeneralConfig keys in display order (mirrors server/src/config/fields.ts
+ * GENERAL_FIELD_SCHEMAS). Exported because hosts.js renders the SAME list as the per-host
+ * "overrides" form - a host may override any general field. FROZEN key list: adding a field
+ * here without a server-side schema entry produces a 422.
+ */
+export const GENERAL_FIELDS = [
   { key: 'workspacesRoot', label: 'Workspaces root', help: 'host directory used for bind workspaces' },
-  { key: 'sharedClaudeVolume', label: 'Shared .claude volume', help: 'mounted at <container home>/.claude in every session' },
-  { key: 'sharedClaudeHomeVolume', label: 'Shared .claude-home volume', help: 'holds ~/.claude.json (account + onboarding)' },
-  { key: 'toolsVolume', label: 'Tools volume', help: 'read-only Claude Code binaries for custom images' },
+  { key: 'volumePrefix', label: 'Volume prefix', help: 'every volume PorterClaude creates starts with this (porterclaude-ws-<session>, porterclaude-auth-<agent>, ...)' },
+  { key: 'toolsVolume', label: 'Tools volume', help: 'read-only volume holding the coding agents; mounted into every session' },
   { key: 'defaultRecipe', label: 'Default recipe' },
   { key: 'containerPrefix', label: 'Container prefix', help: 'containers are named <prefix><session>' },
   { key: 'sessionNetwork', label: 'Session network', help: 'blank = the default bridge network', nullable: true },
@@ -33,224 +52,9 @@ const GENERAL_FIELDS = [
   { key: 'containerHome', label: 'Container home' },
   { key: 'workspaceMount', label: 'Workspace mount' },
   { key: 'toolsMount', label: 'Tools mount' },
+  { key: 'sharedClaudeVolume', label: 'Legacy .claude volume', help: 'v0.1 only: the tools sync imports it once into porterclaude-auth-claude', legacy: true },
+  { key: 'sharedClaudeHomeVolume', label: 'Legacy .claude-home volume', help: 'v0.1 only: imported together with the volume above', legacy: true },
 ];
-
-// ---------------------------------------------------------------------------
-// backend panel
-// ---------------------------------------------------------------------------
-
-function backendKind() {
-  const portainer = byId('backend-kind-portainer');
-  return portainer && portainer.checked ? 'portainer' : 'socket';
-}
-
-function syncBackendFields() {
-  const kind = backendKind();
-  const socketFields = byId('backend-socket-fields');
-  const portainerFields = byId('backend-portainer-fields');
-  if (socketFields) socketFields.classList.toggle('d-none', kind !== 'socket');
-  if (portainerFields) portainerFields.classList.toggle('d-none', kind !== 'portainer');
-}
-
-/** Read the backend form. The API key is omitted when the (always empty) field is blank. */
-function readBackendForm() {
-  const kind = backendKind();
-  if (kind === 'socket') {
-    const socketPath = String((byId('socket-path') || {}).value || '').trim() || '/var/run/docker.sock';
-    return { kind: 'socket', socket: { socketPath } };
-  }
-  const url = String((byId('portainer-url') || {}).value || '').trim();
-  const apiKey = String((byId('portainer-api-key') || {}).value || '');
-  const endpointRaw = String((byId('portainer-endpoint') || {}).value || '');
-  const insecureTls = !!(byId('portainer-insecure') && byId('portainer-insecure').checked);
-  /** @type {any} */
-  const portainer = { url, insecureTls };
-  if (apiKey) portainer.apiKey = apiKey; // blank => keep the stored key (never send "")
-  if (endpointRaw !== '') portainer.endpointId = Number(endpointRaw);
-  return { kind: 'portainer', portainer };
-}
-
-function fillEndpointSelect(endpoints, selectedId) {
-  const select = byId('portainer-endpoint');
-  if (!select) return;
-  const list = Array.isArray(endpoints) ? endpoints : [];
-  const current = selectedId ?? (select.value !== '' ? Number(select.value) : null);
-  if (!list.length) {
-    select.innerHTML = current === null || current === undefined
-      ? '<option value="">(test the connection to list endpoints)</option>'
-      : `<option value="${escapeHtml(String(current))}" selected>endpoint #${escapeHtml(String(current))}</option>`;
-    return;
-  }
-  select.innerHTML = list
-    .map((e) => {
-      const id = e.id ?? e.Id;
-      const name = e.name ?? e.Name ?? `endpoint ${id}`;
-      const sel = Number(id) === Number(current) ? ' selected' : '';
-      return `<option value="${escapeHtml(String(id))}"${sel}>${escapeHtml(name)} (#${escapeHtml(String(id))})</option>`;
-    })
-    .join('');
-}
-
-function renderTestResult(html, variant = 'secondary') {
-  const box = byId('backend-test-result');
-  if (!box) return;
-  box.innerHTML = html ? `<div class="alert alert-${variant} py-2 small mb-0">${html}</div>` : '';
-}
-
-function infoTable(info) {
-  const rows = [
-    ['Host', info.name],
-    ['Docker', info.serverVersion],
-    ['OS', info.os],
-    ['Architecture', info.architecture],
-    ['CPUs', info.ncpu],
-    ['Memory', info.memTotalBytes ? fmtBytes(info.memTotalBytes) : '-'],
-    ['Containers', `${info.containersRunning ?? '?'} running / ${info.containers ?? '?'} total`],
-    ['Images', info.images],
-  ];
-  return (
-    '<table class="table table-sm mb-0"><tbody>' +
-    rows
-      .map(([k, v]) => `<tr><th class="fw-normal text-secondary" style="width:10rem">${escapeHtml(k)}</th><td>${escapeHtml(v === undefined || v === null ? '-' : String(v))}</td></tr>`)
-      .join('') +
-    '</tbody></table>'
-  );
-}
-
-/**
- * Portainer cannot answer GET /info without an endpoint id, and a first-time setup has
- * none stored yet, so before testing/saving we fetch the endpoint list with the current
- * form values (POST /api/settings/backend/endpoints - it never saves anything) and select
- * the first one. Returns a payload that carries the selected endpointId, if any.
- * @param {any} payload from readBackendForm()
- */
-async function ensureEndpointSelected(payload) {
-  if (payload.kind !== 'portainer') return payload;
-  if (payload.portainer.endpointId !== undefined && payload.portainer.endpointId !== null) return payload;
-  /** @type {any} */
-  const probe = { url: payload.portainer.url, insecureTls: !!payload.portainer.insecureTls };
-  if (payload.portainer.apiKey) probe.apiKey = payload.portainer.apiKey;
-  try {
-    const res = await api.settings.endpoints(probe);
-    const endpoints = (res && res.endpoints) || [];
-    if (!endpoints.length) return payload;
-    fillEndpointSelect(endpoints, endpoints[0].id ?? endpoints[0].Id);
-  } catch {
-    return payload; // the test call below will report the real error
-  }
-  return readBackendForm();
-}
-
-/** Test the CURRENT form values (never saves anything). */
-async function testBackend() {
-  const btn = byId('btn-backend-test');
-  let payload = readBackendForm();
-  if (payload.kind === 'portainer' && !payload.portainer.url) {
-    renderTestResult('Enter the Portainer URL first.', 'warning');
-    return;
-  }
-  if (btn) btn.disabled = true;
-  renderTestResult('<span class="spinner-border spinner-border-sm me-2"></span>testing…', 'secondary');
-  try {
-    payload = await ensureEndpointSelected(payload);
-    const res = await api.settings.testBackend(payload);
-    const endpoints = (res && res.endpoints) || [];
-    if (payload.kind === 'portainer' && endpoints.length) {
-      fillEndpointSelect(endpoints, payload.portainer.endpointId ?? null);
-    }
-    if (res && res.ok) {
-      renderTestResult(
-        `<div class="fw-semibold mb-2">Connection OK${endpoints.length ? ` · ${endpoints.length} endpoint(s)` : ''}</div>${infoTable(res.info || {})}`,
-        'success',
-      );
-      return;
-    }
-    const err = (res && res.error) || {};
-    renderTestResult(`<strong>${escapeHtml(err.code || 'backend_error')}</strong>: ${escapeHtml(err.message || 'connection failed')}`, 'danger');
-  } catch (err) {
-    renderTestResult(escapeHtml((err && err.message) || 'connection failed'), 'danger');
-  } finally {
-    if (btn) btn.disabled = false;
-  }
-}
-
-async function saveBackend(event) {
-  if (event) event.preventDefault();
-  const btn = byId('btn-backend-save');
-  let payload = readBackendForm();
-  if (payload.kind === 'portainer' && !payload.portainer.url) {
-    renderTestResult('Enter the Portainer URL first.', 'warning');
-    return;
-  }
-  if (btn) btn.disabled = true;
-  try {
-    payload = await ensureEndpointSelected(payload);
-    if (payload.kind === 'portainer' && payload.portainer.endpointId === undefined) {
-      renderTestResult('Pick a Portainer endpoint (use "Test connection" to load the list).', 'warning');
-      return;
-    }
-    await api.settings.putBackend(payload);
-    const keyInput = byId('portainer-api-key');
-    if (keyInput) keyInput.value = '';
-    toast('Docker backend saved', { variant: 'success' });
-    await reload();
-  } catch (err) {
-    toastError(err, 'Could not save the backend');
-  } finally {
-    if (btn) btn.disabled = false;
-  }
-}
-
-async function refreshEndpoints() {
-  try {
-    const payload = {};
-    const url = String((byId('portainer-url') || {}).value || '').trim();
-    const apiKey = String((byId('portainer-api-key') || {}).value || '');
-    if (url) payload.url = url;
-    if (apiKey) payload.apiKey = apiKey;
-    const insecure = byId('portainer-insecure');
-    if (insecure) payload.insecureTls = !!insecure.checked;
-    const res = await api.settings.endpoints(payload);
-    fillEndpointSelect((res && res.endpoints) || [], settings && settings.backend ? settings.backend.portainer.endpointId : null);
-  } catch {
-    /* the endpoint list is a convenience; the user can still type/test */
-  }
-}
-
-/** Paint the backend panel from the last loaded settings (the key field stays empty). */
-function renderBackend() {
-  if (!settings) return;
-  const backend = settings.backend || {};
-  const kind = backend.kind === 'portainer' ? 'portainer' : 'socket';
-  const socketRadio = byId('backend-kind-socket');
-  const portainerRadio = byId('backend-kind-portainer');
-  if (socketRadio) socketRadio.checked = kind === 'socket';
-  if (portainerRadio) portainerRadio.checked = kind === 'portainer';
-
-  const socketPath = byId('socket-path');
-  if (socketPath) socketPath.value = (backend.socket && backend.socket.socketPath) || '/var/run/docker.sock';
-
-  const hint = byId('socket-available-hint');
-  if (hint) {
-    hint.textContent = backend.socketAvailable ? 'local docker socket detected' : 'no local docker socket detected';
-    hint.className = `small ms-2 ${backend.socketAvailable ? 'text-success' : 'text-secondary'}`;
-  }
-
-  const p = backend.portainer || {};
-  const url = byId('portainer-url');
-  if (url) url.value = p.url || '';
-  const key = byId('portainer-api-key');
-  if (key) key.value = '';
-  const keyHint = byId('portainer-key-hint');
-  if (keyHint) keyHint.textContent = p.apiKeySet ? `stored ${p.apiKeyHint || '…'}` : '(not set)';
-  const insecure = byId('portainer-insecure');
-  if (insecure) insecure.checked = !!p.insecureTls;
-  fillEndpointSelect([], p.endpointId ?? null);
-  // a stored Portainer backend can list its endpoints without a fresh key
-  if (kind === 'portainer' && p.url && p.apiKeySet) void refreshEndpoints();
-
-  syncBackendFields();
-}
 
 // ---------------------------------------------------------------------------
 // general panel
@@ -266,7 +70,9 @@ function renderGeneral() {
       const value = general[field.key];
       return (
         '<div class="col-md-6">' +
-        `<label class="form-label" for="gen-${field.key}">${escapeHtml(field.label)}</label>` +
+        `<label class="form-label" for="gen-${field.key}">${escapeHtml(field.label)}` +
+        (field.legacy ? ' <span class="badge text-bg-secondary">legacy</span>' : '') +
+        '</label>' +
         `<input class="form-control" id="gen-${field.key}" data-general-key="${field.key}" value="${escapeHtml(value === null || value === undefined ? '' : String(value))}"` +
         `${field.nullable ? ' placeholder="(none)"' : ''}>` +
         (field.help ? `<div class="form-text">${escapeHtml(field.help)}</div>` : '') +
@@ -387,17 +193,26 @@ async function changePassword(event) {
 // sub-tabs
 // ---------------------------------------------------------------------------
 
-/** Sub-tab switcher for #settings-subtabs / .pc-subview. */
-function showSubtab(name) {
-  currentSubtab = name;
+/** The panel module behind each sub-tab (all implement { init, show, hide }). */
+const PANELS = { hosts: hostsPanel, agents: agentsPanel, images: imagesPanel };
+
+/**
+ * Sub-tab switcher for #settings-subtabs / .pc-subview. Exactly one panel is "shown" at a
+ * time: the others get hide() so their polls/job tails stop.
+ * @param {'hosts'|'agents'|'general'|'images'|'account'} name
+ */
+export function showSubtab(name) {
+  currentSubtab = SUBTABS.includes(name) ? name : 'hosts';
   document.querySelectorAll('#settings-subtabs [data-subtab]').forEach((btn) => {
-    btn.classList.toggle('active', btn.getAttribute('data-subtab') === name);
+    btn.classList.toggle('active', btn.getAttribute('data-subtab') === currentSubtab);
   });
   document.querySelectorAll('.pc-subview[data-subtab]').forEach((pane) => {
-    pane.classList.toggle('d-none', pane.getAttribute('data-subtab') !== name);
+    pane.classList.toggle('d-none', pane.getAttribute('data-subtab') !== currentSubtab);
   });
-  if (name === 'images') imagesPanel.show();
-  else imagesPanel.hide();
+  for (const [key, panel] of Object.entries(PANELS)) {
+    if (key === currentSubtab) panel.show();
+    else panel.hide();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -408,7 +223,6 @@ function showSubtab(name) {
 export async function reload() {
   const res = await api.settings.get();
   settings = res;
-  renderBackend();
   renderGeneral();
   renderAccount();
   bus.emit(EVENTS.SETTINGS_CHANGED, { settings });
@@ -425,31 +239,18 @@ const settingsView = {
       btn.addEventListener('click', () => showSubtab(btn.getAttribute('data-subtab')));
     });
 
-    for (const id of ['backend-kind-socket', 'backend-kind-portainer']) {
-      const el = byId(id);
-      if (el) el.addEventListener('change', syncBackendFields);
-    }
-    const test = byId('btn-backend-test');
-    if (test) test.addEventListener('click', () => { void testBackend(); });
-    const backendForm = byId('backend-form');
-    if (backendForm) backendForm.addEventListener('submit', (e) => { void saveBackend(e); });
-    const urlInput = byId('portainer-url');
-    if (urlInput) {
-      urlInput.addEventListener('blur', () => {
-        if (backendKind() === 'portainer' && urlInput.value) void refreshEndpoints();
-      });
-    }
-
     const generalForm = byId('general-form');
     if (generalForm) generalForm.addEventListener('submit', (e) => { void saveGeneral(e); });
 
     const passwordForm = byId('password-form');
     if (passwordForm) passwordForm.addEventListener('submit', (e) => { void changePassword(e); });
 
-    try {
-      await imagesPanel.init(ctx);
-    } catch (err) {
-      console.error('[settings] images panel init failed', err);
+    for (const [key, panel] of Object.entries(PANELS)) {
+      try {
+        await panel.init(ctx);
+      } catch (err) {
+        console.error(`[settings] ${key} panel init failed`, err);
+      }
     }
 
     showSubtab(currentSubtab);
@@ -463,10 +264,11 @@ const settingsView = {
     reload().catch((err) => {
       if (err && err.status !== 401) toastError(err, 'Could not load the settings');
     });
-    if (currentSubtab === 'images') setTimeout(() => imagesPanel.show(), 0);
+    // re-run the panel lifecycle so the visible one refreshes on every entry
+    setTimeout(() => showSubtab(currentSubtab), 0);
   },
   hide() {
-    imagesPanel.hide();
+    for (const panel of Object.values(PANELS)) panel.hide();
   },
   refresh() {
     void reload().catch(() => {});

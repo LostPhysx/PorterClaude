@@ -1,19 +1,50 @@
-// OWNER: F1. Settings -> Images sub-panel: recipe list, builds, job log polling,
-// tools-volume sync. Not a top-level view; settings.js drives its lifecycle.
+// OWNER: F1. Settings -> Images sub-panel: recipe list, builds, job log polling and the
+// tools volume (which in v0.2 is what installs the CODING AGENTS). Not a top-level view;
+// settings.js drives its lifecycle.
+//
+// v0.2: everything here is PER HOST. `#images-host-select` picks it, the choice is
+// remembered in localStorage, and every call goes to `/api/hosts/:hostId/images/...`.
+// Job ids stay globally unique, but a job of another host answers 404 - so the host id is
+// part of the job-tail state as well (`openJob(hostId, jobId)`).
 import { api } from './api.js';
-import { byId, toast, toastError, escapeHtml, fmtBytes, fmtDate } from './util.js';
+import { byId, toast, toastError, escapeHtml, fmtBytes, fmtDate, storage, LS_PREFIX } from './util.js';
+import { getHosts, resolveHostId, hostOptionsHtml } from './hosts.js';
 
 /** Poll interval for a running job (api.md: builds are polled, not streamed). */
 export const JOB_POLL_MS = 1000;
 
+/** localStorage key remembering which host the Images panel is pointed at. */
+export const LS_IMAGES_HOST = `${LS_PREFIX}images.host`;
+
 /** @type {any[]} */
 let recipes = [];
-/** @type {any|null} */
+/** @type {any|null} ToolsStatus of the selected host */
 let toolsStatus = null;
+/** @type {string} the host this panel is pointed at ('' when there is no host yet) */
+let hostId = '';
 let initialised = false;
 
-/** job modal state */
-const jobState = { id: null, cursor: 0, timer: null, autoScroll: true, status: null };
+/** job modal state (hostId is part of it: `/api/hosts/:hostId/images/jobs/:id`) */
+const jobState = { hostId: '', id: null, cursor: 0, timer: null, autoScroll: true, status: null };
+
+/** The host the panel currently shows. @returns {string} */
+export function currentHostId() {
+  return hostId;
+}
+
+/**
+ * TODO(F1): fill #images-host-select with hostOptionsHtml(hostId) (no "All hosts" entry -
+ * builds always target exactly one engine), preselect resolveHostId(storage.get(...)),
+ * persist the choice under LS_IMAGES_HOST and reload the panel on change. With no host at
+ * all: disable the select and render "No Docker host yet - add one under Settings -> Hosts"
+ * into #tools-status, #tools-agents and #recipes-list instead of firing requests.
+ */
+export function renderHostSelect() {
+  void getHosts;
+  void resolveHostId;
+  void hostOptionsHtml;
+  // TODO(F1)
+}
 
 function stopJobPoll() {
   if (jobState.timer) clearTimeout(jobState.timer);
@@ -30,7 +61,6 @@ function recipeCard(r) {
         : '<span class="badge text-bg-secondary">not built</span>';
 
   const meta = [];
-  if (r.claudeVersion) meta.push(`claude ${escapeHtml(r.claudeVersion)}`);
   if (r.sizeBytes) meta.push(escapeHtml(fmtBytes(r.sizeBytes)));
   if (r.builtAt) meta.push(`built ${escapeHtml(fmtDate(r.builtAt))}`);
 
@@ -57,31 +87,56 @@ function recipeCard(r) {
   );
 }
 
-/** Render #recipes-list from GET /api/images/recipes. */
+/** Render #recipes-list from GET /api/hosts/:hostId/images/recipes. */
 export async function reloadRecipes() {
   const list = byId('recipes-list');
   if (!list) return;
+  if (!hostId) {
+    recipes = [];
+    list.innerHTML = '<div class="col-12 text-secondary small">Pick a host first.</div>';
+    return;
+  }
   try {
-    const res = await api.images.recipes();
+    const res = await api.images.recipes(hostId);
     recipes = Array.isArray(res && res.recipes) ? res.recipes : [];
     list.innerHTML = recipes.length
       ? recipes.map(recipeCard).join('')
       : '<div class="col-12 text-secondary small">No recipes reported by the server.</div>';
   } catch (err) {
     recipes = [];
+    // v0.2 copy: it is THIS host that has no usable connection, not "the backend".
     const message = err && err.code === 'backend_not_configured'
-      ? 'No Docker backend is configured yet - pick one under "Docker backend" first.'
+      ? 'This host has no usable connection yet - fix it under "Hosts".'
       : `Could not load the recipes: ${escapeHtml((err && err.message) || 'unknown error')}`;
     list.innerHTML = `<div class="col-12"><div class="alert alert-warning py-2 small mb-0">${message}</div></div>`;
   }
 }
 
-/** GET /api/images/tools -> #tools-status. */
+/**
+ * TODO(F1): render #tools-agents from `ToolsStatus.agents` (AgentToolStatus[]): a small
+ * table with one row per agent - the agent id in monospace (ids are the API identity; this
+ * module deliberately does NOT import agents.js, see the module graph in frontend.md 12.2),
+ * an "installed <version>" success badge / "not installed" secondary badge / the `error`
+ * string in danger, and fmtDate(installedAt). Below it a one-liner:
+ *   "Agents are installed into the tools volume of THIS host. There is no sync between
+ *    hosts: every host needs its own login."
+ * When `agents` is empty: "no agents installed yet - enable them under Agents, then sync".
+ */
+export function renderToolsAgents() {
+  // TODO(F1)
+}
+
+/** GET /api/hosts/:hostId/images/tools -> #tools-status (+ renderToolsAgents). */
 export async function reloadTools() {
   const el = byId('tools-status');
   if (!el) return;
+  if (!hostId) {
+    toolsStatus = null;
+    el.textContent = 'Pick a host first.';
+    return;
+  }
   try {
-    const res = await api.images.tools();
+    const res = await api.images.tools(hostId);
     const s = (res && res.status) || {};
     toolsStatus = s;
     if (s.syncing) {
@@ -89,23 +144,23 @@ export async function reloadTools() {
         `<span class="spinner-border spinner-border-sm me-1"></span>syncing tools volume <code>${escapeHtml(s.volume || '')}</code>` +
         (s.jobId ? ` · <a href="#" data-job="${escapeHtml(s.jobId)}">view log</a>` : '');
     } else if (s.present) {
-      const badge = s.outdated
-        ? ' <span class="badge text-bg-warning">outdated</span>'
-        : '';
+      const badge = s.outdated ? ' <span class="badge text-bg-warning">outdated</span>' : '';
       const hint = s.outdated
         ? '<div class="small text-secondary">the tools image no longer matches <code>docker/tools</code> - sync to rebuild it and refresh the volume</div>'
         : '';
+      const installed = Array.isArray(s.agents) ? s.agents.filter((a) => a && a.installed).length : 0;
       el.innerHTML =
-        `tools volume <code>${escapeHtml(s.volume || '')}</code> · claude ${escapeHtml(s.claudeVersion || '?')} · synced ${escapeHtml(fmtDate(s.lastSyncedAt))}${badge}${hint}`;
+        `tools volume <code>${escapeHtml(s.volume || '')}</code> · ${escapeHtml(String(installed))} agent(s) installed · synced ${escapeHtml(fmtDate(s.lastSyncedAt))}${badge}${hint}`;
     } else {
-      el.innerHTML = `tools volume <code>${escapeHtml(s.volume || 'porterclaude-tools')}</code> is not populated - custom images cannot bootstrap Claude Code yet.`;
+      el.innerHTML = `tools volume <code>${escapeHtml(s.volume || 'porterclaude-tools')}</code> is not populated - sessions on this host have no coding agent yet.`;
     }
   } catch (err) {
     toolsStatus = null;
     el.textContent = err && err.code === 'backend_not_configured'
-      ? 'tools volume status unavailable (no Docker backend configured)'
+      ? 'tools volume status unavailable (this host has no usable connection)'
       : `tools volume status unavailable: ${(err && err.message) || 'unknown error'}`;
   }
+  renderToolsAgents();
 }
 
 function jobRow(job) {
@@ -127,12 +182,16 @@ function jobRow(job) {
   );
 }
 
-/** GET /api/images/jobs -> #jobs-list (newest first, click opens #job-modal). */
+/** GET /api/hosts/:hostId/images/jobs -> #jobs-list (newest first, click opens #job-modal). */
 export async function reloadJobs() {
   const list = byId('jobs-list');
   if (!list) return;
+  if (!hostId) {
+    list.innerHTML = '';
+    return;
+  }
   try {
-    const res = await api.images.jobs();
+    const res = await api.images.jobs(hostId);
     const jobs = Array.isArray(res && res.jobs) ? res.jobs : [];
     list.innerHTML = jobs.length
       ? jobs.map(jobRow).join('')
@@ -158,9 +217,9 @@ function setJobTitle(job) {
 }
 
 async function pollJob() {
-  if (!jobState.id) return;
+  if (!jobState.id || !jobState.hostId) return;
   try {
-    const res = await api.images.job(jobState.id, jobState.cursor);
+    const res = await api.images.job(jobState.hostId, jobState.id, jobState.cursor);
     const job = (res && res.job) || null;
     appendJobLines((res && res.lines) || []);
     if (res && typeof res.nextIndex === 'number') jobState.cursor = res.nextIndex;
@@ -183,16 +242,19 @@ async function pollJob() {
 }
 
 /**
- * Open #job-modal and tail a job. The poll stops when the modal hides, when the job
- * finishes, and on hide()/AUTH_REQUIRED (settings.js calls hide()).
+ * Open #job-modal and tail a job of `jobHostId`. The poll stops when the modal hides, when
+ * the job finishes, and on hide()/AUTH_REQUIRED (settings.js calls hide()).
+ * Exported because agents.js opens the tools-sync job from the Agents panel.
+ * @param {string} jobHostId
  * @param {string} jobId
  */
-export function openJob(jobId) {
-  if (!jobId) return;
+export function openJob(jobHostId, jobId) {
+  if (!jobId || !jobHostId) return;
   const modalEl = byId('job-modal');
   const body = byId('job-body');
   if (!modalEl || typeof bootstrap === 'undefined') return;
   stopJobPoll();
+  jobState.hostId = jobHostId;
   jobState.id = jobId;
   jobState.cursor = 0;
   jobState.autoScroll = true;
@@ -205,25 +267,25 @@ export function openJob(jobId) {
 
 async function buildRecipe(name, opts) {
   try {
-    const res = await api.images.buildRecipe(name, opts);
+    const res = await api.images.buildRecipe(hostId, name, opts);
     const job = res && res.job;
-    if (job && job.id) openJob(job.id);
+    if (job && job.id) openJob(hostId, job.id);
     await reloadRecipes();
   } catch (err) {
     if (err && err.code === 'conflict') {
-      // a build is already running: open its job instead of erroring
+      // a build is already running ON THIS HOST: open its job instead of erroring
       await reloadRecipes();
       const running = recipes.find((r) => r.name === name && r.jobId);
       if (running) {
-        openJob(running.jobId);
+        openJob(hostId, running.jobId);
         return;
       }
       try {
-        const res = await api.images.jobs();
+        const res = await api.images.jobs(hostId);
         const jobs = (res && res.jobs) || [];
         const match = jobs.find((j) => j.target === name && j.status === 'running');
         if (match) {
-          openJob(match.id);
+          openJob(hostId, match.id);
           return;
         }
       } catch {
@@ -234,17 +296,26 @@ async function buildRecipe(name, opts) {
   }
 }
 
-async function syncTools() {
+/**
+ * Sync the tools volume of the selected host: this is what installs/updates the coding
+ * agents enabled on it. Exported so agents.js can trigger the same flow.
+ * @returns {Promise<void>}
+ */
+export async function syncTools() {
   const btn = byId('btn-tools-sync');
+  if (!hostId) {
+    toast('Pick a host first.', { variant: 'warning' });
+    return;
+  }
   if (btn) btn.disabled = true;
   try {
-    const res = await api.images.syncTools(false);
+    const res = await api.images.syncTools(hostId, false);
     const job = res && res.job;
-    if (job && job.id) openJob(job.id);
+    if (job && job.id) openJob(hostId, job.id);
     await reloadTools();
   } catch (err) {
     if (err && err.code === 'conflict' && toolsStatus && toolsStatus.jobId) {
-      openJob(toolsStatus.jobId);
+      openJob(hostId, toolsStatus.jobId);
     } else {
       toastError(err, 'Could not sync the tools volume');
     }
@@ -254,9 +325,9 @@ async function syncTools() {
 }
 
 async function cancelJob() {
-  if (!jobState.id) return;
+  if (!jobState.id || !jobState.hostId) return;
   try {
-    await api.images.cancelJob(jobState.id);
+    await api.images.cancelJob(jobState.hostId, jobState.id);
     toast('Cancellation requested', { variant: 'info' });
   } catch (err) {
     toastError(err, 'Could not cancel the job');
@@ -268,6 +339,12 @@ const imagesPanel = {
     void ctx;
     if (initialised) return;
     initialised = true;
+
+    // TODO(F1): wire #images-host-select (change -> hostId = value, storage.set(
+    //   LS_IMAGES_HOST, value), reload everything) and subscribe to EVENTS.HOSTS_CHANGED so
+    //   the select follows host CRUD. `hostId` must never stay '' while a host exists.
+    void storage;
+    void LS_IMAGES_HOST;
 
     const refresh = byId('btn-images-refresh');
     if (refresh) {
@@ -297,7 +374,7 @@ const imagesPanel = {
         const jobBtn = e.target.closest('[data-job]');
         if (jobBtn) {
           e.preventDefault();
-          openJob(jobBtn.getAttribute('data-job'));
+          openJob(hostId, jobBtn.getAttribute('data-job'));
           return;
         }
         const buildBtn = e.target.closest('[data-build]');
@@ -313,7 +390,7 @@ const imagesPanel = {
     if (jobs) {
       jobs.addEventListener('click', (e) => {
         const btn = e.target.closest('[data-job]');
-        if (btn) openJob(btn.getAttribute('data-job'));
+        if (btn) openJob(hostId, btn.getAttribute('data-job'));
       });
     }
 
@@ -323,12 +400,13 @@ const imagesPanel = {
         const link = e.target.closest('[data-job]');
         if (link) {
           e.preventDefault();
-          openJob(link.getAttribute('data-job'));
+          openJob(hostId, link.getAttribute('data-job'));
         }
       });
     }
   },
   show() {
+    renderHostSelect();
     void reloadRecipes();
     void reloadTools();
     void reloadJobs();

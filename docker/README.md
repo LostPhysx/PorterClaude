@@ -1,5 +1,11 @@
 # docker/ — images
 
+> **v0.2 — TODO(O1): rewrite this file for the agent model.** Recipes no longer bake a
+> coding agent in; every agent is delivered through the per-host tools volume and every
+> session (recipe and custom alike) is started with `<toolsMount>/entrypoint.sh`. See
+> [`docs/design/orchestration.md` §13–§15](../docs/design/orchestration.md).
+
+
 OWNER: O1. Design: [`docs/design/orchestration.md`](../docs/design/orchestration.md).
 
 | Path | Image | Built by | Tag |

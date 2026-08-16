@@ -1,5 +1,8 @@
 # PorterClaude — backend design (`server/`)
 
+> **v0.2 (hosts + agents): the [v0.2 section](#v02--hosts-and-agents-authoritative-from-here-down)
+> at the bottom supersedes every statement above that it contradicts.**
+
 Companion to [`api.md`](api.md), which is the wire contract. This doc is the internal
 design: module layout, ownership, key flows, error handling, and what QA should test.
 
@@ -419,3 +422,269 @@ Manual / integration against a real engine (integration QA):
   container after deleting `config.json`.
 * Build a recipe from Settings → Images: log lines stream via polling, `built` flips to
   true, `outdated` flips after touching the Dockerfile.
+
+---
+
+# v0.2 — hosts and agents (AUTHORITATIVE from here down)
+
+Sections 1–12 above describe v0.1. Where they disagree with this section, **this section
+wins**. The wire contract is `api.md` §"v0.2 — hosts and agents".
+
+## 11.1 What v0.2 changes, in one paragraph
+
+The single global docker backend becomes **N hosts**; Claude Code becomes **N agents**.
+Both are data, not code paths: a host is `{id, name, connection}` and a `HostManager` hands
+out one `DockerBackend` per host; an agent is an `AgentDefinition` and everything that used
+to be claude-specific (installation, shared volume, terminal command, images panel) is
+driven by that definition. Nothing is shared between hosts — no volumes, no images, no
+logins, no sync.
+
+## 12 Module map (v0.2 delta)
+
+| Path | Owner | Purpose |
+|---|---|---|
+| `src/config/fields.ts` | **FROZEN** | the shared field validators + `GENERAL_FIELD_SCHEMAS` (leaf module: breaks the schema↔hosts import cycle) |
+| `src/config/schema.ts` | **FROZEN** | config v2: `hosts[]`, `defaultHostId`, `credentials`, `agents.custom`, `general.volumePrefix` |
+| `src/config/store.ts` | B1 | + host/credential/agent accessors, **v1→v2 migration**, new env seeds, new `sanitized()` |
+| `src/hosts/model.ts` | **FROZEN** | `HostConfig`, `HostConnection` (socket/portainer + reserved tcp/ssh), `HostView`, credential shapes, `slugifyHostId`/`uniqueHostId`/`connectionLabel` |
+| `src/hosts/manager.ts` | B1 | `HostManager`: per-host backend cache, `settingsFor`, CRUD, probe/views, portainer import, `legacyAccess()` |
+| `src/hosts/credentials.ts` | B1 | `CredentialStore`: portainer credentials, the ONLY place the api key is decrypted |
+| `src/hosts/routes.ts` | B1 | `/api/hosts` |
+| `src/hosts/credentialRoutes.ts` | B1 | `/api/credentials` |
+| `src/agents/model.ts` | **FROZEN** | `AgentDefinition` + the pure layout helpers (volume names, links, history target, slugs) |
+| `src/agents/builtin.ts` | **FROZEN** | the five built-in agents + `DEFAULT_ENABLED_AGENT_IDS` |
+| `src/agents/registry.ts` | B1 | `AgentRegistry`: built-in ∪ custom, per-host/-session resolution, install specs |
+| `src/agents/routes.ts` | B1 | `/api/agents` **and** `/api/hosts/:hostId/agents` |
+| `src/backends/index.ts` | B1 | `createBackend(ResolvedConnection)` + `testConnection` + `listPortainerEndpoints` (BackendManager is gone) |
+| `src/routes/docker.ts` | B1 | host-scoped (`mergeParams`) |
+| `src/routes/settings.ts` | B1 | general/ui/password/vendor only |
+| `src/routes/health.ts` | B1 | `hosts` summary |
+| `src/sessions/*` | B2 | `hostId` + `agents` everywhere (see §13) |
+| `src/terminals/*` | B2 | `shell: 'agent'`, host routing (see §14) |
+| `src/images/*` | B2 | host-scoped, agent-aware tools sync (see §15) |
+
+`routes/index.ts` (FROZEN) mounts the host-scoped routers **before** `/api/hosts`, so a host
+id can never shadow `/images`, `/docker` or `/agents`.
+
+### Import DAG (must stay acyclic)
+
+```
+config/fields.ts ─┬─> hosts/model.ts ─┐
+                  ├─> agents/model.ts ─┼─> config/schema.ts ─> config/store.ts ─> hosts/manager.ts
+                  └─> sessions/model.ts┘                                   └─> agents/registry.ts
+```
+
+`hosts/model.ts` must never import `config/schema.ts` (that is why `GENERAL_FIELD_SCHEMAS`
+lives in `fields.ts`); `agents/model.ts` imports nothing but zod.
+
+## 12.1 Hosts
+
+```ts
+HostConfig = { id, name, connection, overrides: Partial<GeneralConfig>,
+               agents: { enabled: string[] }, notes, createdAt, updatedAt }
+HostConnection = { type:'socket', socketPath }
+               | { type:'portainer', credentialId, endpointId }
+               | { type:'tcp', url, credentialId, insecureTls }    // reserved, 501
+               | { type:'ssh', url, credentialId, socketPath }     // reserved, 501
+```
+
+* **Effective settings** — `hosts.settingsFor(hostId) = { ...config.general, ...host.overrides }`.
+  Every B2 call site that used `config.general()` uses this instead. `config.general()` stays
+  as the *global defaults* the settings page edits.
+* **Backend cache** — `Map<hostId, {backend, fingerprint}>`. The fingerprint covers the
+  connection AND the referenced credential blob, so rotating a Portainer key rebuilds exactly
+  the hosts that use it. `invalidateChanged()` (wired to `ConfigStore.on('change')`) drops
+  only what changed; `close()` closes everything.
+* **At most one socket host.** The app process has exactly one `/var/run/docker.sock`;
+  a second socket host is a `409`.
+* **Two hosts may point at the same engine** (a socket host and a portainer endpoint of the
+  same machine). That is allowed and shares volumes/images by construction — document it in
+  the UI, and let an operator separate them with `overrides.volumePrefix` /
+  `overrides.containerPrefix` if they really want two independent installs on one engine.
+* **`status`** in `HostView` comes from a ≤15 s cached probe; the host list must render for a
+  dead engine (`status:'unreachable'`, `error` set) instead of 502ing.
+* **Deleting a host never touches the engine.** Containers, volumes and images stay; only
+  PorterClaude forgets them. `409` while sessions reference it, `force=1` overrides and
+  leaves those sessions with `hostMissing:true`.
+
+## 12.2 Credentials
+
+`credentials.portainer[]` holds `{id, name, url, apiKeyEnc, insecureTls}`. `CredentialStore`
+is the only decryption point (`apiKeyFor`), warns ONCE per process when a rotated
+`APP_SECRET` makes the blob undecryptable, and never logs the plaintext. Deleting a
+credential that a host references is a `409`.
+
+`HostManager.importPortainerEndpoints(credentialId)` turns the endpoint list into hosts (see
+api.md for the exact rules). It is the only place that creates several hosts at once.
+
+## 12.3 Agents
+
+```ts
+AgentDefinition = { id, name, command, args, versionCommand, install,
+                    sharedPaths: {path, kind}[], historyPath, env, loginHint, homepage }
+```
+
+**Registry** — `BUILTIN_AGENTS` ∪ `config.agents.custom`, ids unique across both. A custom
+definition with a duplicate `agentPathSlug()` is rejected (both paths would land in the same
+directory of the auth volume).
+
+**Storage layout (the core decision).** One volume per agent per host:
+
+```
+<volumePrefix>auth-<agentId>   mounted at   <containerHome>/.porterclaude/agents/<agentId>
+```
+
+and the bootstrap symlinks every shared path into it:
+
+```
+~/.claude       ->  <agentDir>/claude          (dir)
+~/.claude.json  ->  <agentDir>/claude.json     (file)
+~/.config/opencode -> <agentDir>/config-opencode
+```
+
+Why not mount the shared paths directly, as v0.1 did for `~/.claude`:
+1. an agent may share **several** directories (opencode: `~/.local/share/opencode` **and**
+   `~/.config/opencode`) and one volume cannot be mounted twice with different contents;
+2. single-file paths cannot be bind mounted at all — agents rewrite them atomically via
+   `rename(2)`, which replaces a file bind and breaks sharing (this is why v0.1 already used
+   a second volume + symlink for `~/.claude.json`);
+3. one rule for every agent means the entrypoint, the ownership repair and the UI have one
+   code path instead of a per-agent special case.
+
+Consequence for private history: the overlay volume mounts at `agentHistoryTarget(def, home)`
+— a path **inside** the agent volume (`<agentDir>/claude/projects`) — never at the `~/…`
+symlink, because docker resolves mount targets before the bootstrap runs. Docker sorts mounts
+by target depth, so the nested mount on top of the agent volume is well defined (same
+mechanism v0.1 used for `~/.claude/projects` inside the shared claude volume).
+
+**Delivery is uniform** (product owner's call): recipes stop baking claude in; **every**
+session mounts the tools volume read-only at `<toolsMount>` and gets
+`entrypoint ["<toolsMount>/entrypoint.sh"]`. Recipes keep their image `CMD` (the php recipe
+must still start supervisord) — docker only replaces what the create request sets, so
+overriding the entrypoint alone preserves `Cmd`. Custom images keep `cmd ["sleep","infinity"]`.
+
+**Contract with the ORCHESTRATION topic** (docker/tools):
+
+| Direction | Item | Meaning |
+|---|---|---|
+| server → tools container | env `PORTERCLAUDE_AGENTS` | JSON `AgentInstallSpec[]` (id, command, install, versionCommand) |
+| tools → volume | `<toolsMount>/AGENTS.json` | `{ syncedAt, agents:[{id,command,installed,version,error}] }` |
+| tools → volume | `<toolsMount>/agents/<id>/…` | the agent's files; `<toolsMount>/bin/<command>` is the shim on PATH |
+| tools → volume | `<toolsMount>/runtime/node/bin/node`, `<toolsMount>/runtime/python` | runtimes for `npm` / `pip` agents |
+| server → session container | env `PORTERCLAUDE_AGENT_IDS` | comma separated ids mounted into this container |
+| server → session container | env `PORTERCLAUDE_AGENT_LINKS` | `target|source|kind;…` — the symlinks to create |
+| server → session container | env `PORTERCLAUDE_HOST` | the host id (diagnostics) |
+
+The entrypoint SHOULD create the links itself at start (best effort, POSIX sh); the server
+re-runs the same repair from the outside in `afterStart` (root exec), which is what makes it
+work for containers created by an older tools volume and for non-root images.
+
+**Terminals**: `shell=agent:<id>` runs `agentCommandLine(def)` = `command` + `args`, every
+element shell-quoted. An agent that is not in the session's `resolvedAgents` is refused with
+`agent_not_available` / close 4410 — starting it anyway would run an *unauthenticated* agent
+with no auth volume and confuse the user.
+
+## 12.4 Migration (v1 → v2) and the legacy claude login
+
+`ConfigStore.migrate()` (B1) rewrites the raw JSON before it is parsed. It is lossless and
+writes `config.json.v1.bak` first. Rules are listed in the code and in api.md §Config file.
+
+The *data* migration is separate and happens on the first `tools/sync` of a migrated host:
+copy `general.sharedClaudeVolume` → `<volumePrefix>auth-claude/claude/` and the
+`.claude.json` from `general.sharedClaudeHomeVolume` → `<volumePrefix>auth-claude/claude.json`,
+chown to the volume owner, drop the marker `.pc-import-v1`. The old volumes are **never**
+deleted, so a rollback to v0.1 keeps working and the import can be re-run by deleting the
+marker. Without this the deployed instance would silently ask for `/login` again.
+
+## 13 Sessions (v0.2 delta)
+
+* `SessionConfig` gains `hostId` (immutable after create) and `agents: string[] | null`
+  (null = the host's enabled set, resolved at create/recreate time).
+* Session **names are unique across hosts** — that is what lets the terminal WS route
+  `session → host`. `create()` checks the stored sessions of every host plus the containers
+  of the target host.
+* `list()` merges every host: one `listManagedContainers` per host, in parallel, each failure
+  degrading only that host's sessions to `status:'absent'` + a warning. `opts.hostId` filters.
+* `SessionView` gains `hostId`, `hostName`, `hostMissing`, `resolvedAgents`.
+* Volume names are prefixed with `general.volumePrefix` (default `porterclaude-`, i.e. the
+  v0.1 names): `<prefix>ws-<slug>`, `<prefix>hist-<slug>` (claude) /
+  `<prefix>hist-<slug>-<agentId>`, `<prefix>auth-<agentId>`.
+* `ensureAgentVolumes` replaces `ensureSharedVolumes`: create one auth volume per resolved
+  agent (labels `porterclaude.managed=true`, `porterclaude.agent=<id>`).
+* The ownership repairs of v0.1 §7 stay, but operate on `<containerHome>/.porterclaude` and
+  the agent dirs instead of `~/.claude`: docker creates the mountpoint parents as `root:root`,
+  so a non-root image still needs the root exec that chowns them and re-runs the bootstrap.
+* `reconcile()`/adoption reads `porterclaude.host` and `porterclaude.agents` back from the
+  labels; an adopted container without a host label falls back to the host whose backend
+  listed it.
+* Changing a host's enabled agents makes its sessions report `needsRecreate` (the mounts are
+  part of the spec hash). That is intended and documented in the UI.
+
+## 14 Terminals (v0.2 delta)
+
+* `TerminalService.open({session, shell, agentId, name, cols, rows})` resolves the session's
+  host first (`requireRunningContainer` now returns `hostId`) and uses that host's backend
+  and settings.
+* The command matrix keeps its six rows; the `claude` row became the `agent` row and takes
+  the agent argv.
+* The tools PATH prefix now applies to **every** image (recipes included), because the agents
+  live in the tools volume for both.
+* New close codes 4410 (`agent_not_available`) and 4411 (`host_unavailable`); both are
+  terminal, the client must not reconnect.
+
+## 15 Images and the tools volume (v0.2 delta)
+
+* Every public `ImageService` method takes `hostId` first; jobs carry `hostId`, are listed per
+  host and their "already running" checks are per host.
+* `ToolsStatus.agents` is read from `<toolsMount>/AGENTS.json` with a one-shot container
+  (same trick as `readClaudeVersion`), cached per host and invalidated after a sync.
+* `syncTools(hostId)` = build `<ns>/tools:latest` when missing/outdated → ensure the volume →
+  run the populate container **with `PORTERCLAUDE_AGENTS`** → legacy claude import (once) →
+  invalidate the cached manifest. A single agent failing to install is a job warning, not a
+  failed job.
+* Recipes no longer ship claude, so `RecipeStatus.claudeVersion` is only about the tools
+  volume now; it is kept in the response for compatibility and mirrors the `claude` entry of
+  `ToolsStatus.agents`.
+
+## 16 Test plan (v0.2 additions)
+
+Unit (vitest, no docker host):
+* `config/fields.ts` + `GeneralSettingsInputSchema` parity guard still compiles (it is a
+  compile-time assertion, so a missing validator fails the build).
+* **Migration**: v1 portainer file, v1 socket file, v1 with sessions (incl.
+  `shareHistory:false`), empty v1 → hosts/credentials/defaultHostId/sessions[].hostId, the
+  `.v1.bak` file exists, and the migrated api key still decrypts.
+* `HostManager`: default resolution, per-host cache identity, `invalidateChanged()` drops
+  only the changed host, `settingsFor` merge, socket-host uniqueness, delete rules,
+  `importPortainerEndpoints` (create/update/skip).
+* `CredentialStore`: `sanitize()` never contains the key (grep the JSON), omitted `apiKey`
+  keeps the stored one, delete-while-referenced is a 409.
+* `AgentRegistry`: built-in ∪ custom, id collision 409, duplicate path slug 422,
+  `resolveForSession` (null → host set, explicit list, unknown id dropped).
+* `agents/model.ts` pure helpers: `agentPathSlug` table (`~/.claude`, `~/.claude.json`,
+  `~/.local/share/opencode`, `~/.config/opencode`), `agentLinks`, `agentHistoryTarget`,
+  `encode/decodeAgentLinks` round trip.
+* `buildContainerSpec` v0.2: one auth mount per agent, private history nested inside it,
+  tools volume in a recipe session, entrypoint set + `cmd` only for custom, the new labels,
+  `PORTERCLAUDE_AGENT_LINKS`, and spec-hash stability vs. change when the agent set changes.
+* `buildTerminalCommand`: the agent rows with a multi-word `agentCommand` and with a hostile
+  agent name (quoting).
+* `parseTerminalShell`: `bash`, `sh`, `agent:claude`, legacy `claude`, garbage → null.
+* Routes: a 404-sweep over every path in api.md v0.2 (host-scoped ones included), plus
+  `/api/hosts/:hostId/...` with an unknown host → 404 and with an incomplete connection → 409.
+
+Integration (real engines — the reference instance is socket mode; add a Portainer host):
+1. Upgrade path: start v0.2 against the existing `/data`, confirm the host `default` appears,
+   the sessions still list, `config.json.v1.bak` exists, and a `tools/sync` imports the
+   claude login (open a terminal: no `/login` prompt).
+2. Add a Portainer credential → import endpoints → a host per endpoint → create a session on
+   the new host → terminal works, and the session list shows both hosts.
+3. Enable `opencode` on one host → sync tools → Images panel shows it installed with a
+   version → recreate a session → `agent:opencode` terminal starts it → login → a SECOND
+   session on the SAME host is authenticated → a session on the OTHER host is NOT.
+4. `shareHistory:false` session on a host with two agents → two history volumes, both
+   writable, and the shared auth volume is untouched.
+5. Delete a host with sessions → 409; with `force=1` → the sessions show `hostMissing` and the
+   containers are still running on the engine.
+6. Kill a host's engine → the host list still renders (`unreachable`), the other host's
+   sessions still work, and a terminal on the dead host closes 4411.

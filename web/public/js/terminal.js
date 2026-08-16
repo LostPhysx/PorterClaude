@@ -3,7 +3,7 @@
 // F1 must not edit this file.
 //
 // Globals provided by index.html classic scripts: Terminal, FitAddon, WebLinksAddon.
-import { api, terminalWsUrl, TERMINAL_NAME_RE } from './api.js';
+import { api, terminalWsUrl, formatShellParam, TERMINAL_NAME_RE, AGENT_ID_RE } from './api.js';
 import { bus, EVENTS } from './bus.js';
 
 /** Close codes (mirror of server/src/terminals/protocol.ts TERMINAL_CLOSE). FROZEN. */
@@ -15,6 +15,10 @@ export const CLOSE = Object.freeze({
   unauthorized: 4401,
   sessionNotFound: 4404,
   sessionNotRunning: 4409,
+  /** v0.2: the agent is unknown or not mounted into this session - TERMINAL, never retry */
+  agentNotAvailable: 4410,
+  /** v0.2: the session's host is gone / unsupported - TERMINAL, never retry */
+  hostUnavailable: 4411,
   backendError: 4502,
   internal: 4500,
 });
@@ -56,7 +60,7 @@ export const CONTAINER_SIGNAL_EXITS = Object.freeze([137, 143]);
 export const SESSION_STATE_POLL_MS = 3000;
 export const SESSION_STATE_POLL_INTERVAL_MS = 250;
 
-/** @typedef {'bash'|'claude'|'sh'} Shell */
+/** @typedef {'bash'|'sh'|'agent'} Shell */
 /** @typedef {'connecting'|'open'|'closed'|'reconnecting'|'fatal'} PaneStatus */
 
 const ANSI_DIM = '\x1b[2m';
@@ -64,13 +68,29 @@ const ANSI_RED = '\x1b[31m';
 const ANSI_RESET = '\x1b[0m';
 
 /**
+ * The middle part of a pane name. FROZEN (v0.2): an AGENT pane uses the AGENT ID, so a
+ * claude pane is still called `<session>-claude-<n>` - exactly the v0.1 name, which is what
+ * lets an upgraded layout reattach to its existing tmux sessions.
+ * @param {Shell} shell @param {string|null} [agentId]
+ * @returns {string}
+ */
+export function terminalSlug(shell, agentId = null) {
+  if (shell === 'agent') {
+    if (!agentId || !AGENT_ID_RE.test(String(agentId))) throw new Error(`invalid agent id: ${agentId}`);
+    return String(agentId);
+  }
+  return shell === 'sh' ? 'sh' : 'bash';
+}
+
+/**
  * Build the stable pane name that drives the tmux session (`pc_<name>`).
  * FROZEN: code.js persists this in the layout, so the algorithm must stay stable.
- * @param {string} session @param {Shell} shell @param {number} n 1-based per session+shell
+ * @param {string} session @param {string} slug terminalSlug(shell, agentId)
+ * @param {number} n 1-based per session+slug
  * @returns {string} e.g. "web-claude-2"
  */
-export function makeTerminalName(session, shell, n) {
-  const name = `${session}-${shell}-${n}`.toLowerCase();
+export function makeTerminalName(session, slug, n) {
+  const name = `${session}-${slug}-${n}`.toLowerCase();
   if (!TERMINAL_NAME_RE.test(name)) throw new Error(`invalid terminal name: ${name}`);
   return name;
 }
@@ -102,19 +122,27 @@ function jitter(ms) {
  */
 export class TerminalPane {
   /**
-   * @param {{session:string, shell:Shell, name:string,
+   * @param {{session:string, shell:Shell, agentId?:string|null, name:string,
    *          theme?:'dark'|'light',
    *          onStatus?:(status:PaneStatus, info?:object)=>void,
    *          onTitle?:(title:string)=>void,
-   *          onRequestClose?:()=>void}} opts
+   *          onRequestClose?:()=>void,
+   *          onOpenBash?:()=>void}} opts
+   *        v0.2: `agentId` is REQUIRED when `shell === 'agent'`; `onOpenBash` is the action
+   *        the pane offers after close 4410 (agent_not_available).
    */
   constructor(opts) {
     this.session = opts.session;
     this.shell = opts.shell;
+    /** @type {string|null} set exactly when shell === 'agent' (v0.2) */
+    this.agentId = opts.agentId ?? null;
+    /** @type {string|null} the host the server resolved this session to (from `ready`) */
+    this.hostId = null;
     this.name = opts.name;
     this.onStatus = opts.onStatus ?? (() => {});
     this.onTitle = opts.onTitle ?? (() => {});
     this.onRequestClose = opts.onRequestClose ?? (() => {});
+    this.onOpenBash = opts.onOpenBash ?? (() => {});
     /** @type {PaneStatus} */
     this.status = 'closed';
     /** @type {WebSocket|null} */
@@ -228,7 +256,12 @@ export class TerminalPane {
     let ws;
     try {
       ws = new WebSocket(terminalWsUrl({
-        session: this.session, shell: this.shell, name: this.name, cols, rows,
+        session: this.session,
+        // v0.2 wire value: 'bash' | 'sh' | 'agent:<agentId>' (api.js formatShellParam)
+        shell: formatShellParam(this.shell, this.agentId),
+        name: this.name,
+        cols,
+        rows,
       }));
     } catch (err) {
       console.error('[terminal] cannot open websocket', err);
@@ -282,6 +315,10 @@ export class TerminalPane {
     switch (msg.type) {
       case 'ready': {
         this.terminalId = msg.terminalId ?? null;
+        // v0.2: the server reports which HOST it routed the session to and which AGENT it
+        // actually started - both are what the pane hands back through onStatus.
+        this.hostId = typeof msg.hostId === 'string' ? msg.hostId : null;
+        if (typeof msg.agentId === 'string') this.agentId = msg.agentId;
         this.tmux = msg.tmux !== false;
         this.reattached = msg.reattached === true;
         this._retryDelay = RECONNECT_MIN_MS;
@@ -297,7 +334,12 @@ export class TerminalPane {
           this._resetOnReady = false;
           try { this.term?.reset(); } catch (err) { console.debug('[terminal] reset failed', err); }
         }
-        this._setStatus('open', { tmux: this.tmux, reattached: this.reattached });
+        this._setStatus('open', {
+          tmux: this.tmux,
+          reattached: this.reattached,
+          hostId: this.hostId,
+          agentId: this.agentId,
+        });
         if (this.tmux === false) {
           this._renderNote('tmux', {
             variant: 'warning',
@@ -482,6 +524,35 @@ export class TerminalPane {
         text: 'your session expired — sign in again',
       });
       bus.emit(EVENTS.AUTH_REQUIRED, {});
+      return;
+    }
+
+    // v0.2 TERMINAL conditions - never auto-reconnect (api.md "WebSocket: terminals").
+    if (code === CLOSE.agentNotAvailable) {
+      this._setStatus('fatal');
+      // TODO(F2): wording - `the agent "<label>" is not available in this session` plus
+      // "enable it on the host (Settings, Agents), sync the tools volume and recreate the
+      // session". Keep the two actions below.
+      this._renderNote('conn', {
+        variant: 'danger',
+        text: detail || `agent "${this.agentId || '?'}" is not available in this session`,
+        actions: [
+          { label: 'Open bash instead', onClick: () => this.onOpenBash() },
+          { label: 'Close pane', onClick: () => this.onRequestClose() },
+        ],
+      });
+      return;
+    }
+
+    if (code === CLOSE.hostUnavailable) {
+      this._setStatus('fatal');
+      // TODO(F2): wording - "the host of this session is unavailable" + the host id when the
+      // `ready` frame had already delivered one. No retry, no api call.
+      this._renderNote('conn', {
+        variant: 'danger',
+        text: detail || 'the host of this session is unavailable',
+        actions: [{ label: 'Close pane', onClick: () => this.onRequestClose() }],
+      });
       return;
     }
 

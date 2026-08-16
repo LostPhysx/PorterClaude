@@ -115,62 +115,14 @@ describe('auth', () => {
 });
 
 describe('/api/settings', () => {
-  it('returns the sanitized settings and never the api key', async () => {
-    const cookie = await login();
-    await h.ctx.config.setPortainerApiKey('ptr_top_secret_9999');
-
-    const res = await request(h.app).get('/api/settings').set('Cookie', cookie);
-    expect(res.status).toBe(200);
-    expect(res.text).not.toContain('ptr_top_secret_9999');
-    expect(res.body.backend.portainer).toMatchObject({ apiKeySet: true, apiKeyHint: '9999' });
-    expect(res.body.backend.portainer.apiKey).toBeUndefined();
-    expect(res.body.general.imageNamespace).toBe('porterclaude');
-    expect(res.body.ui).toEqual({ layout: null, theme: 'auto' });
-    expect(res.body.auth).toEqual({ passwordSet: true });
-    expect(typeof res.body.backend.socketAvailable).toBe('boolean');
-  });
-
-  it('PUT /backend keeps the stored key when apiKey is omitted', async () => {
-    const cookie = await login();
-    await h.ctx.config.setPortainerApiKey('ptr_stored_key_4321');
-
-    const res = await request(h.app)
-      .put('/api/settings/backend')
-      .set('Cookie', cookie)
-      .send({ kind: 'portainer', portainer: { url: 'https://portainer.example.com/', endpointId: 2 } });
-
-    expect(res.status).toBe(200);
-    expect(res.body.backend.kind).toBe('portainer');
-    expect(res.body.backend.portainer.url).toBe('https://portainer.example.com');
-    expect(res.body.backend.portainer.endpointId).toBe(2);
-    expect(res.body.backend.portainer.apiKeySet).toBe(true);
-    expect(res.body.backend.portainer.apiKeyHint).toBe('4321');
-    expect(h.ctx.config.getPortainerApiKey()).toBe('ptr_stored_key_4321');
-    expect(res.text).not.toContain('ptr_stored_key_4321');
-  });
-
-  it('PUT /backend rejects a bad payload with 422', async () => {
-    const cookie = await login();
-    const res = await request(h.app)
-      .put('/api/settings/backend')
-      .set('Cookie', cookie)
-      .send({ kind: 'portainer', portainer: { url: 'not-a-url' } });
-    expect(res.status).toBe(422);
-    expect(res.body.error.code).toBe('validation_error');
-    expect(Array.isArray(res.body.error.details)).toBe(true);
-  });
-
-  it('POST /backend/test answers 200 { ok:false } for an unreachable host', async () => {
-    const cookie = await login();
-    const res = await request(h.app)
-      .post('/api/settings/backend/test')
-      .set('Cookie', cookie)
-      .send({ kind: 'portainer', portainer: { url: 'https://127.0.0.1:9', apiKey: 'ptr_x', endpointId: 1 } });
-    expect(res.status).toBe(200);
-    expect(res.body.ok).toBe(false);
-    expect(res.body.error.message).toBeTruthy();
-    expect(res.text).not.toContain('ptr_x');
-  }, 30_000);
+  // TODO(B1): v0.2 route tests (the /api/settings/backend* routes are gone, see api.md):
+  //   * GET /api/settings has no `backend` section and reports hosts.count/defaultHostId;
+  //   * POST /api/credentials/portainer stores the key encrypted and answers apiKeySet
+  //     with a 4-char hint only; PUT without apiKey keeps it; the plaintext never appears
+  //     in any response body (grep);
+  //   * POST /api/hosts creates a host (409 for a second socket host), POST
+  //     /api/hosts/:id/default switches the default, DELETE 409s while a session uses it;
+  //   * POST /api/hosts/test answers 200 { ok:false } for an unreachable connection.
 
   it('PUT /general merges partial updates', async () => {
     const cookie = await login();
@@ -258,7 +210,9 @@ describe('/api/settings', () => {
   });
 });
 
-describe('/api/docker', () => {
+describe('/api/hosts/:hostId/docker', () => {
+  // TODO(B1): the helpers are host-scoped now -> 404 for an unknown host and
+  // 409 backend_not_configured for a host whose connection is incomplete.
   it('409s backend_not_configured on every helper', async () => {
     const cookie = await login();
     for (const path of ['/api/docker/info', '/api/docker/containers', '/api/docker/volumes', '/api/docker/networks']) {

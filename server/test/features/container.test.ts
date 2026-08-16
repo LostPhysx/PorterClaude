@@ -11,14 +11,20 @@ import {
 } from '../../src/sessions/container.js';
 import { CONTAINER_LABELS } from '../../src/sessions/model.js';
 import { generalConfig, sessionConfig } from './helpers.js';
+import { BUILTIN_AGENTS } from '../../src/agents/builtin.js';
 
 const general = generalConfig();
+// TODO(B2): the v0.1 expectations below still describe the shared-claude-volume layout.
+// Rewrite them against the v0.2 contract (agent auth volumes + symlinks, tools volume in
+// every session, uniform entrypoint) — see docs/design/backend.md v0.2 §7/§12.
+const agents = BUILTIN_AGENTS.filter((a) => a.id === 'claude');
 
 function recipeSpec(overrides = {}) {
   const session = sessionConfig(overrides);
   return buildContainerSpec({
     session,
     general,
+    agents,
     resolvedImage: 'porterclaude/node:latest',
     imageType: 'recipe',
   });
@@ -26,7 +32,7 @@ function recipeSpec(overrides = {}) {
 
 function customSpec(overrides = {}) {
   const session = sessionConfig({ image: { type: 'custom', ref: 'nginx:1.27' }, ...overrides });
-  return buildContainerSpec({ session, general, resolvedImage: 'nginx:1.27', imageType: 'custom' });
+  return buildContainerSpec({ session, general, agents, resolvedImage: 'nginx:1.27', imageType: 'custom' });
 }
 
 describe('buildContainerSpec', () => {
@@ -236,6 +242,7 @@ describe('specHash', () => {
       buildContainerSpec({
         session: sessionConfig(),
         general,
+        agents,
         resolvedImage: 'porterclaude/node:other',
         imageType: 'recipe',
       }),
@@ -266,6 +273,7 @@ describe('custom image PATH (BE-6)', () => {
     const spec = buildContainerSpec({
       session,
       general,
+      agents,
       resolvedImage: 'alpine:3.20',
       imageType: 'custom',
       imageEnvPath: '/usr/sbin:/usr/bin:/sbin:/bin',
@@ -301,6 +309,7 @@ describe('custom image PATH (BE-6)', () => {
       buildContainerSpec({
         session,
         general,
+        agents,
         resolvedImage: 'alpine:3.20',
         imageType: 'custom',
         ...(imageEnvPath === undefined ? {} : { imageEnvPath }),

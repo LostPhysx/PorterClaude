@@ -9,7 +9,9 @@ import { createLogger } from '../../src/logger.js';
 import { resolvePaths } from '../../src/paths.js';
 import { loadOrCreateMasterSecret, SecretBox } from '../../src/config/crypto.js';
 import { ConfigStore } from '../../src/config/store.js';
-import { BackendManager } from '../../src/backends/index.js';
+import { CredentialStore } from '../../src/hosts/credentials.js';
+import { HostManager } from '../../src/hosts/manager.js';
+import { AgentRegistry } from '../../src/agents/registry.js';
 import { createAuthService } from '../../src/auth/index.js';
 import { SessionService } from '../../src/sessions/service.js';
 import { ImageService } from '../../src/images/service.js';
@@ -46,15 +48,26 @@ export async function buildContext(env: Record<string, string> = {}): Promise<{ 
   const config = new ConfigStore({ paths, env: parsed, log, secrets });
   await config.init();
 
-  const backends = new BackendManager({ config, env: parsed, log });
-  // mirrors src/index.ts: only backend settings changes rebuild the transport
-  config.on('change', () => backends.invalidateIfChanged());
+  const credentials = new CredentialStore({ config, secrets, log });
+  const hosts = new HostManager({ config, env: parsed, log, credentials });
+  const agents = new AgentRegistry({ config, log });
+  // mirrors src/index.ts: only a changed host connection rebuilds that host's transport
+  config.on('change', () => hosts.invalidateChanged());
 
-  const deps: ServiceDeps = { env: parsed, log, paths, config, backends };
+  const deps: ServiceDeps = {
+    env: parsed,
+    log,
+    paths,
+    config,
+    hosts,
+    agents,
+    backends: hosts.legacyAccess(),
+  };
   const ctx: AppContext = {
     ...deps,
     secrets,
     auth: createAuthService({ config, secrets, env: parsed, log }),
+    credentials,
     sessions: new SessionService(deps),
     images: new ImageService(deps),
     terminals: new TerminalService(deps, new SessionService(deps)),
@@ -73,7 +86,7 @@ export async function makeHarness(env: Record<string, string> = {}): Promise<Tes
     app,
     dataDir,
     cleanup: async () => {
-      await ctx.backends.close().catch(() => undefined);
+      await ctx.hosts.close().catch(() => undefined);
       await rm(dataDir, { recursive: true, force: true }).catch(() => undefined);
     },
   };

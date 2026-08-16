@@ -19,13 +19,21 @@ const boolish = z
 
 const RemoveQuery = z.object({ removeVolumes: boolish });
 
+/** v0.2: optional host filter for the list; session NAMES stay globally unique. */
+const ListQuery = z.object({ hostId: z.string().min(1).max(32).optional() });
+
 const LogsQuery = z.object({
   tail: z.coerce.number().int().min(1).max(10_000).optional().default(200),
   timestamps: boolish,
 });
 
 /**
- * GET    /api/sessions                 -> { sessions: SessionView[] }
+ * v0.2: sessions stay FLAT (no /api/hosts/:hostId prefix) because a session name is unique
+ * across hosts - that is also what lets the terminal websocket route session -> host with
+ * nothing but the name. The host is part of the body (create only, immutable afterwards)
+ * and of every SessionView.
+ *
+ * GET    /api/sessions?hostId=<id>     -> { sessions: SessionView[] }
  * POST   /api/sessions                 SessionInput -> 201 { session: SessionView }
  *                                       409 conflict when the name is taken
  * GET    /api/sessions/:name           -> { session: SessionView }
@@ -43,8 +51,9 @@ export function createSessionsRouter(ctx: AppContext): Router {
 
   router.get(
     '/',
-    asyncHandler(async (_req, res) => {
-      const sessions = await ctx.sessions.list();
+    asyncHandler(async (req, res) => {
+      const { hostId } = parseQuery(ListQuery, req);
+      const sessions = await ctx.sessions.list(hostId ? { hostId } : undefined);
       res.json({ sessions });
     }),
   );

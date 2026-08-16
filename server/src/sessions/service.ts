@@ -1,4 +1,26 @@
 // OWNER: B2. Session lifecycle. Public API FROZEN — terminals/ws.ts and routes depend on it.
+//
+// v0.2 SKELETON STATE (planner). The file still carries the v0.1 bodies so the repo
+// compiles and the existing tests keep running; B2 owns turning it host + agent aware:
+//
+//   1. EVERY docker call must go through the SESSION'S host:
+//        const hostId  = <from the stored config / the create input>;
+//        const general = this.deps.hosts.settingsFor(hostId);     // not config.general()
+//        const backend = this.deps.hosts.backendFor(hostId);      // not deps.backends.get()
+//      `deps.backends` is a deprecated shim pinned to the default host — no call site of it
+//      may survive (integration QA greps for it).
+//   2. `create()` resolves `input.hostId ?? defaultHostId` ONCE and stores it; `update()`
+//      rejects a different hostId with 422 (immutable — moving hosts = recreate elsewhere).
+//   3. Session NAMES are unique across hosts (api.md v0.2): the create conflict check must
+//      look at every stored session, and additionally at the containers of the TARGET host.
+//   4. `list()` must merge the containers of EVERY host (one listManagedContainers per host,
+//      failures degrade that host's sessions to status 'absent' + a warning — one dead host
+//      must never break the whole page), and honour `opts.hostId` as a filter.
+//   5. Agent awareness: `resolveAgents(cfg)` (below) feeds `buildContainerSpec`,
+//      `ensureAgentVolumes` creates one auth volume per agent, and the ownership repairs in
+//      `afterStart` must chown the agent dirs instead of ~/.claude.
+//   6. `reconcile()` reads `porterclaude.host` / `porterclaude.agents` back from the labels
+//      when adopting an orphan, and only lists hosts that are reachable.
 import type { ServiceDeps } from '../context.js';
 import type { GeneralConfig } from '../config/schema.js';
 import type {
@@ -14,6 +36,7 @@ import { AppError, DockerApiError } from '../http/errors.js';
 import { getRecipe, recipeImageRef } from '../images/recipes.js';
 import { shortId } from '../util/ids.js';
 import { shQuote } from '../util/slug.js';
+import type { AgentDefinition } from '../agents/model.js';
 import type { SessionConfig, SessionInput, SessionView } from './model.js';
 import {
   CONTAINER_LABELS,
@@ -120,7 +143,9 @@ export class SessionService {
 
   /** Stored configs merged with live container state. Never throws when the backend is
    *  down: returns configs with status 'absent' and a warning instead. */
-  async list(): Promise<SessionView[]> {
+  async list(opts?: { hostId?: string }): Promise<SessionView[]> {
+    // TODO(B2): iterate over every host (or only opts.hostId) instead of the default one.
+    void opts;
     const general = this.deps.config.general();
     const configs = this.deps.config.listSessions();
 
@@ -216,7 +241,14 @@ export class SessionService {
     }
 
     const now = new Date().toISOString();
-    const cfg: SessionConfig = { ...input, createdAt: now, updatedAt: now };
+    // TODO(B2): resolve against the TARGET host (hosts.requireHostId(input.hostId)) and use
+    // its settings/backend above instead of the default host's.
+    const cfg: SessionConfig = {
+      ...input,
+      hostId: this.deps.hosts.requireHostId(input.hostId),
+      createdAt: now,
+      updatedAt: now,
+    };
 
     const created = await this.createContainerFor(backend, cfg, general);
     cfg.specHash = created.specHash;
@@ -254,8 +286,11 @@ export class SessionService {
         { path: ['name'], message: `expected '${name}'` },
       ]);
     }
+    // TODO(B2): 422 when input.hostId is set and differs from stored.hostId ("the host of a
+    // session is immutable; create the session on the other host instead").
     const cfg: SessionConfig = {
       ...input,
+      hostId: stored.hostId,
       createdAt: stored.createdAt,
       updatedAt: new Date().toISOString(),
     };
@@ -343,8 +378,11 @@ export class SessionService {
     }
 
     if (opts?.removeVolumes) {
-      // ONLY the per-session volumes; the shared claude/tools volumes are never touched.
-      for (const volume of [workspaceVolumeFor(name), historyVolumeFor(name)]) {
+      // ONLY the per-session volumes; the shared agent/tools volumes are never touched.
+      for (const volume of [
+        workspaceVolumeFor(general.volumePrefix, name),
+        ...this.historyVolumesFor(name, stored, general),
+      ]) {
         try {
           await backend.removeVolume(volume, { force: true });
         } catch (err) {
@@ -434,7 +472,9 @@ export class SessionService {
    * FROZEN SIGNATURE — used by TerminalService. Resolves a session name to a RUNNING
    * container id. Throws AppError.notFound / AppError.conflict('session not running').
    */
-  async requireRunningContainer(name: string): Promise<{ containerId: string; config: SessionConfig }> {
+  async requireRunningContainer(
+    name: string,
+  ): Promise<{ containerId: string; config: SessionConfig; hostId: string }> {
     const general = this.deps.config.general();
     const backend = this.deps.backends.get();
     const containers = await this.listManagedContainers(backend);
@@ -446,16 +486,47 @@ export class SessionService {
     }
     if (container.state !== 'running') throw AppError.conflict(`session '${name}' is not running`);
     const config = stored ?? this.synthesizeConfig(container, null, general);
-    return { containerId: container.id, config };
+    return { containerId: container.id, config, hostId: config.hostId };
   }
 
-  /** Ensure the shared claude volumes exist on the current backend (idempotent). */
+  /**
+   * Ensure the per-agent auth volumes of a session exist on ITS host (idempotent).
+   *
+   * TODO(B2): create `agentAuthVolumeFor(general.volumePrefix, agent.id)` for every agent of
+   * `resolveAgents(cfg)` (labels: porterclaude.managed=true, porterclaude.agent=<id>). The
+   * v0.1 shared claude volumes are NOT created any more — they only survive as the source of
+   * the one-time legacy import done by the tools sync (images/service.ts).
+   */
   async ensureSharedVolumes(): Promise<void> {
     const general = this.deps.config.general();
     const backend = this.deps.backends.get();
     for (const name of [general.sharedClaudeVolume, general.sharedClaudeHomeVolume]) {
       await backend.createVolume({ name, labels: { [CONTAINER_LABELS.managed]: 'true' } });
     }
+  }
+
+  /**
+   * The agents mounted into a session: `session.agents ?? host.agents.enabled`, resolved
+   * against the registry and sorted by id (the order goes into the spec hash).
+   *
+   * TODO(B2):
+   *   const host = this.deps.hosts.hostForSession(cfg);
+   *   return this.deps.agents.resolveForSession(host, cfg).sort((a, b) => a.id.localeCompare(b.id));
+   */
+  resolveAgents(cfg: SessionConfig): AgentDefinition[] {
+    void cfg;
+    return [];
+  }
+
+  /**
+   * Private-history volume names of a session (one per agent that declares a historyPath).
+   *
+   * TODO(B2): derive from resolveAgents(cfg); `historyVolumeFor` keeps the v0.1 name for the
+   * claude agent, which is what makes an upgraded session keep its history.
+   */
+  private historyVolumesFor(name: string, cfg: SessionConfig | null, general: GeneralConfig): string[] {
+    void cfg;
+    return [historyVolumeFor(general.volumePrefix, name, 'claude')];
   }
 
   // -------------------------------------------------------------------------
@@ -588,7 +659,7 @@ export class SessionService {
     const wanted: string[] = [];
     const workspace = workspaceMountFor(cfg, general);
     if (workspace.type === 'volume') wanted.push(workspace.source);
-    if (!cfg.shareHistory) wanted.push(historyVolumeFor(cfg.name));
+    if (!cfg.shareHistory) wanted.push(...this.historyVolumesFor(cfg.name, cfg, general));
 
     // null = the engine could not be asked; then nothing is rolled back rather than
     // guessing that a volume is new and deleting somebody's workspace.
@@ -610,6 +681,7 @@ export class SessionService {
       const spec = buildContainerSpec({
         session: cfg,
         general,
+        agents: this.resolveAgents(cfg),
         resolvedImage,
         imageType: cfg.image.type,
         imageEnvPath,
@@ -695,8 +767,17 @@ export class SessionService {
         cmd: [script],
         labels: { [VOLUME_INIT_LABEL]: cfg.name },
         mounts: [
+          // TODO(B2): the seed volume is now the CLAUDE AGENT's auth volume
+          // (agentAuthVolumeFor(general.volumePrefix, agent.id)) and the target is
+          // agentHistoryTarget(agent, home); repeat the init for every agent with a
+          // historyPath instead of only for claude.
           { type: 'volume', source: general.sharedClaudeVolume, target: sharedTarget, readOnly: false },
-          { type: 'volume', source: historyVolumeFor(cfg.name), target: HISTORY_INIT_MOUNT, readOnly: false },
+          {
+            type: 'volume',
+            source: historyVolumeFor(general.volumePrefix, cfg.name, 'claude'),
+            target: HISTORY_INIT_MOUNT,
+            readOnly: false,
+          },
         ],
         tty: false,
         openStdin: false,
@@ -1076,6 +1157,7 @@ export class SessionService {
         const spec = buildContainerSpec({
           session: cfg,
           general,
+          agents: this.resolveAgents(cfg),
           resolvedImage,
           imageType: cfg.image.type,
           // recover the image PATH the container was created with, otherwise the recomputed
@@ -1113,6 +1195,11 @@ export class SessionService {
 
     return {
       ...cfg,
+      // TODO(B2): hostName = the host's name, hostMissing = hosts.get(cfg.hostId) === null,
+      // resolvedAgents = resolveAgents(cfg).map((a) => a.id).
+      hostName: cfg.hostId,
+      hostMissing: false,
+      resolvedAgents: this.resolveAgents(cfg).map((a) => a.id),
       status,
       containerId: container?.id ?? null,
       containerName: container?.name ?? containerNameFor(general.containerPrefix, cfg.name),
@@ -1162,7 +1249,7 @@ export class SessionService {
     const workspace: SessionConfig['workspace'] = workspaceMount
       ? workspaceMount.type === 'bind'
         ? { type: 'bind', hostPath: workspaceMount.source ?? general.workspaceMount }
-        : { type: 'volume', volume: workspaceMount.name ?? workspaceVolumeFor(name) }
+        : { type: 'volume', volume: workspaceMount.name ?? workspaceVolumeFor(general.volumePrefix, name) }
       : { type: 'volume' };
 
     const historyTarget = historyMountTargetFor(general);
@@ -1184,6 +1271,11 @@ export class SessionService {
 
     return {
       name,
+      // TODO(B2): read the host and the agents back from the labels
+      // (CONTAINER_LABELS.host / CONTAINER_LABELS.agents) so adoption is lossless; fall back
+      // to the host whose backend listed the container.
+      hostId: container.labels[CONTAINER_LABELS.host] ?? this.deps.hosts.defaultHostId() ?? 'default',
+      agents: null,
       image: recipe ? { type: 'recipe', recipe } : { type: 'custom', ref: container.image },
       workspace,
       env: synthesizeEnv(inspect, general, image),

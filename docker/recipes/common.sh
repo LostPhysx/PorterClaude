@@ -6,15 +6,15 @@
 #     recipe Dockerfile does:  COPY common.sh /tmp/common.sh  &&  RUN bash /tmp/common.sh
 #     No other shared file is available in a recipe context: anything else this script needs
 #     it must generate itself (heredocs).
+#   * v0.2: recipes are LANGUAGE-TOOLCHAIN IMAGES ONLY. They no longer install a coding
+#     agent — every agent is delivered through the per-host tools volume and PorterClaude
+#     starts every session with <toolsMount>/entrypoint.sh (docs/design/orchestration.md §15).
 #   * Result of a successful run:
 #       - apt tooling: git gh ripgrep tmux curl jq unzip (deliberately NO privilege-
 #         escalation helper: sessions are unprivileged)
 #       - user `dev`, uid 1000, gid 1000, HOME=/home/dev, shell /bin/bash
-#       - /home/dev/.claude, /home/dev/.claude/projects, /home/dev/.claude-home and
-#         /workspace owned by 1000:1000  (projects must exist so that the private-history
-#         volume mount cannot get a root-owned mountpoint created under it)
-#       - claude installed OUTSIDE $HOME (under /opt/claude) and linked to /usr/local/bin/claude
-#       - /etc/porterclaude/claude-version  (exact `claude --version`)
+#       - /home/dev/.porterclaude/agents and /workspace owned by 1000:1000 (the parent of
+#         every per-agent auth volume mount, so docker's copy-up has an owner to work with)
 #       - /etc/porterclaude/recipe          (from $PORTERCLAUDE_RECIPE, may be empty)
 #       - /etc/profile.d/porterclaude.sh    (PATH incl. the image's own ENV PATH and
 #                                            $PORTERCLAUDE_PATH_EXTRA, TERM, COLORTERM)
@@ -28,7 +28,6 @@
 set -eu
 export DEBIAN_FRONTEND=noninteractive
 
-CLAUDE_INSTALL_ROOT="${CLAUDE_INSTALL_ROOT:-/opt/claude}"
 DEV_USER=dev
 DEV_UID=1000
 DEV_GID=1000
@@ -123,85 +122,25 @@ ensure_dev_user() {
   usermod -s /bin/bash "$DEV_USER" || warn "could not set the login shell of '$DEV_USER'"
   usermod -d "$DEV_HOME" "$DEV_USER" || warn "could not set the home directory of '$DEV_USER'"
 
-  # Docker copies image content *and ownership* into an empty named volume on first use:
-  # that is what makes uid 1000 own the shared login volume.
+  # Docker copies image content *and ownership* into an empty named volume on first use.
   #
-  # .claude/projects (Claude Code's conversation store) MUST exist in the image: when a
-  # session with shareHistory=false mounts porterclaude-hist-<slug> at
-  # /home/dev/.claude/projects, docker creates the missing mountpoint inside the shared
-  # volume as root:root 0755, and every uid-1000 session then gets EACCES on
-  # ~/.claude/projects. Shipping it in the image lets docker copy-up seed BOTH the shared
-  # volume and every fresh history volume with the right owner. (The server repairs
-  # pre-existing volumes - prepareHistoryVolume/ensureProjectsDir - this is the
-  # clean-slate half of the same fix.)
-  mkdir -p "$DEV_HOME/.claude/projects" "$DEV_HOME/.claude-home" "$DEV_HOME/.local/bin" \
-           "$DEV_HOME/.config" "$DEV_HOME/.cache" /workspace
-  [ -e "$DEV_HOME/.claude-home/.claude.json" ] \
-    || printf '%s\n' '{}' > "$DEV_HOME/.claude-home/.claude.json"
+  # v0.2: the shared state of an agent lives in <home>/.porterclaude/agents/<agentId> (one
+  # named volume per agent per host). The per-agent directories cannot be pre-created here
+  # (their ids are configuration, not image content), so the server chowns the mount parents
+  # after the start; shipping the PARENT with the right owner is the clean-slate half of
+  # that fix and keeps a uid-1000 session able to create the symlink sources.
+  mkdir -p "$DEV_HOME/.porterclaude/agents" "$DEV_HOME/.local/bin" "$DEV_HOME/.config" "$DEV_HOME/.cache" /workspace
   chown -R "$DEV_UID:$DEV_GID" "$DEV_HOME" /workspace
   chmod 0755 "$DEV_HOME"
-  chmod 0700 "$DEV_HOME/.claude/projects"
 }
 
-# --- 4. Claude Code (native installer, installed outside $HOME) --------------------------
-install_claude() {
-  local launcher resolved version requested installer
-  requested="${CLAUDE_VERSION:-stable}"
-  mkdir -p "$CLAUDE_INSTALL_ROOT" /etc/porterclaude
-  # /home/dev/.claude is replaced by a shared volume at runtime, so the installer must not
-  # write there: HOME points at $CLAUDE_INSTALL_ROOT for the duration of the install.
-  #
-  # $CLAUDE_VERSION is the recipe Dockerfile's `ARG CLAUDE_VERSION` (the classic builder puts
-  # build args into RUN's environment) and it MUST reach the installer: the same value is what
-  # the porterclaude.claude-version label claims, and a label saying 2.1.200 on an image that
-  # actually runs `latest` is worse than no label at all. `install.sh [version]` accepts
-  # `stable`, `latest` or an exact version; `stable` is the installer's own default and is
-  # therefore passed as no argument at all, so an older installer that ignores arguments still
-  # produces exactly what the label promises.
-  log "installing Claude Code (requested version '$requested', HOME=$CLAUDE_INSTALL_ROOT)"
-  installer=/tmp/claude-install.sh
-  curl -fsSL --retry 3 --connect-timeout 20 https://claude.ai/install.sh -o "$installer" \
-    || die "could not download https://claude.ai/install.sh — a recipe without claude is useless"
-  set --
-  if [ -n "$requested" ] && [ "$requested" != "stable" ]; then set -- "$requested"; fi
-  HOME="$CLAUDE_INSTALL_ROOT" bash "$installer" "$@" \
-    || die "the Claude Code installer failed — a recipe without claude is useless"
-  rm -f "$installer"
-
-  launcher=""
-  if [ -x "$CLAUDE_INSTALL_ROOT/.local/bin/claude" ]; then
-    launcher="$CLAUDE_INSTALL_ROOT/.local/bin/claude"
-  else
-    launcher="$(find "$CLAUDE_INSTALL_ROOT" -type f -name claude -perm -u+x 2>/dev/null | head -n1 || true)"
-  fi
-  [ -n "$launcher" ] || die "no claude binary found under $CLAUDE_INSTALL_ROOT"
-
-  resolved="$(readlink -f "$launcher" || true)"
-  [ -n "$resolved" ] || resolved="$launcher"
-  ln -sfn "$resolved" /usr/local/bin/claude
-  chmod -R a+rX "$CLAUDE_INSTALL_ROOT"
-
-  version="$(HOME="$CLAUDE_INSTALL_ROOT" /usr/local/bin/claude --version 2>/dev/null \
-             | head -n1 | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' || true)"
-  [ -n "$version" ] || die "'claude --version' produced no output"
-  printf '%s\n' "$version" > /etc/porterclaude/claude-version
-  log "claude installed: $version  ($resolved)"
-  # Machine-readable marker: the server picks it out of the build output so an uncached
-  # build needs no extra container to learn what it actually installed (server/src/images
-  # /service.ts VERSION_LOG_RE). A cached build prints nothing, hence the file above.
-  printf 'PORTERCLAUDE_CLAUDE_VERSION=%s\n' "$version"
-  # An exact request that did not come out the other end means the label lies — say so
-  # loudly instead of shipping an image that disagrees with porterclaude.claude-version.
-  case "$requested" in
-    stable|latest|"") ;;
-    *)
-      case "$version" in
-        *"$requested"*) ;;
-        *) warn "requested claude version '$requested' but the installer produced '$version'" ;;
-      esac
-      ;;
-  esac
-}
+# --- 4. (v0.2: the coding agents are NOT part of a recipe image any more) -----------------
+# v0.1 installed Claude Code here. Delivery is uniform now: the per-host tools volume carries
+# every enabled agent, PorterClaude mounts it read-only into EVERY session and overrides the
+# entrypoint with <toolsMount>/entrypoint.sh, which puts <toolsMount>/bin first on PATH.
+# Do NOT add an agent installer back into a recipe: it would shadow the volume's version,
+# double the image size and break "one login per host, every session authenticated".
+# (CI asserts that nothing under docker/recipes mentions an agent installer.)
 
 # --- 5. shell environment ----------------------------------------------------------------
 write_profile() {
@@ -260,15 +199,17 @@ PROFILE
   log "wrote /etc/profile.d/porterclaude.sh (image PATH: $image_path, extra: ${extra:-none})"
 }
 
-# --- 6. the recipe entrypoint ------------------------------------------------------------
+# --- 6. the recipe entrypoint -------------------------------------------------------------
+# v0.2: PorterClaude ALWAYS overrides the entrypoint of a managed session with the tools
+# volume's <toolsMount>/entrypoint.sh (which wires PATH, the agent symlinks and the ownership
+# repair). This file therefore only matters when somebody runs a recipe image by hand — keep
+# it to the minimum: no agent knowledge, no volume knowledge.
 write_entrypoint() {
-  # POSIX sh, best effort: every step logs on failure and continues. The container must
-  # always come up, whatever the state of the mounted volumes.
   cat > /usr/local/bin/pc-entrypoint.sh <<'ENTRY'
 #!/bin/sh
 # PorterClaude recipe entrypoint (generated by docker/recipes/common.sh). POSIX sh.
-# Wires the shared Claude Code config, then runs the container command.
-# Nothing in here may abort the container: failures warn and continue.
+# Managed sessions never reach this: the server replaces the entrypoint with the tools
+# volume's bootstrap. Nothing in here may abort the container.
 set -u
 
 HOME="${HOME:-/home/dev}"
@@ -276,8 +217,8 @@ export HOME
 TERM="${TERM:-xterm-256color}"
 export TERM
 
-pc_log()  { printf '[porterclaude] %s\n' "$*"; }
-pc_warn() { printf '[porterclaude][warn] %s\n' "$*" >&2; }
+pc_log() { printf '[porterclaude] %s
+' "$*"; }
 
 # Portable idle loop: some images ship a `sleep` that rejects "infinity", and a bare
 # `sleep` as pid 1 ignores SIGTERM. Backgrounding it and waiting lets the trap run.
@@ -289,40 +230,7 @@ pc_idle() {
   done
 }
 
-pc_link_config() {
-  vol="$HOME/.claude-home/.claude.json"
-  loc="$HOME/.claude.json"
-
-  mkdir -p "$HOME/.claude" "$HOME/.claude-home" 2>/dev/null \
-    || pc_warn "cannot create $HOME/.claude / $HOME/.claude-home"
-  if [ ! -d "$HOME/.claude-home" ]; then
-    pc_warn "no $HOME/.claude-home — skipping the .claude.json link"
-    return 0
-  fi
-
-  if [ ! -e "$vol" ]; then
-    printf '%s\n' '{}' > "$vol" 2>/dev/null || pc_warn "cannot seed $vol"
-  fi
-
-  if [ -f "$loc" ] && [ ! -L "$loc" ]; then
-    # never delete user data: move it into the shared volume, or park a backup beside it
-    if [ ! -s "$vol" ] || [ "$(cat "$vol" 2>/dev/null)" = "{}" ]; then
-      mv -f "$loc" "$vol" 2>/dev/null || pc_warn "cannot move $loc into the shared volume"
-    else
-      mv -f "$loc" "$loc.pc-backup" 2>/dev/null || pc_warn "cannot back up $loc"
-    fi
-  fi
-
-  if [ -L "$loc" ]; then
-    rm -f "$loc" 2>/dev/null || pc_warn "cannot replace the $loc symlink"
-  fi
-  if [ ! -e "$loc" ]; then
-    ln -s "$vol" "$loc" 2>/dev/null || pc_warn "cannot link $loc -> $vol"
-  fi
-  return 0
-}
-
-pc_link_config
+mkdir -p "$HOME/.porterclaude/agents" 2>/dev/null || :
 date -u +%FT%TZ > /tmp/porterclaude-ready 2>/dev/null || :
 
 if [ "$#" -eq 0 ]; then
@@ -355,7 +263,6 @@ main() {
   install_packages
   install_gh
   ensure_dev_user
-  install_claude
   write_profile
   write_entrypoint
   write_metadata

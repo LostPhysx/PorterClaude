@@ -1,17 +1,27 @@
 // OWNER: F1. Sessions tab: table, create/edit modal, lifecycle actions, logs modal.
+//
+// v0.2: a session is pinned to a HOST (chosen on create, IMMUTABLE afterwards) and mounts a
+// set of CODING AGENTS (null = every agent the host enables). The table gains a Host column
+// and a host filter; the dialog gains a host picker and an agent picker; every lookup the
+// dialog needs (recipes, images, networks, agents) is host scoped.
+//
 // CROSS-PACKAGE CONTRACT (FROZEN):
 //   * after every successful list()/poll/CRUD, emit
-//     bus.emit(EVENTS.SESSIONS_CHANGED, { sessions }) with the raw SessionView[] from the API
+//     bus.emit(EVENTS.SESSIONS_CHANGED, { sessions }) with the raw, UNFILTERED SessionView[]
+//     from the API - the host filter of this tab is applied when RENDERING only, so F2's rail
+//     never loses a host.
 //   * the row action "Open terminal" must emit
-//     bus.emit(EVENTS.OPEN_TERMINAL, { session: name, shell: 'bash'|'claude' })
+//     bus.emit(EVENTS.OPEN_TERMINAL, { session: name, shell: 'bash'|'sh'|'agent:<id>' })
 //     and then navigate to #/code (F2 opens the pane).
 //   * getSessions() must return the last known SessionView[] (F2 uses it on first paint).
 import { api } from './api.js';
 import { bus, EVENTS } from './bus.js';
 import {
   byId, toast, toastError, confirmDialog, escapeHtml, fmtDuration, statusBadgeClass,
-  anyModalOpen, renderAlert,
+  anyModalOpen, renderAlert, storage, LS_PREFIX,
 } from './util.js';
+import { getHosts, getHost, hostLabel, resolveHostId, hostOptionsHtml } from './hosts.js';
+import { agentLabel } from './agents.js';
 
 /** Poll cadence (mirrors app.js SESSION_POLL_MS; kept local to avoid an import cycle). */
 export const POLL_MS = 5000;
@@ -36,6 +46,15 @@ let networks = [];
 let editing = null;
 /** @type {Set<string>} rows with a request in flight */
 const busyRows = new Set();
+
+/** localStorage key of the Sessions tab host filter. */
+export const LS_SESSIONS_HOST = `${LS_PREFIX}sessions.host`;
+/** '' = all hosts. CLIENT-SIDE only (see the contract at the top of this file). */
+let hostFilter = storage.get(LS_SESSIONS_HOST, '') || '';
+/** host id selected in the session dialog; drives every lookup the dialog makes */
+let formHostId = '';
+/** @type {any[]} HostAgentView[] of `formHostId` (GET /api/hosts/:hostId/agents) */
+let formAgents = [];
 
 let pollTimer = null;
 let pollFailures = 0;
@@ -204,7 +223,61 @@ function pills(session) {
   if (session.orphan) {
     out.push('<span class="badge text-bg-info ms-1" title="container carries porterclaude labels but has no stored config">orphan</span>');
   }
+  // TODO(F1): push a danger "host gone" pill when session.hostMissing is true, and disable
+  // every row action except Destroy for such a session (it is read-only, api.md "Sessions").
   return out.join('');
+}
+
+/**
+ * The Host cell of a row.
+ * TODO(F1): render `hostName` (falling back to hostLabel(hostId)) plus, when
+ * `hostMissing === true`, a danger badge "host gone" with the title
+ * "the host of this session was deleted - it is read-only until a host with id
+ *  '<hostId>' exists again". Below it the host id in small monospace.
+ * @param {any} session SessionView
+ * @returns {string} table-cell HTML (everything escaped)
+ */
+export function hostCell(session) {
+  void hostLabel;
+  void getHost;
+  return `<td class="small">${escapeHtml((session && session.hostName) || (session && session.hostId) || '')}</td>`;
+}
+
+/**
+ * The agent chips shown under the session name.
+ * TODO(F1): one `<span class="badge text-bg-secondary">` per `resolvedAgents` entry,
+ * labelled with agentLabel(id) and `title`-d with the id; `agents === null` additionally
+ * gets a muted "(host default)" marker, an explicit list gets "(pinned)". No chips at all
+ * when `resolvedAgents` is empty - instead a muted "no agents" hint.
+ * @param {any} session SessionView
+ * @returns {string}
+ */
+export function agentChips(session) {
+  void session;
+  void agentLabel;
+  return '';
+}
+
+/**
+ * The rows the table shows: `sessions` filtered by `hostFilter` ('' = all).
+ * The bus payload is NEVER filtered - see the contract at the top of this file.
+ * @returns {any[]}
+ */
+export function visibleSessions() {
+  if (!hostFilter) return sessions;
+  return sessions.filter((s) => s && s.hostId === hostFilter);
+}
+
+/**
+ * TODO(F1): fill #sessions-host-filter with
+ * `hostOptionsHtml(hostFilter, { includeAll: true, allLabel: 'All hosts' })`, keep
+ * `hostFilter` + storage in sync on change, re-render, and hide the whole select while
+ * there is at most ONE host (a single-host install must look exactly like v0.1).
+ */
+export function renderHostFilter() {
+  void hostOptionsHtml;
+  void getHosts;
+  // TODO(F1)
 }
 
 /** Render one <tr> per session into #sessions-tbody. */
@@ -212,6 +285,8 @@ function render() {
   const tbody = byId('sessions-tbody');
   const empty = byId('sessions-empty');
   if (!tbody) return;
+  // TODO(F1): render visibleSessions() instead of `sessions`, and show a
+  // "no sessions on <host>" hint (not the generic empty state) when the filter hides all.
   if (!sessions.length) {
     tbody.innerHTML = '';
     if (empty) empty.classList.remove('d-none');
@@ -230,7 +305,9 @@ function render() {
         `<tr data-name="${escapeHtml(s.name)}"${busyRows.has(s.name) ? ' class="opacity-75"' : ''}>` +
         `<td><div class="fw-semibold">${escapeHtml(s.name)}${warnIcon}${pills(s)}</div>` +
         (s.displayName ? `<div class="small text-secondary">${escapeHtml(s.displayName)}</div>` : '') +
+        agentChips(s) +
         '</td>' +
+        hostCell(s) +
         `<td><div>${escapeHtml(imageLabel(s))}</div>` +
         resolvedImageCell(s) +
         '</td>' +
@@ -272,7 +349,7 @@ export async function reload() {
       publish();
       renderAlert(
         alertBox,
-        'No Docker backend is configured yet. <a href="#/settings" class="alert-link">Open Settings</a> to connect Portainer or the local socket.',
+        'No Docker host is configured yet. <a href="#/settings" class="alert-link">Open Settings and add a host</a> - the local socket, or imported Portainer endpoints.',
         'warning',
       );
       return sessions;
@@ -311,9 +388,18 @@ function startPolling() {
 // lookups used by the modal
 // ---------------------------------------------------------------------------
 
-async function loadRecipes() {
+/**
+ * v0.2: recipes are per host. Called with the host the DIALOG is pointed at; the table's
+ * `imageLabel()` uses whatever was loaded last, which is good enough for a label.
+ * @param {string} hostId
+ */
+async function loadRecipes(hostId) {
+  if (!hostId) {
+    recipes = FALLBACK_RECIPES.map((name) => ({ name, title: name, built: null }));
+    return recipes;
+  }
   try {
-    const res = await api.images.recipes();
+    const res = await api.images.recipes(hostId);
     recipes = Array.isArray(res && res.recipes) ? res.recipes : [];
   } catch {
     recipes = FALLBACK_RECIPES.map((name) => ({ name, title: name, built: null }));
@@ -321,12 +407,20 @@ async function loadRecipes() {
   return recipes;
 }
 
-async function loadLookups() {
-  await loadRecipes();
+/**
+ * Every lookup the session dialog needs, for ONE host: recipes, image refs, networks and
+ * the host's agents. Re-run whenever #sf-host changes.
+ * @param {string} hostId
+ */
+async function loadLookups(hostId) {
+  await loadRecipes(hostId);
+  imageRefs = [];
+  networks = [];
+  formAgents = [];
+  if (!hostId) return;
   try {
-    const res = await api.images.list();
+    const res = await api.images.list(hostId);
     const list = Array.isArray(res && res.images) ? res.images : [];
-    imageRefs = [];
     for (const img of list) {
       // ImageSummary (backends/types.ts) exposes `tags`; repoTags/RepoTags kept as fallbacks.
       for (const tag of img.tags || img.repoTags || img.RepoTags || []) {
@@ -337,11 +431,17 @@ async function loadLookups() {
     imageRefs = [];
   }
   try {
-    const res = await api.docker.networks();
+    const res = await api.docker.networks(hostId);
     const list = Array.isArray(res && res.networks) ? res.networks : [];
     networks = list.map((n) => n.name || n.Name).filter(Boolean);
   } catch {
     networks = [];
+  }
+  try {
+    const res = await api.hosts.agents(hostId);
+    formAgents = Array.isArray(res && res.agents) ? res.agents : [];
+  } catch {
+    formAgents = [];
   }
 }
 
@@ -388,6 +488,46 @@ function mountRow(mount = {}) {
   );
 }
 
+/**
+ * The host row of the session form.
+ * TODO(F1): CREATE -> `<select id="sf-host">` filled with hostOptionsHtml(formHostId) and a
+ * form-text "the engine this session runs on - it cannot be changed later".
+ * EDIT -> the same select but DISABLED (plus a hidden input keeping the value) and the note
+ * "the host of a session is immutable; create a new session to move it" in #sf-host-note.
+ * With exactly one host the row still renders (it is the only place that says where the
+ * session lives) but carries no warning.
+ * @param {any|null} session
+ * @returns {string}
+ */
+function hostFieldHtml(session) {
+  void session;
+  void hostOptionsHtml;
+  // TODO(F1)
+  return '<div class="col-md-6" id="sf-host-fields"><div id="sf-host-note" class="form-text"></div></div>';
+}
+
+/**
+ * The agent picker.
+ * TODO(F1): a checkbox `#sf-agents-inherit` ("Use the agents enabled on this host") which,
+ * when checked (the default, and what `session.agents === null` means), disables and greys
+ * the list below it; the list is one checkbox per HostAgentView of `formAgents`
+ * (`<input class="form-check-input" data-agent="<id>">`) inside `#sf-agents`, labelled
+ * `name` + a muted `id`, with a "not installed yet" hint for `installed === false` and a
+ * "run the tools sync on this host first" link to Settings. When the host has no enabled
+ * agent at all: "no agents enabled on this host - Settings, Agents".
+ * @param {any|null} session
+ * @returns {string}
+ */
+function agentsFieldHtml(session) {
+  void session;
+  void formAgents;
+  // TODO(F1)
+  return '<div class="col-12"><label class="form-label d-block">Coding agents</label>' +
+    '<div class="form-check"><input class="form-check-input" type="checkbox" id="sf-agents-inherit" checked>' +
+    '<label class="form-check-label" for="sf-agents-inherit">Use the agents enabled on this host</label></div>' +
+    '<div id="sf-agents" class="row g-2 mt-1"></div></div>';
+}
+
 function sessionFormHtml(session) {
   const isEdit = !!session;
   const s = session || {};
@@ -414,6 +554,8 @@ function sessionFormHtml(session) {
        <div class="form-text">lowercase letters, digits and dashes${isEdit ? ' - immutable' : ''}</div></div>` +
     `<div class="col-md-7"><label class="form-label" for="sf-display">Display name</label>
        <input class="form-control" id="sf-display" value="${escapeHtml(s.displayName || '')}" placeholder="optional"></div>` +
+
+    hostFieldHtml(session) +
 
     '<div class="col-12"><hr class="my-1"></div>' +
     '<div class="col-12"><label class="form-label d-block">Image</label>' +
@@ -475,10 +617,11 @@ function sessionFormHtml(session) {
        <datalist id="sf-network-list">${networkList}</datalist></div>` +
     `<div class="col-md-3"><label class="form-label" for="sf-user">User</label>
        <input class="form-control" id="sf-user" value="${escapeHtml(s.user || '')}" placeholder="image default"></div>` +
+    agentsFieldHtml(session) +
     '<div class="col-12 d-flex gap-4">' +
     '<div class="form-check"><input class="form-check-input" type="checkbox" id="sf-share-history"' +
     `${s.shareHistory === false ? '' : ' checked'}>` +
-    '<label class="form-check-label" for="sf-share-history">Share Claude conversation history</label></div>' +
+    '<label class="form-check-label" for="sf-share-history">Share agent conversation history with the other sessions on this host</label></div>' +
     '<div class="form-check"><input class="form-check-input" type="checkbox" id="sf-autostart"' +
     `${s.autoStart === false ? '' : ' checked'}>` +
     '<label class="form-check-label" for="sf-autostart">Start automatically</label></div>' +
@@ -626,6 +769,13 @@ export function readSessionForm() {
   if (memoryMb) limits.memoryMb = Number(memoryMb);
   input.limits = limits;
 
+  // TODO(F1): v0.2 fields.
+  //   * CREATE: `input.hostId = <#sf-host value>` (omit it only when there is no host at
+  //     all - then the save cannot succeed anyway). EDIT: never send `hostId`; the server
+  //     answers 422 when it differs, and sending the SAME value is pointless noise.
+  //   * `input.agents = null` when #sf-agents-inherit is checked, otherwise the array of
+  //     checked `#sf-agents [data-agent]` ids (an empty array means "no agent at all",
+  //     which is allowed and gives a plain shell container).
   input.shareHistory = checked('sf-share-history');
   input.autoStart = checked('sf-autostart');
   input.network = value('sf-network') || null;
@@ -644,7 +794,7 @@ async function validateCustomImage() {
   }
   out.innerHTML = '<span class="text-secondary"><span class="spinner-border spinner-border-sm me-1"></span>checking…</span>';
   try {
-    const res = await api.images.validateCustom(ref);
+    const res = await api.images.validateCustom(formHostId, ref);
     const r = (res && res.result) || {};
     const warnings = (r.warnings || []).map((w) => `<li>${escapeHtml(w)}</li>`).join('');
     if (r.ok) {
@@ -706,6 +856,11 @@ function wireSessionForm() {
 
   const validate = byId('btn-validate-image');
   if (validate) validate.addEventListener('click', () => { void validateCustomImage(); });
+
+  // TODO(F1): on #sf-host change -> formHostId = value, then `await loadLookups(formHostId)`
+  // and repaint the recipe select, the image datalist, the network datalist and the agent
+  // checkboxes WITHOUT losing what the user already typed (same pattern as the refresh in
+  // openSessionModal). Also toggle #sf-agents-inherit -> enable/disable the checkbox list.
 }
 
 /**
@@ -714,6 +869,8 @@ function wireSessionForm() {
  */
 export function openSessionModal(session = null) {
   editing = session;
+  // TODO(F1): formHostId = session ? session.hostId : resolveHostId(hostFilter || null);
+  // the lookups below must run against THAT host.
   const body = byId('session-form-body');
   const title = byId('session-modal-title');
   const modalEl = byId('session-modal');
@@ -723,7 +880,7 @@ export function openSessionModal(session = null) {
   body.innerHTML = sessionFormHtml(session);
   wireSessionForm();
   bootstrap.Modal.getOrCreateInstance(modalEl).show();
-  void loadLookups().then(() => {
+  void loadLookups(formHostId).then(() => {
     // refresh the pickers once the lookups arrive, keeping what the user typed
     if (editing !== session) return;
     const recipeSelect = byId('sf-recipe');
@@ -737,6 +894,8 @@ export function openSessionModal(session = null) {
     if (imageList) imageList.innerHTML = imageRefs.map((ref) => `<option value="${escapeHtml(ref)}"></option>`).join('');
     const networkList = byId('sf-network-list');
     if (networkList) networkList.innerHTML = networks.map((n) => `<option value="${escapeHtml(n)}"></option>`).join('');
+    // TODO(F1): repaint #sf-agents from `formAgents` here as well (it is empty until the
+    // per-host lookup lands).
   });
 }
 
@@ -839,7 +998,7 @@ async function destroySession(session) {
   if (removeVolumes) {
     const second = await confirmDialog({
       title: 'Delete the volumes too?',
-      body: `<strong>porterclaude-ws-${escapeHtml(name)}</strong> and its history volume will be deleted permanently. The shared Claude login volume is never touched.`,
+      body: `<strong>porterclaude-ws-${escapeHtml(name)}</strong> and its per-agent history volumes will be deleted permanently. The shared agent login volumes of the host are never touched.`,
       confirmLabel: 'Delete everything',
     });
     if (!second) return;
@@ -942,7 +1101,7 @@ const sessionsView = {
     const newBtn = byId('btn-session-new');
     if (newBtn) {
       newBtn.addEventListener('click', () => {
-        void loadLookups().finally(() => openSessionModal(null));
+        openSessionModal(null);
       });
     }
     const refreshBtn = byId('btn-sessions-refresh');
@@ -977,8 +1136,12 @@ const sessionsView = {
       void reload().catch(() => {});
     });
 
+    // TODO(F1): wire #sessions-host-filter (change -> hostFilter = value,
+    // storage.set(LS_SESSIONS_HOST, value), render()) and subscribe to EVENTS.HOSTS_CHANGED
+    // -> renderHostFilter(); a host that disappears falls back to '' (all hosts).
+    renderHostFilter();
     await reload().catch(() => {});
-    void loadRecipes();
+    void loadRecipes(resolveHostId(hostFilter || null));
     startPolling();
   },
   show() {

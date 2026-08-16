@@ -7,10 +7,27 @@ import type { GeneralConfig } from '../config/schema.js';
 import { AppError } from '../http/errors.js';
 import type { SessionConfig } from './model.js';
 import { CONTAINER_LABELS, historyVolumeFor, workspaceVolumeFor } from './model.js';
+import type { AgentDefinition } from '../agents/model.js';
+import {
+  SESSION_AGENTS_ENV,
+  SESSION_AGENT_LINKS_ENV,
+  agentAuthVolumeFor,
+  agentDataDir,
+  agentHistoryTarget,
+  agentLinks,
+  encodeAgentLinks,
+} from '../agents/model.js';
 
 export interface BuildSpecInput {
   session: SessionConfig;
+  /** the EFFECTIVE settings of the session's host (`hosts.settingsFor(session.hostId)`) */
   general: GeneralConfig;
+  /**
+   * The agents mounted into this container, already resolved
+   * (`agents.resolveForSession(host, session)`). Order matters: it goes into the
+   * `porterclaude.agents` label and the spec hash, so pass it sorted by id.
+   */
+  agents: AgentDefinition[];
   /** concrete image ref: recipes resolve to <imageNamespace>/<recipe>:latest */
   resolvedImage: string;
   /** custom images get the tools-volume bootstrap entrypoint */
@@ -32,12 +49,16 @@ export function containerHomeFor(general: GeneralConfig): string {
   return general.containerHome.replace(/\/+$/, '') || '/home/dev';
 }
 
-/** Absolute path of the conversation-history directory inside a session container. */
+/**
+ * @deprecated v0.1 layout. In v0.2 the history lives INSIDE the claude agent's auth volume
+ * (`agentHistoryTarget(def, home)`); this helper only survives for the one-time legacy
+ * import and for reading old containers back during reconcile.
+ */
 export function historyMountTargetFor(general: GeneralConfig): string {
   return `${containerHomeFor(general)}/.claude/projects`;
 }
 
-/** Absolute path of the shared claude volume inside a session container. */
+/** @deprecated v0.1 layout, see historyMountTargetFor. */
 export function sharedClaudeTargetFor(general: GeneralConfig): string {
   return `${containerHomeFor(general)}/.claude`;
 }
@@ -95,91 +116,115 @@ export function imagePathFromEnv(env: string[] | undefined, general: GeneralConf
 }
 
 /**
- * Contract (docs/design/backend.md "Container layout"):
+ * Contract (docs/design/backend.md v0.2 §7 "Container layout"):
  *   name        <containerPrefix><session>            e.g. pc-web
  *   labels      porterclaude.managed=true
  *               porterclaude.session=<slug>
+ *               porterclaude.host=<hostId>                        (v0.2)
+ *               porterclaude.agents=<id,id,...>                   (v0.2)
  *               porterclaude.image-type=recipe|custom
  *               porterclaude.recipe=<name>            (recipes only)
  *               porterclaude.spec-hash=<sha256>
  *               porterclaude.created-at=<iso>
- *   mounts      <sharedClaudeVolume>      -> <containerHome>/.claude
- *               <sharedClaudeHomeVolume>  -> <containerHome>/.claude-home
- *               workspace                 -> <workspaceMount>            (bind or volume)
- *               <toolsVolume> (ro)        -> <toolsMount>                (custom images only)
- *               porterclaude-hist-<slug>  -> <containerHome>/.claude/projects  (shareHistory=false)
+ *   mounts      <volumePrefix>auth-<agentId> -> <home>/.porterclaude/agents/<agentId>
+ *                                                              (one per resolved agent)
+ *               <volumePrefix>hist-<slug>[-<agentId>]
+ *                                           -> agentHistoryTarget(agent)  (shareHistory=false)
+ *               workspace                   -> <workspaceMount>       (bind or volume)
+ *               <toolsVolume> (ro)          -> <toolsMount>           (EVERY session in v0.2)
  *               ...extraMounts
- *   env         PORTERCLAUDE_SESSION=<slug>, TERM=xterm-256color, ...session.env
- *               custom images additionally: PORTERCLAUDE_TOOLS=<toolsMount>,
- *               PORTERCLAUDE_HOME=<containerHome>, HOME=<containerHome>,
- *               PATH=<toolsMount>/bin:<containerHome>/.local/bin:<image PATH>
- *   custom      entrypoint ["<toolsMount>/entrypoint.sh"], cmd ["sleep","infinity"]
- *   recipes     entrypoint/cmd left to the image
+ *   env         PORTERCLAUDE_SESSION=<slug>, PORTERCLAUDE_HOST=<hostId>, TERM=xterm-256color,
+ *               PORTERCLAUDE_TOOLS=<toolsMount>, PORTERCLAUDE_HOME=<containerHome>,
+ *               HOME=<containerHome>,
+ *               PATH=<toolsMount>/bin:<containerHome>/.local/bin:<image PATH>,
+ *               PORTERCLAUDE_AGENT_IDS=<id,id>, PORTERCLAUDE_AGENT_LINKS=<target|source|kind;...>,
+ *               <agent.env>..., ...session.env
+ *   entrypoint  ["<toolsMount>/entrypoint.sh"]        for EVERY session (v0.2)
+ *   cmd         ["sleep","infinity"] for custom images; recipes keep the image CMD, so the
+ *               php recipe still starts supervisord behind the bootstrap
  *   workingDir  <workspaceMount>;  init true;  tty false;  pidsLimit 4096
  *   restart     autoStart ? 'unless-stopped' : 'no'
  *   resources   cpus -> NanoCpus, memoryMb -> Memory
  *
- * The private-history mount overlays a directory *inside* the shared claude volume, so the
- * mountpoint must already exist with the shared volume's ownership when the container
- * starts - otherwise docker creates it as root:root and ~/.claude/projects becomes
- * unwritable for THIS session and for every other (shared) session too.
- * SessionService.prepareHistoryVolume() pre-creates it (backend.md section 7); this file
- * only declares the mount.
+ * WHY the uniform bootstrap: v0.1 baked claude into the recipe images and mounted the tools
+ * volume only into custom ones. With N agents that would mean rebuilding every recipe for
+ * every agent, so v0.2 delivers ALL agents through the tools volume and wires PATH/HOME the
+ * same way everywhere. Recipes keep their CMD because overriding only the entrypoint leaves
+ * the image's Cmd in place (docker only replaces what the create request sets).
  *
- * HOME is pinned for custom images because docker otherwise inherits HOME from the image
- * (usually /root for the root images people pick), which would make claude write its
- * credentials and history outside the shared volumes -> "log in once, every session
- * authenticated" would not hold.
+ * WHY symlinks instead of direct mounts of ~/.claude & co: see agents/model.ts. The
+ * private-history volume therefore mounts at `agentHistoryTarget(...)` (a path inside the
+ * agent volume), never at `~/.claude/projects` (a symlink) — docker resolves mount targets
+ * before the bootstrap runs.
+ *
+ * PLANNER DRAFT (v0.2): the shape below is the contract; B2 owns it from here (tests,
+ * ownership repairs in service.ts, and the `TODO(B2)` items inside).
  */
 export function buildContainerSpec(input: BuildSpecInput): CreateContainerSpec {
-  const { session, general, resolvedImage, imageType } = input;
+  const { session, general, resolvedImage, imageType, agents } = input;
   const home = containerHomeFor(general);
+  const toolsMount = toolsMountFor(general);
 
-  const mounts: MountSpec[] = [
-    { type: 'volume', source: general.sharedClaudeVolume, target: `${home}/.claude`, readOnly: false },
-    { type: 'volume', source: general.sharedClaudeHomeVolume, target: `${home}/.claude-home`, readOnly: false },
-  ];
+  const mounts: MountSpec[] = [];
 
-  // Private conversation history: must be mounted *after* the shared .claude volume.
-  if (!session.shareHistory) {
+  // One auth volume per agent, mounted at the agent dir. Its private-history overlay (when
+  // the session does not share history) is nested INSIDE that mount on purpose.
+  for (const agent of agents) {
     mounts.push({
       type: 'volume',
-      source: historyVolumeFor(session.name),
-      target: historyMountTargetFor(general),
+      source: agentAuthVolumeFor(general.volumePrefix, agent.id),
+      target: agentDataDir(home, agent.id),
       readOnly: false,
     });
+    if (!session.shareHistory) {
+      const historyTarget = agentHistoryTarget(agent, home);
+      if (historyTarget) {
+        mounts.push({
+          type: 'volume',
+          source: historyVolumeFor(general.volumePrefix, session.name, agent.id),
+          target: historyTarget,
+          readOnly: false,
+        });
+      }
+    }
   }
 
   mounts.push(workspaceMountFor(session, general));
 
-  if (imageType === 'custom') {
-    mounts.push({ type: 'volume', source: general.toolsVolume, target: general.toolsMount, readOnly: true });
-  }
+  // v0.2: the tools volume is mounted into EVERY session (it carries the agents now).
+  mounts.push({ type: 'volume', source: general.toolsVolume, target: toolsMount, readOnly: true });
 
   for (const m of session.extraMounts) {
     mounts.push({ type: m.type, source: m.source, target: m.target, readOnly: m.readOnly });
   }
 
+  const links = agents.flatMap((agent) => agentLinks(agent, home));
+
   const env: Record<string, string> = {
     PORTERCLAUDE_SESSION: session.name,
+    PORTERCLAUDE_HOST: session.hostId,
     TERM: 'xterm-256color',
-  };
-  if (imageType === 'custom') {
-    env.PORTERCLAUDE_TOOLS = general.toolsMount;
-    env.PORTERCLAUDE_HOME = home;
+    PORTERCLAUDE_TOOLS: toolsMount,
+    PORTERCLAUDE_HOME: home,
     // Pin PATH: `docker exec` inherits the CONTAINER env, not whatever the entrypoint
-    // exported, and a non-root custom image cannot persist PATH in an rc file (docker
-    // creates <containerHome> as root:root). Without this a terminal cannot find claude.
-    env.PATH = composeToolsPath(general, input.imageEnvPath);
-    // Pin HOME: docker would otherwise use the image's HOME (/root for root images) and
-    // claude would write credentials/history outside the shared volumes.
-    env.HOME = home;
-  }
+    // exported, and a non-root image cannot persist PATH in an rc file (docker creates
+    // <containerHome> as root:root). Without this a terminal cannot find the agents.
+    PATH: composeToolsPath(general, input.imageEnvPath),
+    // Pin HOME: docker would otherwise use the image's HOME (/root for root images) and the
+    // agents would write their credentials outside the shared auth volumes.
+    HOME: home,
+    [SESSION_AGENTS_ENV]: agents.map((a) => a.id).join(','),
+    [SESSION_AGENT_LINKS_ENV]: encodeAgentLinks(links),
+  };
+  // agent-declared env first, the user's own env always wins
+  for (const agent of agents) for (const [k, v] of Object.entries(agent.env)) env[k] = v;
   for (const [k, v] of Object.entries(session.env)) env[k] = v;
 
   const labels: Record<string, string> = {
     [CONTAINER_LABELS.managed]: 'true',
     [CONTAINER_LABELS.session]: session.name,
+    [CONTAINER_LABELS.host]: session.hostId,
+    [CONTAINER_LABELS.agents]: agents.map((a) => a.id).join(','),
     [CONTAINER_LABELS.imageType]: imageType,
     [CONTAINER_LABELS.createdAt]: session.createdAt,
   };
@@ -212,14 +257,13 @@ export function buildContainerSpec(input: BuildSpecInput): CreateContainerSpec {
       ...(session.limits.memoryMb === undefined ? {} : { memoryMb: session.limits.memoryMb }),
       pidsLimit: SESSION_PIDS_LIMIT,
     },
+    entrypoint: [`${toolsMount}/entrypoint.sh`],
     ...(session.user ? { user: session.user } : {}),
     ...(network ? { networks: [network] } : {}),
   };
 
-  if (imageType === 'custom') {
-    spec.entrypoint = [`${general.toolsMount.replace(/\/+$/, '')}/entrypoint.sh`];
-    spec.cmd = ['sleep', 'infinity'];
-  }
+  // Recipes keep the image CMD (php runs supervisord); custom images idle.
+  if (imageType === 'custom') spec.cmd = ['sleep', 'infinity'];
 
   // The hash covers everything above; adding it as a label must not change it (labels are
   // excluded from the hash on purpose).
@@ -278,7 +322,7 @@ export function workspaceMountFor(session: SessionConfig, general: GeneralConfig
       readOnly: false,
     };
   }
-  const volume = ws.volume ?? workspaceVolumeFor(session.name);
+  const volume = ws.volume ?? workspaceVolumeFor(general.volumePrefix, session.name);
   return { type: 'volume', source: volume, target, readOnly: false };
 }
 

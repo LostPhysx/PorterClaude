@@ -6,7 +6,8 @@ export interface HealthResponse {
   status: 'ok';
   version: string;
   uptimeSec: number;
-  backend: { kind: 'portainer' | 'socket' | 'none'; configured: boolean };
+  /** v0.2: one global backend became N hosts; this is the summary the healthcheck needs */
+  hosts: { count: number; configured: boolean; defaultHostId: string | null };
 }
 
 /**
@@ -17,19 +18,21 @@ export function createHealthRouter(ctx: AppContext): Router {
   const router = Router();
 
   router.get('/', (_req, res) => {
-    let kind: HealthResponse['backend']['kind'] = 'none';
+    let count = 0;
     let configured = false;
+    let defaultHostId: string | null = null;
     try {
-      kind = ctx.config.get().backend.kind;
-      configured = ctx.backends.isConfigured();
+      count = ctx.config.get().hosts.length;
+      defaultHostId = ctx.config.get().defaultHostId;
+      configured = ctx.hosts.isConfigured();
     } catch {
-      // never fail the healthcheck because of a config/backend problem
+      // never fail the healthcheck because of a config/host problem
     }
     const body: HealthResponse = {
       status: 'ok',
       version: ctx.version,
       uptimeSec: Math.max(0, Math.floor((Date.now() - ctx.startedAt) / 1000)),
-      backend: { kind, configured },
+      hosts: { count, configured, defaultHostId },
     };
     res.json(body);
   });

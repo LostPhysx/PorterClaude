@@ -1,10 +1,28 @@
 // FROZEN (planner-authored, fully implemented). Shape of <DATA_DIR>/config.json and of the
 // sanitized objects returned by GET /api/settings. Secrets are stored as opaque
 // "enc:v1:..." strings (see config/crypto.ts) and are NEVER included in API responses.
+//
+// v0.2 (CONFIG_VERSION 2) — what changed against v1:
+//   * `backend` (one global docker backend)      -> `hosts[]` + `defaultHostId`
+//   * portainer url/key/endpoint inline          -> `credentials.portainer[]` (+ endpointId on the host)
+//   * `sessions[].hostId`                        -> new, defaults to 'default' for stored v1 sessions
+//   * `sessions[].agents`                        -> new (null = inherit the host's enabled agents)
+//   * `agents.custom[]`                          -> new (user-defined AgentDefinitions)
+//   * `general.volumePrefix`                     -> new; `sharedClaudeVolume` /
+//     `sharedClaudeHomeVolume` are kept but are LEGACY (only the one-time claude auth import
+//     reads them, see backend.md v0.2 §12.4).
+// The v1 -> v2 migration is lossless and writes `<DATA_DIR>/config.json.v1.bak` first
+// (ConfigStore.migrate, TODO(B1)).
 import { z } from 'zod';
+import { GENERAL_FIELD_SCHEMAS, stored } from './fields.js';
 import { SessionConfigSchema } from '../sessions/model.js';
+import { HostConfigSchema, HostIdSchema, PortainerCredentialConfigSchema } from '../hosts/model.js';
+import { AgentDefinitionSchema } from '../agents/model.js';
 
-export const CONFIG_VERSION = 1;
+export const CONFIG_VERSION = 2;
+
+/** the version this config was migrated FROM (v1 = the v0.1 single-backend shape) */
+export const CONFIG_VERSION_V1 = 1;
 
 export const AuthConfigSchema = z.object({
   /** scrypt hash string "scrypt:<N>:<r>:<p>:<saltB64>:<hashB64>"; null until first boot seeds it */
@@ -14,78 +32,37 @@ export const AuthConfigSchema = z.object({
   updatedAt: z.string().nullable().default(null),
 });
 
-export const PortainerConfigSchema = z.object({
-  url: z.string().default(''),
-  /** encrypted blob, never returned by the API */
-  apiKeyEnc: z.string().nullable().default(null),
-  endpointId: z.number().int().nullable().default(null),
-  insecureTls: z.boolean().default(false),
-});
-
-export const SocketConfigSchema = z.object({
-  socketPath: z.string().default('/var/run/docker.sock'),
-});
-
-export const BackendConfigSchema = z.object({
-  kind: z.enum(['portainer', 'socket', 'none']).default('none'),
-  portainer: PortainerConfigSchema.default({}),
-  socket: SocketConfigSchema.default({}),
-});
-
 // ---------------------------------------------------------------------------
-// Field validators for the path-like general settings.
+// General settings
 //
 // Every one of these values ends up in a docker API call (container name, volume name,
 // mount target). An unchecked value therefore fails deep inside docker on the NEXT session
 // create — a 502 far away from the request that caused it — instead of at the settings
-// call, so they are validated where they enter the system (PUT /api/settings/general uses
-// the very same schemas, see GeneralSettingsInputSchema).
+// call, so they are validated where they enter the system (config/fields.ts holds the
+// validators; PUT /api/settings/general and HostOverridesSchema reuse them).
+//
+// Per host they can be overridden (hosts/model.ts HostOverridesSchema); the effective value
+// is `HostManager.settingsFor(hostId)`.
 // ---------------------------------------------------------------------------
-
-/** docker object names (volumes, networks): [a-zA-Z0-9][a-zA-Z0-9_.-]* */
-const DOCKER_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
-/** container-name-safe prefixes and image namespaces (lowercase, docker repo syntax) */
-const LOWER_NAME_RE = /^[a-z0-9][a-z0-9._-]*$/;
-/** absolute POSIX path with at least one segment, no `.`/`..` segment, no backslash/NUL */
-const ABS_POSIX_PATH_RE = /^(?:\/(?!\.\.?(?:\/|$))[^/\0\\]+)+\/?$/;
-
-const dockerName = (label: string) =>
-  z.string().min(1).max(128).regex(DOCKER_NAME_RE, `${label} must match [a-zA-Z0-9][a-zA-Z0-9_.-]*`);
-
-const lowerName = (label: string) =>
-  z.string().min(1).max(64).regex(LOWER_NAME_RE, `${label} must match [a-z0-9][a-z0-9._-]*`);
-
-const absPosixPath = (label: string) =>
-  z
-    .string()
-    .min(1)
-    .max(512)
-    .regex(ABS_POSIX_PATH_RE, `${label} must be an absolute POSIX path (no '.'/'..' segments)`);
-
-/**
- * `.catch(<default>)` on the STORED shape only: a hand-edited config.json with a bad value
- * falls back to the default instead of failing AppConfigSchema, which would quarantine the
- * whole file (and with it every stored session). The API input schema below has no catch,
- * so a bad value sent to PUT /api/settings/general is a 422.
- */
-const stored = <T extends z.ZodTypeAny, D extends z.infer<T>>(schema: T, fallback: D) =>
-  schema.default(fallback).catch(fallback);
 
 export const GeneralConfigSchema = z.object({
   /** host directory used when a session asks for a bind workspace without an absolute path */
-  workspacesRoot: stored(absPosixPath('workspacesRoot'), '/srv/porterclaude/workspaces'),
-  sharedClaudeVolume: stored(dockerName('sharedClaudeVolume'), 'porterclaude-claude'),
-  sharedClaudeHomeVolume: stored(dockerName('sharedClaudeHomeVolume'), 'porterclaude-claude-home'),
-  toolsVolume: stored(dockerName('toolsVolume'), 'porterclaude-tools'),
-  defaultRecipe: stored(lowerName('defaultRecipe'), 'node'),
-  containerPrefix: stored(lowerName('containerPrefix'), 'pc-'),
+  workspacesRoot: stored(GENERAL_FIELD_SCHEMAS.workspacesRoot, '/srv/porterclaude/workspaces'),
+  /** prefix of every volume PorterClaude creates: ws-/hist-/auth-/tools */
+  volumePrefix: stored(GENERAL_FIELD_SCHEMAS.volumePrefix, 'porterclaude-'),
+  /** LEGACY (v0.1): source of the one-time claude auth import; not mounted any more */
+  sharedClaudeVolume: stored(GENERAL_FIELD_SCHEMAS.sharedClaudeVolume, 'porterclaude-claude'),
+  sharedClaudeHomeVolume: stored(GENERAL_FIELD_SCHEMAS.sharedClaudeHomeVolume, 'porterclaude-claude-home'),
+  toolsVolume: stored(GENERAL_FIELD_SCHEMAS.toolsVolume, 'porterclaude-tools'),
+  defaultRecipe: stored(GENERAL_FIELD_SCHEMAS.defaultRecipe, 'node'),
+  containerPrefix: stored(GENERAL_FIELD_SCHEMAS.containerPrefix, 'pc-'),
   /** attach every session container to this docker network (null = default bridge) */
-  sessionNetwork: stored(dockerName('sessionNetwork').nullable(), null),
-  imageNamespace: stored(lowerName('imageNamespace'), 'porterclaude'),
-  /** home dir inside recipe images; mounts are derived from it */
-  containerHome: stored(absPosixPath('containerHome'), '/home/dev'),
-  workspaceMount: stored(absPosixPath('workspaceMount'), '/workspace'),
-  toolsMount: stored(absPosixPath('toolsMount'), '/opt/porterclaude'),
+  sessionNetwork: stored(GENERAL_FIELD_SCHEMAS.sessionNetwork, null),
+  imageNamespace: stored(GENERAL_FIELD_SCHEMAS.imageNamespace, 'porterclaude'),
+  /** home dir inside session containers; agent + workspace mounts are derived from it */
+  containerHome: stored(GENERAL_FIELD_SCHEMAS.containerHome, '/home/dev'),
+  workspaceMount: stored(GENERAL_FIELD_SCHEMAS.workspaceMount, '/workspace'),
+  toolsMount: stored(GENERAL_FIELD_SCHEMAS.toolsMount, '/opt/porterclaude'),
 });
 
 export const UiConfigSchema = z.object({
@@ -94,21 +71,34 @@ export const UiConfigSchema = z.object({
   theme: z.enum(['auto', 'light', 'dark']).default('auto'),
 });
 
+export const CredentialsConfigSchema = z.object({
+  portainer: z.array(PortainerCredentialConfigSchema).default([]),
+});
+
+export const AgentsConfigSchema = z.object({
+  /** user-defined agents; ids may not collide with a built-in (agents/builtin.ts) */
+  custom: z.array(AgentDefinitionSchema).default([]),
+});
+
 export const AppConfigSchema = z.object({
   version: z.number().int().default(CONFIG_VERSION),
   auth: AuthConfigSchema.default({}),
-  backend: BackendConfigSchema.default({}),
+  /** every managed docker engine; empty on a fresh install */
+  hosts: z.array(HostConfigSchema).default([]),
+  /** id of the host used when a request omits one; null while there is no host */
+  defaultHostId: HostIdSchema.nullable().default(null),
+  credentials: CredentialsConfigSchema.default({}),
+  agents: AgentsConfigSchema.default({}),
   general: GeneralConfigSchema.default({}),
   sessions: z.array(SessionConfigSchema).default([]),
   ui: UiConfigSchema.default({}),
 });
 
 export type AuthConfig = z.infer<typeof AuthConfigSchema>;
-export type PortainerConfig = z.infer<typeof PortainerConfigSchema>;
-export type SocketConfig = z.infer<typeof SocketConfigSchema>;
-export type BackendConfig = z.infer<typeof BackendConfigSchema>;
 export type GeneralConfig = z.infer<typeof GeneralConfigSchema>;
 export type UiConfig = z.infer<typeof UiConfigSchema>;
+export type CredentialsConfig = z.infer<typeof CredentialsConfigSchema>;
+export type AgentsConfig = z.infer<typeof AgentsConfigSchema>;
 export type AppConfig = z.infer<typeof AppConfigSchema>;
 
 export function defaultConfig(): AppConfig {
@@ -119,89 +109,34 @@ export function defaultConfig(): AppConfig {
 // Sanitized views returned by the API (no secrets, ever).
 // ---------------------------------------------------------------------------
 
-export interface SanitizedPortainer {
-  url: string;
-  endpointId: number | null;
-  insecureTls: boolean;
-  apiKeySet: boolean;
-  /** last 4 chars of the stored key, or null */
-  apiKeyHint: string | null;
-}
-
 export interface SanitizedSettings {
-  backend: {
-    kind: 'portainer' | 'socket' | 'none';
-    portainer: SanitizedPortainer;
-    socket: SocketConfig;
-    /** the local docker socket exists and is reachable (auto-detection hint for the UI) */
-    socketAvailable: boolean;
-  };
   general: GeneralConfig;
   ui: UiConfig;
   auth: { passwordSet: boolean };
+  hosts: {
+    count: number;
+    defaultHostId: string | null;
+    /** the local docker socket is reachable from the app container */
+    socketAvailable: boolean;
+    /** id of the existing socket host, if one is configured (at most one) */
+    socketHostId: string | null;
+  };
 }
 
 // ---------------------------------------------------------------------------
 // Request payloads for the settings API.
 // ---------------------------------------------------------------------------
 
-export const BackendSettingsInputSchema = z.object({
-  kind: z.enum(['portainer', 'socket', 'none']),
-  portainer: z
-    .object({
-      url: z.string().url(),
-      /** omit to keep the stored key */
-      apiKey: z.string().min(1).optional(),
-      endpointId: z.number().int().nullable().optional(),
-      insecureTls: z.boolean().optional(),
-    })
-    .optional(),
-  socket: z.object({ socketPath: z.string().min(1) }).optional(),
-});
-
-export const BackendTestInputSchema = z.object({
-  kind: z.enum(['portainer', 'socket']),
-  portainer: z
-    .object({
-      url: z.string().url(),
-      apiKey: z.string().min(1).optional(),
-      endpointId: z.number().int().nullable().optional(),
-      insecureTls: z.boolean().optional(),
-    })
-    .optional(),
-  socket: z.object({ socketPath: z.string().min(1) }).optional(),
-});
-
-export const PortainerEndpointsInputSchema = z.object({
-  url: z.string().url().optional(),
-  apiKey: z.string().min(1).optional(),
-  insecureTls: z.boolean().optional(),
-});
-
 /**
  * PUT /api/settings/general. NOT `GeneralConfigSchema.partial()`: the stored shape swallows
- * bad values via `.catch()` (see above), which would silently turn `containerPrefix: '../x'`
- * into the default and answer 200. Here every field is validated strictly, so the caller
- * gets a 422 naming the field.
+ * bad values via `.catch()` (config/fields.ts), which would silently turn
+ * `containerPrefix: '../x'` into the default and answer 200. Here every field is validated
+ * strictly, so the caller gets a 422 naming the field.
  */
-export const GeneralSettingsInputSchema = z
-  .object({
-    workspacesRoot: absPosixPath('workspacesRoot'),
-    sharedClaudeVolume: dockerName('sharedClaudeVolume'),
-    sharedClaudeHomeVolume: dockerName('sharedClaudeHomeVolume'),
-    toolsVolume: dockerName('toolsVolume'),
-    defaultRecipe: lowerName('defaultRecipe'),
-    containerPrefix: lowerName('containerPrefix'),
-    sessionNetwork: dockerName('sessionNetwork').nullable(),
-    imageNamespace: lowerName('imageNamespace'),
-    containerHome: absPosixPath('containerHome'),
-    workspaceMount: absPosixPath('workspaceMount'),
-    toolsMount: absPosixPath('toolsMount'),
-  })
-  .partial();
+export const GeneralSettingsInputSchema = z.object(GENERAL_FIELD_SCHEMAS).partial();
 
-/** Compile-time guard: a field added to GeneralConfigSchema without a rule above (i.e.
- *  without validation on the way in) fails the build here. */
+/** Compile-time guard: a field added to GeneralConfigSchema without a validator in
+ *  GENERAL_FIELD_SCHEMAS (i.e. without validation on the way in) fails the build here. */
 const _generalInputCoversEveryField: Record<keyof GeneralConfig, unknown> =
   GeneralSettingsInputSchema.shape;
 void _generalInputCoversEveryField;
@@ -213,6 +148,4 @@ export const PasswordChangeInputSchema = z.object({
   newPassword: z.string().min(8).max(200),
 });
 
-export type BackendSettingsInput = z.infer<typeof BackendSettingsInputSchema>;
-export type BackendTestInput = z.infer<typeof BackendTestInputSchema>;
 export type GeneralSettingsInput = z.infer<typeof GeneralSettingsInputSchema>;

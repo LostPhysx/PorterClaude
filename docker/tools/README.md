@@ -1,5 +1,12 @@
 # docker/tools — the shared `porterclaude-tools` volume
 
+> **v0.2 — TODO(O1): rewrite this file.** The volume now carries one directory per agent
+> (`agents/<id>`), generated shims in `bin/`, the bundled Node/uv runtimes in `runtime/` and
+> the `AGENTS.json` manifest; the payload is installed by the populate run from
+> `PORTERCLAUDE_AGENTS`, not baked into the image. See
+> [`docs/design/orchestration.md` §13](../../docs/design/orchestration.md).
+
+
 OWNER: O1. Full design: [`docs/design/orchestration.md`](../../docs/design/orchestration.md) §4.
 
 Custom session images (any `FROM` the user types) get Claude Code without a rebuild: the

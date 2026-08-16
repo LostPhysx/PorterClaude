@@ -1,8 +1,6 @@
 # PorterClaude recipe: dotnet (mcr.microsoft.com/dotnet/sdk:9.0, Debian 12 based). OWNER: O1.
 FROM mcr.microsoft.com/dotnet/sdk:9.0
-ARG CLAUDE_VERSION=stable
-LABEL porterclaude.recipe="dotnet" \
-      porterclaude.claude-version="${CLAUDE_VERSION}"
+LABEL porterclaude.recipe="dotnet"
 ENV LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
     PORTERCLAUDE_RECIPE=dotnet \

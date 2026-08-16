@@ -1,45 +1,41 @@
 #!/bin/sh
-# PorterClaude — bootstrap entrypoint for CUSTOM session images. OWNER: O1. RUNTIME.
+# TODO(O1): remove this line once the bodies below are implemented — it only silences the
+# "assigned but never used / arguments never passed" warnings a skeleton necessarily has.
+# shellcheck disable=SC2034,SC2119,SC2120,SC2317
+# PorterClaude — session bootstrap. OWNER: O1. RUNTIME. PLANNER SKELETON for v0.2.
+# Spec: docs/design/orchestration.md §14 (v0.2), §4.4 (v0.1 background).
 #
-# The server starts custom-image sessions with:
-#   entrypoint ["/opt/porterclaude/entrypoint.sh"]   cmd ["sleep","infinity"]
-#   env PORTERCLAUDE_TOOLS=/opt/porterclaude  PORTERCLAUDE_HOME=/home/dev
-#       HOME=/home/dev  PORTERCLAUDE_SESSION=<slug>
-# /opt/porterclaude is the shared tools volume, mounted READ-ONLY.
+# v0.2: this is the entrypoint of EVERY managed session (recipe AND custom image), not just
+# custom ones. The server creates the container with:
+#   entrypoint ["<toolsMount>/entrypoint.sh"]
+#   cmd        ["sleep","infinity"]        (custom images only; recipes keep their image CMD)
+#   env        PORTERCLAUDE_TOOLS=<toolsMount>  PORTERCLAUDE_HOME=<containerHome>  HOME=…
+#              PORTERCLAUDE_SESSION=<slug>      PORTERCLAUDE_HOST=<hostId>
+#              PORTERCLAUDE_AGENT_IDS=claude,opencode
+#              PORTERCLAUDE_AGENT_LINKS=<target>|<source>|<kind>;<target>|<source>|<kind>
+#              PATH=<toolsMount>/bin:<home>/.local/bin:<image PATH>   TERM=xterm-256color
+# The tools volume is mounted READ-ONLY at $PORTERCLAUDE_TOOLS; the per-agent auth volumes
+# are mounted at <home>/.porterclaude/agents/<agentId> (read-write).
 #
-# HARD RULES (docs/design/orchestration.md §4.4):
-#   * strict POSIX sh — this runs inside busybox/ash, dash and bash images alike
+# HARD RULES (unchanged from v0.1):
+#   * strict POSIX sh — busybox/ash, dash and bash images alike; no `local`, no arrays
 #   * NOTHING here may abort the container: every step logs on failure and continues
-#   * no assumptions about the image user, package manager, or $HOME
+#   * no assumptions about the image user, package manager or $HOME
 #
-# $HOME vs $PORTERCLAUDE_HOME: the shared login volumes are mounted at $PORTERCLAUDE_HOME
-# (porterclaude-claude -> $PORTERCLAUDE_HOME/.claude, porterclaude-claude-home ->
-# $PORTERCLAUDE_HOME/.claude-home). Custom images bring their own user home (/root for the
-# root images most people pick), and runc derives HOME from the image's passwd entry unless
-# the server pins it. If we honoured that home, claude would store its credentials outside
-# the shared volumes and "log in once, every session authenticated" (PLAN.md) would break.
-# So: PORTERCLAUDE_HOME WINS, and the image's own home is bridged into it with symlinks for
-# anything that resolves ~ through passwd instead of $HOME.
+# WHAT v0.2 CHANGES (see §14): the claude-specific wiring is gone. The symlinks to create
+# come from $PORTERCLAUDE_AGENT_LINKS, ownership repair covers <home>/.porterclaude, and the
+# /usr/local/bin wrappers are generated per shim found in <tools>/bin.
 #
-# OWNERSHIP: those shared volumes are used by EVERY session of an installation, but only one
-# uid can own them. The recipe images hard-wire their session user to uid 1000 and cannot
-# adapt; a root custom image can — so root adapts (section 4 below): everything this script
-# and `claude` write into the shared volumes is handed over to the volume's owner.
+# This file does NOT source <tools>/lib/pc-common.sh on purpose: it must work even when the
+# volume is half-populated. The few helpers it needs are duplicated below.
 set -u
 
 TOOLS="${PORTERCLAUDE_TOOLS:-/opt/porterclaude}"
 
-# The PATH the container was CREATED with. The server pins <tools>/bin + the image's own ENV
-# PATH there (sessions/container.ts composeToolsPath), so this variable is the only place the
-# image's toolchain directories (/usr/local/go/bin, /usr/local/cargo/bin, /usr/local/openjdk/bin,
-# ...) survive: login shells source /etc/profile, which on Debian & co REPLACES PATH with a
-# fixed list. setup_path() below bakes this value into the persisted profile snippets, so that
-# `which go` in a terminal of a golang:* custom session finds the toolchain again.
+# The PATH the container was CREATED with (see v0.1 notes): the only place the image's own
+# toolchain directories survive, because /etc/profile REPLACES PATH in login shells.
 ORIG_PATH="${PATH:-}"
 
-# The home the image's passwd entry gives our uid — /root for the root images most people
-# pick. This is what `su -`, `sudo -i`, login(1) and every getpwuid() caller resolve `~` to,
-# no matter what $HOME says.
 passwd_home() {
   _u="$(id -u 2>/dev/null || echo)"
   if [ -n "$_u" ] && [ -r /etc/passwd ]; then
@@ -47,11 +43,8 @@ passwd_home() {
   fi
 }
 
-# The home the image itself would use. The server PINS HOME=$PORTERCLAUDE_HOME in the
-# container env (so that `docker exec`ed terminals agree with us), which means $HOME is no
-# longer evidence of what the image wanted: whenever PORTERCLAUDE_HOME is set we must ask
-# passwd instead, or the bridge below silently turns into a no-op and `su -` lands in an
-# unlinked /root. Without PORTERCLAUDE_HOME, $HOME is the image's own answer and wins.
+# $HOME is pinned by the server, so it is no longer evidence of what the image wanted:
+# ask passwd whenever PORTERCLAUDE_HOME is set (v0.1 §4.4 step 1 — do not "simplify" this).
 PASSWD_HOME="$(passwd_home 2>/dev/null || echo)"
 if [ -n "${PORTERCLAUDE_HOME:-}" ]; then
   IMAGE_HOME="$PASSWD_HOME"
@@ -60,28 +53,27 @@ else
 fi
 HOME="${PORTERCLAUDE_HOME:-${IMAGE_HOME:-/root}}"
 export HOME
-# "/" is a home in some minimal images; we do not scatter dotfiles into the root filesystem.
 case "$IMAGE_HOME" in
   ""|"/") IMAGE_HOME="" ;;
 esac
 TERM="${TERM:-xterm-256color}"
 export TERM
 BOOTSTRAP_LOG=/tmp/porterclaude-bootstrap.log
-# v2: the persisted snippet now also restores the image's own PATH (see setup_path). The
-# version is part of the marker on purpose — a container bootstrapped by an older tools
-# volume gets the new block appended instead of being skipped by the idempotency guard.
-MARKER_TAG="porterclaude (generated v2)"
+
+# v3: the persisted profile snippet is unchanged in shape, but the marker version must be
+# bumped so a container bootstrapped by a v0.1/v0.2 volume gets the new block appended
+# instead of being skipped by the idempotency guard.
+MARKER_TAG="porterclaude (generated v3)"
 MARKER="# $MARKER_TAG - do not duplicate"
 
-# uid:gid the recipe images give their session user (docker/recipes/common.sh). It is the
-# canonical owner of the shared login volumes while they are still root-owned.
+# uid:gid the recipe images give their session user (docker/recipes/common.sh): the fallback
+# owner of the agent volumes while they are still root-owned.
 RECIPE_OWNER="1000:1000"
+
 log()  { printf '[porterclaude] %s\n' "$*"; }
 warn() { printf '[porterclaude][warn] %s\n' "$*" >&2; }
 
-am_root() {
-  [ "$(id -u 2>/dev/null || echo 1)" = "0" ]
-}
+am_root() { [ "$(id -u 2>/dev/null || echo 1)" = "0" ]; }
 
 # Portable idle loop: some images ship a `sleep` that rejects "infinity", and a bare
 # `sleep` as pid 1 ignores SIGTERM. Backgrounding it and waiting lets the trap run.
@@ -93,8 +85,6 @@ idle_forever() {
   done
 }
 
-# pc_path_compose <colon-list> ... : join the lists, dropping empty and duplicate entries
-# (first occurrence wins). Same helper the generated profile snippet carries.
 pc_path_compose() {
   _new=''
   for _p in "$@"; do
@@ -151,17 +141,13 @@ export COLORTERM=truecolor
 SNIPPET
 }
 
-# 1. PATH: $TOOLS/bin first, then the image's own PATH ($ORIG_PATH — see the top of this
-#    file), persisted for the login shells the terminals open. Without the $ORIG_PATH part
-#    a terminal in e.g. a golang:1.23-bookworm session has no `go`: /etc/profile throws the
-#    image's ENV PATH away and only what we persist here comes back.
+# --- 1. PATH (unchanged from v0.1) --------------------------------------------------------
 setup_path() {
   PATH="$(pc_path_compose "$TOOLS/bin:$HOME/.local/bin" "$ORIG_PATH" "$PATH")"
   export PATH
 
   files="/etc/profile.d/porterclaude.sh $HOME/.profile $HOME/.bashrc"
   if [ -n "$IMAGE_HOME" ] && [ "$IMAGE_HOME" != "$HOME" ]; then
-    # a shell started with the image's own HOME must still find $TOOLS/bin
     files="$files $IMAGE_HOME/.profile $IMAGE_HOME/.bashrc"
   fi
   # shellcheck disable=SC2086  # deliberate word splitting over the list above
@@ -177,26 +163,163 @@ setup_path() {
   done
 }
 
-# 2. Non-login shells: a tiny wrapper on the standard PATH (root only). It execs the
-#    dispatcher of the tools volume, which is also what does the ownership hand-back of
-#    section 4 after claude exits (fetch-claude.sh, write_dispatcher).
-install_claude_wrapper() {
-  am_root || return 0
-  [ -d /usr/local/bin ] || mkdir -p /usr/local/bin 2>/dev/null || return 0
-  [ -w /usr/local/bin ] || return 0
-  {
-    printf '#!/bin/sh\n'
-    printf '%s\n' "$MARKER"
-    printf 'exec "%s/bin/claude" "$@"\n' "$TOOLS"
-  } > /usr/local/bin/claude 2>/dev/null || {
-    warn "cannot write /usr/local/bin/claude"
-    return 0
-  }
-  chmod 0755 /usr/local/bin/claude 2>/dev/null || :
+# --- 2. agent link table ------------------------------------------------------------------
+#
+# $PORTERCLAUDE_AGENT_LINKS is `target|source|kind;target|source|kind` (server:
+# agents/model.ts encodeAgentLinks). `target` is the path the agent expects inside the
+# container (`/home/dev/.claude`), `source` is the path inside the mounted auth volume
+# (`/home/dev/.porterclaude/agents/claude/claude`), `kind` is `dir` or `file`.
+#
+# for_each_link <callback> : call `<callback> <target> <source> <kind>` for every entry.
+# Empty/short entries are skipped. POSIX field splitting on ';' and '|' via IFS.
+for_each_link() {
+  _cb="$1"
+  _links="${PORTERCLAUDE_AGENT_LINKS:-}"
+  [ -n "$_links" ] || return 0
+  # TODO(O1): split $_links on ';', then each entry on '|', and call "$_cb" target source
+  #           kind. Use `IFS=';'` in a subshell-free way (set -- $_links after IFS change)
+  #           so it works in dash/ash; restore IFS afterwards. Skip entries whose target or
+  #           source is empty, and normalise an unknown kind to 'dir'.
+  :
 }
 
-# 3. Best-effort install of git + tmux. Root only, missing packages only, hard timeout,
-#    everything logged into $BOOTSTRAP_LOG so it never pollutes the terminal.
+# link_one <target> <source> <kind> : create ONE agent symlink (best effort).
+#   * mkdir -p the parent of <target>
+#   * kind=dir  : mkdir -p <source>
+#     kind=file : seed <source> when absent — `{}` when its basename ends in `.json`,
+#                 otherwise an empty file (agents rewrite these atomically, so the file must
+#                 exist inside the volume before the link is used)
+#   * an existing regular file/directory at <target> is PARKED ASIDE (park_aside), never
+#     deleted; an existing symlink pointing elsewhere is replaced
+#   * ln -s <source> <target>
+# A read-only or not-yet-chowned auth volume must only produce a warning: the server chowns
+# <home>/.porterclaude and re-runs us with --porterclaude-bootstrap.
+link_one() {
+  # TODO(O1)
+  _t="$1"; _s="$2"; _k="$3"
+  warn "link_one is not implemented yet ($_t -> $_s, $_k)"
+  return 0
+}
+
+link_agents() {
+  [ -n "${PORTERCLAUDE_AGENT_LINKS:-}" ] || {
+    log "no agent links in this session"
+    return 0
+  }
+  mkdir -p "$HOME/.porterclaude/agents" 2>/dev/null || :
+  for_each_link link_one
+  return 0
+}
+
+# --- 3. ownership of the agent volumes ----------------------------------------------------
+#
+# The auth volumes are shared by every session of ONE host and only one uid can own them.
+# Recipe sessions are hard-wired to uid 1000 and cannot adapt; a root custom session can.
+owner_of() {
+  _o=""
+  if command -v stat >/dev/null 2>&1; then
+    _o="$(stat -c '%u:%g' "$1" 2>/dev/null || echo)"
+  fi
+  case "$_o" in
+    ''|*[!0-9:]*) _o="$(ls -ldn "$1" 2>/dev/null | awk 'NR == 1 { print $3 ":" $4 }')" ;;
+  esac
+  case "$_o" in
+    ''|*[!0-9:]*) _o="" ;;
+  esac
+  printf '%s' "$_o"
+}
+
+# agents_owner : "uid:gid" that should own everything we write into the agent volumes —
+# the first non-root owner among <home>/.porterclaude/agents/*, else $RECIPE_OWNER.
+agents_owner() {
+  # TODO(O1): iterate "$HOME"/.porterclaude/agents/*, use owner_of, skip empty and 0:*,
+  #           print the first match; fall back to $RECIPE_OWNER.
+  printf '%s' "$RECIPE_OWNER"
+}
+
+# claim_agents : root only. chown -R the agent root and every link target to agents_owner,
+# then tighten obvious credential files (0600 on */\.credentials.json, auth.json, *.key).
+# Non-root sessions only warn when an agent dir belongs to a foreign uid (they cannot fix it).
+claim_agents() {
+  if ! am_root; then
+    # TODO(O1): warn once when <home>/.porterclaude/agents/<id> belongs to another uid —
+    #           that is the "your image runs as the wrong user" diagnosis.
+    return 0
+  fi
+  # TODO(O1)
+  return 0
+}
+
+# --- 4. /usr/local/bin wrappers (non-login shells) ----------------------------------------
+#
+# Root only. For every shim in $TOOLS/bin (except pc-agent and pc-* helpers) write a 3-line
+# /usr/local/bin/<name> that execs it — but ONLY when <name> does not already resolve to a
+# binary outside $TOOLS (never shadow the image's own tools).
+install_agent_wrappers() {
+  am_root || return 0
+  [ -d "$TOOLS/bin" ] || return 0
+  # TODO(O1)
+  return 0
+}
+
+# --- 5. bridge the image's own home -------------------------------------------------------
+park_aside() {
+  # $1 = path to free up. Returns 0 when the path is gone, 1 when it must be left alone.
+  if [ ! -e "$1" ] && [ ! -L "$1" ]; then
+    return 0
+  fi
+  if [ -L "$1" ]; then
+    rm -f "$1" 2>/dev/null && return 0
+    warn "cannot replace the symlink $1"
+    return 1
+  fi
+  bak="$1.pc-backup"
+  if [ -e "$bak" ]; then
+    bak="$1.pc-backup.$$"
+  fi
+  if mv -f "$1" "$bak" 2>/dev/null; then
+    log "moved $1 aside to $bak"
+    return 0
+  fi
+  warn "cannot move $1 aside — leaving it as it is"
+  return 1
+}
+
+link_to() {
+  lnk="$1"
+  tgt="$2"
+  if [ -L "$lnk" ] && [ "$(readlink "$lnk" 2>/dev/null || echo)" = "$tgt" ]; then
+    return 0
+  fi
+  park_aside "$lnk" || return 0
+  ln -s "$tgt" "$lnk" 2>/dev/null || warn "cannot link $lnk -> $tgt"
+}
+
+# Anything resolving `~` through the passwd entry (su -, sudo -i, os.homedir(), bash tilde
+# expansion) must land on the same agent state. For every link target below $HOME, create the
+# same relative path below $IMAGE_HOME pointing at the SAME source.
+bridge_image_home() {
+  [ -n "$IMAGE_HOME" ] || return 0
+  [ "$IMAGE_HOME" != "$HOME" ] || return 0
+  if [ ! -d "$IMAGE_HOME" ]; then
+    mkdir -p "$IMAGE_HOME" 2>/dev/null || {
+      warn "cannot create the image home $IMAGE_HOME — skipping the bridge"
+      return 0
+    }
+  fi
+  if [ ! -w "$IMAGE_HOME" ]; then
+    warn "$IMAGE_HOME is not writable — agents started with HOME=$IMAGE_HOME will not see"
+    warn "the shared login (run them from a terminal, where HOME=$HOME)"
+    return 0
+  fi
+  log "bridging the image home $IMAGE_HOME -> $HOME (shared agent logins)"
+  # TODO(O1): for_each_link <cb> where <cb> maps a target under $HOME to
+  #           "$IMAGE_HOME/${target#$HOME/}" and calls link_to <that> <source>.
+  #           Also bridge "$IMAGE_HOME/.porterclaude" -> "$HOME/.porterclaude".
+  return 0
+}
+
+# --- 6. best-effort git + tmux (unchanged from v0.1) ---------------------------------------
 bootstrap_packages() {
   need=""
   for p in git tmux; do
@@ -258,201 +381,34 @@ bootstrap_packages() {
   return 0
 }
 
-# 4. Ownership of the shared login volumes.
-#
-#    porterclaude-claude -> $HOME/.claude and porterclaude-claude-home -> $HOME/.claude-home
-#    are shared by every session of an installation and only ONE uid can own them. Recipe
-#    sessions are hard-wired to uid 1000 (docker/recipes/common.sh) and cannot adapt, a root
-#    custom session can: we take the current owner of the volume root as the owner of
-#    everything written there and fall back to the recipes' 1000:1000 while the volume is
-#    still root-owned (fresh install whose FIRST session is a root custom image — docker
-#    cannot copy-up a home the image does not have, so the volume root stays root:root).
-#    Without this, a login performed in a root session leaves .credentials.json,
-#    settings.json and sessions/ root-owned and "log in once, every session is
-#    authenticated" only holds when the login happened in a uid-1000 session.
-#    Non-root sessions cannot chown anything: they only get a warning.
-owner_of() {
-  # "uid:gid" of $1 as numbers; empty when it cannot be determined.
-  _o=""
-  if command -v stat >/dev/null 2>&1; then
-    _o="$(stat -c '%u:%g' "$1" 2>/dev/null || echo)"
-  fi
-  case "$_o" in
-    ''|*[!0-9:]*) _o="$(ls -ldn "$1" 2>/dev/null | awk 'NR == 1 { print $3 ":" $4 }')" ;;
-  esac
-  case "$_o" in
-    ''|*[!0-9:]*) _o="" ;;
-  esac
-  printf '%s' "$_o"
-}
-
-shared_owner() {
-  for _d in "$HOME/.claude" "$HOME/.claude-home"; do
-    _o="$(owner_of "$_d")"
-    case "$_o" in
-      ''|0:*) continue ;;
-    esac
-    printf '%s' "$_o"
-    return 0
-  done
-  printf '%s' "$RECIPE_OWNER"
-}
-
-warn_foreign_shared() {
-  _me="$(id -u 2>/dev/null || echo)"
-  _o="$(owner_of "$HOME/.claude")"
-  [ -n "$_me" ] && [ -n "$_o" ] || return 0
-  [ "${_o%%:*}" = "$_me" ] && return 0
-  warn "$HOME/.claude belongs to uid ${_o%%:*} but this session runs as uid $_me:"
-  warn "claude may not be able to store its login (run this image as root or as uid ${_o%%:*})"
-  return 0
-}
-
-claim_shared() {
-  if ! am_root; then
-    warn_foreign_shared
-    return 0
-  fi
-  own="$(shared_owner)"
-  case "$own" in
-    ''|0:*) return 0 ;;
-  esac
-  for d in "$HOME/.claude" "$HOME/.claude-home"; do
-    [ -e "$d" ] || continue
-    chown -R "$own" "$d" 2>/dev/null || warn "cannot hand $d over to uid ${own%%:*}"
-  done
-  # the credentials stay private to that uid (chown -R keeps the mode, this is belt & braces)
-  if [ -f "$HOME/.claude/.credentials.json" ]; then
-    chmod 0600 "$HOME/.claude/.credentials.json" 2>/dev/null || :
-  fi
-  return 0
-}
-
-# 5. Shared Claude Code config: ~/.claude.json is a symlink into the shared volume.
-#    Anything seeded here is handed to the volume's owner by claim_shared afterwards.
-link_claude_config() {
-  vol="$HOME/.claude-home/.claude.json"
-  loc="$HOME/.claude.json"
-
-  mkdir -p "$HOME/.claude" "$HOME/.claude-home" 2>/dev/null \
-    || warn "cannot create $HOME/.claude / $HOME/.claude-home"
-  if [ ! -d "$HOME/.claude-home" ]; then
-    warn "no $HOME/.claude-home — skipping the .claude.json link"
-    return 0
-  fi
-
-  if [ ! -e "$vol" ]; then
-    printf '%s\n' '{}' > "$vol" 2>/dev/null || warn "cannot seed $vol (read-only volume?)"
-  fi
-
-  if [ -f "$loc" ] && [ ! -L "$loc" ]; then
-    # never delete user data: move it into the volume, or park a backup beside it
-    if [ ! -s "$vol" ] || [ "$(cat "$vol" 2>/dev/null)" = "{}" ]; then
-      mv -f "$loc" "$vol" 2>/dev/null || warn "cannot move $loc into the shared volume"
-    else
-      mv -f "$loc" "$loc.pc-backup" 2>/dev/null || warn "cannot back up $loc"
-    fi
-  fi
-
-  if [ -L "$loc" ]; then
-    rm -f "$loc" 2>/dev/null || warn "cannot replace the $loc symlink"
-  fi
-  if [ ! -e "$loc" ]; then
-    ln -s "$vol" "$loc" 2>/dev/null || warn "cannot link $loc -> $vol"
-  fi
-  return 0
-}
-
-# 6. Bridge the image's own home into $PORTERCLAUDE_HOME.
-#    HOME is pinned above, but plenty of code resolves `~` through the passwd entry (bash's
-#    tilde expansion after `su`, node's os.homedir(), sudo -i, ...). Rather than duplicate
-#    state there, point the two paths that matter at the shared volumes with symlinks.
-#    Never delete anything the image shipped: pre-existing files/dirs are moved aside.
-park_aside() {
-  # $1 = path to free up. Returns 0 when the path is gone, 1 when it must be left alone.
-  if [ ! -e "$1" ] && [ ! -L "$1" ]; then
-    return 0
-  fi
-  if [ -L "$1" ]; then
-    rm -f "$1" 2>/dev/null && return 0
-    warn "cannot replace the symlink $1"
-    return 1
-  fi
-  bak="$1.pc-backup"
-  if [ -e "$bak" ]; then
-    bak="$1.pc-backup.$$"
-  fi
-  if mv -f "$1" "$bak" 2>/dev/null; then
-    log "moved $1 aside to $bak"
-    return 0
-  fi
-  warn "cannot move $1 aside — leaving it as it is"
-  return 1
-}
-
-link_to() {
-  # $1 = link path, $2 = target inside $HOME
-  lnk="$1"
-  tgt="$2"
-  if [ -L "$lnk" ] && [ "$(readlink "$lnk" 2>/dev/null || echo)" = "$tgt" ]; then
-    return 0
-  fi
-  park_aside "$lnk" || return 0
-  ln -s "$tgt" "$lnk" 2>/dev/null || warn "cannot link $lnk -> $tgt"
-}
-
-bridge_image_home() {
-  [ -n "$IMAGE_HOME" ] || return 0
-  [ "$IMAGE_HOME" != "$HOME" ] || return 0
-  if [ ! -d "$IMAGE_HOME" ]; then
-    mkdir -p "$IMAGE_HOME" 2>/dev/null || {
-      warn "cannot create the image home $IMAGE_HOME — skipping the bridge"
-      return 0
-    }
-  fi
-  if [ ! -w "$IMAGE_HOME" ]; then
-    warn "$IMAGE_HOME is not writable — claude started with HOME=$IMAGE_HOME would not"
-    warn "see the shared login (run it from a terminal, where HOME=$HOME)"
-    return 0
-  fi
-  log "bridging the image home $IMAGE_HOME -> $HOME (shared claude login)"
-  link_to "$IMAGE_HOME/.claude"      "$HOME/.claude"
-  link_to "$IMAGE_HOME/.claude-home" "$HOME/.claude-home"
-  link_to "$IMAGE_HOME/.claude.json" "$HOME/.claude-home/.claude.json"
-  return 0
-}
-
 main() {
-  # Called by the claude dispatcher of the tools volume before and after every claude run
-  # (fetch-claude.sh, write_dispatcher) and usable from the server: hand whatever claude
-  # wrote in the shared volumes back to their owner. Silent, best effort, root only.
+  # Ownership hand-back only. Called by bin/pc-agent before and after every agent run and by
+  # the server as a root exec. Silent, best effort.
   if [ "${1:-}" = "--porterclaude-share" ]; then
-    claim_shared
+    claim_agents
     exit 0
   fi
 
-  # Re-run of the steps that need a writable $HOME. Docker creates the mountpoint parent
-  # $PORTERCLAUDE_HOME as root:root, so in an image that runs as a non-root user the first
-  # run above cannot write $HOME/.profile, $HOME/.bashrc or the $HOME/.claude.json symlink.
-  # The server therefore chowns $PORTERCLAUDE_HOME as root right after the start and calls
-  # us again with this flag (backend.md section 7, "non-root custom images"). Idempotent.
+  # Re-run of everything that needs a writable $HOME / a chowned agent volume. The server
+  # calls this as root right after the start (backend.md §13). Idempotent.
   if [ "${1:-}" = "--porterclaude-bootstrap" ]; then
     log "re-bootstrapping session '${PORTERCLAUDE_SESSION:-unknown}' (home: $HOME)"
     setup_path
-    install_claude_wrapper
-    link_claude_config
-    claim_shared
+    install_agent_wrappers
+    link_agents
+    claim_agents
     bridge_image_home
     log "ready"
     exit 0
   fi
 
-  log "bootstrapping session '${PORTERCLAUDE_SESSION:-unknown}' (tools: $TOOLS, home: $HOME, image home: ${IMAGE_HOME:-none})"
+  log "bootstrapping session '${PORTERCLAUDE_SESSION:-unknown}' on host '${PORTERCLAUDE_HOST:-unknown}'"
+  log "tools: $TOOLS, home: $HOME, image home: ${IMAGE_HOME:-none}, agents: ${PORTERCLAUDE_AGENT_IDS:-none}"
   setup_path
-  install_claude_wrapper
+  install_agent_wrappers
   bootstrap_packages
-  link_claude_config
-  claim_shared
+  link_agents
+  claim_agents
   bridge_image_home
   date -u +%FT%TZ > /tmp/porterclaude-ready 2>/dev/null || :
   log "ready"

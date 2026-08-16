@@ -3,6 +3,8 @@
 // Only add fields; never rename or retype an existing one.
 import { z } from 'zod';
 import { SLUG_RE } from '../util/slug.js';
+import { AgentIdSchema } from '../agents/model.js';
+import { HostIdSchema, LEGACY_HOST_ID } from '../hosts/model.js';
 import type { ContainerState, PortBinding } from '../backends/types.js';
 
 export const SessionNameSchema = z
@@ -91,9 +93,20 @@ export const EnvKeySchema = z
   .string()
   .regex(/^[A-Za-z_][A-Za-z0-9_]*$/, 'environment variable names must match [A-Za-z_][A-Za-z0-9_]*');
 
-/** What the client sends to create/update a session. */
+/**
+ * What the client sends to create/update a session.
+ *
+ * v0.2: `hostId` picks the docker engine (omitted => the default host) and is IMMUTABLE
+ * after create — moving a session to another host means recreating it there. `agents`
+ * picks the coding agents mounted into the container (null => every agent enabled on the
+ * host, resolved at create/recreate time).
+ */
 export const SessionInputSchema = z.object({
   name: SessionNameSchema,
+  /** the host this session runs on; omitted => `config.defaultHostId` */
+  hostId: HostIdSchema.optional(),
+  /** null = inherit the host's enabled agents (the usual case) */
+  agents: z.array(AgentIdSchema).max(64).nullable().default(null),
   displayName: z.string().max(120).optional(),
   image: ImageRefSchema,
   workspace: WorkspaceSchema.default({ type: 'volume' }),
@@ -112,6 +125,9 @@ export const SessionInputSchema = z.object({
 
 /** Persisted form: input + bookkeeping. */
 export const SessionConfigSchema = SessionInputSchema.extend({
+  /** stored form: always set. A v1 config.json is migrated to the 'default' host, and the
+   *  default keeps a hand-written/older file loadable instead of quarantining it. */
+  hostId: z.string().min(1).default(LEGACY_HOST_ID),
   /** deliberately laxer than the input: a session adopted from a container may carry an
    *  env var the engine accepted before this rule existed, and rejecting it here would
    *  fail AppConfigSchema and quarantine the whole config.json. */
@@ -133,6 +149,13 @@ export type SessionImageRef = z.infer<typeof ImageRefSchema>;
 
 /** Runtime status merged over the stored config; this is what GET /api/sessions returns. */
 export interface SessionView extends SessionConfig {
+  /** name of `hostId`, or the id itself when the host is gone (dangling session) */
+  hostName: string;
+  /** the host this session points at no longer exists */
+  hostMissing: boolean;
+  /** the agent ids actually mounted into the container: `agents ?? host.agents.enabled`,
+   *  filtered to agents that still exist in the registry */
+  resolvedAgents: string[];
   /** 'absent' = no container exists for this session yet */
   status: ContainerState | 'absent';
   containerId: string | null;
@@ -162,6 +185,10 @@ export interface SessionView extends SessionConfig {
 export const CONTAINER_LABELS = {
   managed: 'porterclaude.managed',
   session: 'porterclaude.session',
+  /** v0.2: the host id the session belongs to (reconcile/adoption reads it back) */
+  host: 'porterclaude.host',
+  /** v0.2: comma separated agent ids mounted into this container */
+  agents: 'porterclaude.agents',
   imageType: 'porterclaude.image-type',
   recipe: 'porterclaude.recipe',
   specHash: 'porterclaude.spec-hash',
@@ -179,10 +206,19 @@ export function containerNameFor(prefix: string, session: string): string {
   return `${prefix}${session}`;
 }
 
-export function workspaceVolumeFor(session: string): string {
-  return `porterclaude-ws-${session}`;
+/** `<volumePrefix>ws-<session>` (v0.1 name with the default prefix `porterclaude-`). */
+export function workspaceVolumeFor(volumePrefix: string, session: string): string {
+  return `${volumePrefix}ws-${session}`;
 }
 
-export function historyVolumeFor(session: string): string {
-  return `porterclaude-hist-${session}`;
+/**
+ * Private conversation history volume of ONE agent.
+ *
+ * The claude agent keeps the v0.1 name (`<prefix>hist-<session>`) so an existing session
+ * keeps its history across the upgrade; every other agent gets the id suffix.
+ */
+export function historyVolumeFor(volumePrefix: string, session: string, agentId: string): string {
+  return agentId === 'claude'
+    ? `${volumePrefix}hist-${session}`
+    : `${volumePrefix}hist-${session}-${agentId}`;
 }

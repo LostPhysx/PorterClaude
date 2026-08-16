@@ -16,6 +16,11 @@ interface Recorded {
 
 const view = (name: string): SessionView => ({
   name,
+  hostId: 'default',
+  hostName: 'Local docker',
+  hostMissing: false,
+  agents: null,
+  resolvedAgents: ['claude'],
   image: { type: 'recipe', recipe: 'node' },
   workspace: { type: 'volume' },
   env: {},
