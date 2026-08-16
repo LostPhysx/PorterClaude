@@ -32,6 +32,8 @@ const view = (name: string): SessionView => ({
   containerId: 'c1',
   containerName: `pc-${name}`,
   resolvedImage: 'porterclaude/node:latest',
+  containerImage: 'porterclaude/node:latest',
+  imageOutdated: false,
   startedAt: null,
   uptimeSec: null,
   runtimePorts: [],
@@ -146,6 +148,22 @@ describe('/api/sessions', () => {
       .send({ ...body, env: { 'A B': 'x' } })
       .expect(422);
     expect(res.body.error.code).toBe('validation_error');
+  });
+
+  it('POST / rejects a workspace hostPath with .. segments (INT-03)', async () => {
+    const res = await request(makeApp())
+      .post('/api/sessions')
+      .send({ ...body, workspace: { type: 'bind', hostPath: '../../../etc' } })
+      .expect(422);
+    expect(res.body.error.code).toBe('validation_error');
+    expect(JSON.stringify(res.body.error.details)).toContain("'..'");
+  });
+
+  it('POST / accepts a relative workspace hostPath under workspacesRoot', async () => {
+    await request(makeApp())
+      .post('/api/sessions')
+      .send({ ...body, workspace: { type: 'bind', hostPath: 'proj' } })
+      .expect(201);
   });
 
   it('GET /:name, PUT /:name and DELETE /:name', async () => {

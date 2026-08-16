@@ -51,6 +51,60 @@ export function getSessions() {
 // table
 // ---------------------------------------------------------------------------
 
+/**
+ * A `resolvedImage` that is nothing but a content id. Every recipe rebuild produces a new
+ * image id, so a container created before the rebuild ends up pinned to an untagged image
+ * and the API can only report its digest - which is meaningless to a human and hides the
+ * fact that a newer build exists (INT-01).
+ */
+const BARE_DIGEST_RE = /^sha256:[0-9a-f]{12,}$/i;
+
+/**
+ * The image ref this session's spec points at *now* (not the id it happens to run).
+ * `SessionView.resolvedImage` is that ref (api.md: the raw digest lives in
+ * `containerImage`); the recipe catalogue is the fallback for an older server that still
+ * reports the digest there.
+ * @param {any} session SessionView
+ * @returns {string} e.g. "ghcr.io/lostphysx/porterclaude/node:latest", '' when unknown
+ */
+export function imageRefFor(session) {
+  if (session && typeof session.imageRef === 'string' && session.imageRef) return session.imageRef;
+  const resolved = String((session && session.resolvedImage) || '');
+  if (resolved && !BARE_DIGEST_RE.test(resolved)) return resolved;
+  const image = (session && session.image) || {};
+  if (image.type === 'custom') return image.ref || '';
+  const recipe = recipes.find((r) => r.name === image.recipe);
+  return (recipe && recipe.imageRef) || '';
+}
+
+/**
+ * True when recreating the container would pick up a newer image than the one it runs
+ * (`SessionView.imageOutdated`). The fallback - `resolvedImage` being a bare digest - is
+ * what an older server reports for exactly that situation.
+ * @param {any} session SessionView
+ */
+export function imageOutdated(session) {
+  if (!session) return false;
+  if (typeof session.imageOutdated === 'boolean') return session.imageOutdated;
+  return BARE_DIGEST_RE.test(String(session.resolvedImage || ''));
+}
+
+/** The secondary line under the image column: a usable ref, never a bare digest. */
+function resolvedImageLabel(session) {
+  return imageRefFor(session);
+}
+
+/** `<div>` under the image cell: the ref plus the "recreate to pick it up" badge. */
+function resolvedImageCell(session) {
+  const ref = resolvedImageLabel(session);
+  const badge = imageOutdated(session)
+    ? '<span class="badge text-bg-warning" title="a newer build of this image exists - recreate the container to pick it up">image updated \u2014 recreate</span>'
+    : '';
+  if (!ref && !badge) return '';
+  const refHtml = ref ? `<span class="font-monospace">${escapeHtml(ref)}</span>` : '';
+  return `<div class="small text-secondary d-flex flex-wrap gap-1 align-items-center">${refHtml}${badge}</div>`;
+}
+
 function imageLabel(session) {
   const image = session.image || {};
   if (image.type === 'recipe') {
@@ -178,7 +232,7 @@ function render() {
         (s.displayName ? `<div class="small text-secondary">${escapeHtml(s.displayName)}</div>` : '') +
         '</td>' +
         `<td><div>${escapeHtml(imageLabel(s))}</div>` +
-        (s.resolvedImage ? `<div class="small text-secondary font-monospace">${escapeHtml(s.resolvedImage)}</div>` : '') +
+        resolvedImageCell(s) +
         '</td>' +
         `<td class="small">${escapeHtml(workspaceLabel(s))}</td>` +
         `<td><span class="badge ${statusBadgeClass(s.status)}">${escapeHtml(s.status)}</span></td>` +

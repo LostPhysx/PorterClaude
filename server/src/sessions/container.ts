@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import path from 'node:path';
 import type { CreateContainerSpec, MountSpec, PortMapSpec } from '../backends/types.js';
 import type { GeneralConfig } from '../config/schema.js';
+import { AppError } from '../http/errors.js';
 import type { SessionConfig } from './model.js';
 import { CONTAINER_LABELS, historyVolumeFor, workspaceVolumeFor } from './model.js';
 
@@ -230,15 +231,52 @@ function containerName(general: GeneralConfig, session: SessionConfig): string {
   return `${general.containerPrefix}${session.name}`;
 }
 
+/** `/a/b/` -> `/a/b`, `//` -> `/`. */
+function normaliseDir(p: string): string {
+  const normalised = path.posix.normalize(p).replace(/\/+$/, '');
+  return normalised.length ? normalised : '/';
+}
+
+/**
+ * Resolve a bind workspace `hostPath` to the absolute path that is handed to the engine.
+ *
+ * An absolute path is taken as given (the single, admin user may bind anything on the
+ * host); a RELATIVE one is resolved under `general.workspacesRoot` and must stay there.
+ * `path.posix.join` alone does not confine it — `join('/srv/ws', '../../../etc')` is
+ * `/etc` — so the result is normalised and checked against the root. The API schema
+ * already rejects `.`/`..` segments (model.ts WorkspaceHostPathSchema); this is the
+ * defence in depth that also covers configs stored before that rule existed, adopted
+ * containers and any future caller.
+ *
+ * @throws AppError.badRequest when a relative path escapes `workspacesRoot`.
+ */
+export function resolveWorkspaceHostPath(hostPath: string, workspacesRoot: string): string {
+  if (/[\0\\]/.test(hostPath)) {
+    throw AppError.badRequest('workspace hostPath must not contain a backslash or a NUL byte');
+  }
+  if (path.posix.isAbsolute(hostPath)) return normaliseDir(hostPath);
+  const root = normaliseDir(workspacesRoot);
+  const resolved = normaliseDir(path.posix.join(root, hostPath));
+  if (resolved !== root && !resolved.startsWith(root === '/' ? '/' : `${root}/`)) {
+    throw AppError.badRequest(
+      `workspace hostPath '${hostPath}' escapes the workspaces root ${root} ` +
+        '(relative paths must stay under it; pass an absolute path to bind anything else)',
+    );
+  }
+  return resolved;
+}
+
 /** The workspace mount for a session (creating the volume is the service's job). */
 export function workspaceMountFor(session: SessionConfig, general: GeneralConfig): MountSpec {
   const target = general.workspaceMount;
   const ws = session.workspace;
   if (ws.type === 'bind') {
-    const hostPath = path.posix.isAbsolute(ws.hostPath)
-      ? path.posix.normalize(ws.hostPath)
-      : path.posix.join(general.workspacesRoot, ws.hostPath);
-    return { type: 'bind', source: hostPath, target, readOnly: false };
+    return {
+      type: 'bind',
+      source: resolveWorkspaceHostPath(ws.hostPath, general.workspacesRoot),
+      target,
+      readOnly: false,
+    };
   }
   const volume = ws.volume ?? workspaceVolumeFor(session.name);
   return { type: 'volume', source: volume, target, readOnly: false };

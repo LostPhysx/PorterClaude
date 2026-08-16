@@ -186,6 +186,10 @@ install_claude() {
   [ -n "$version" ] || die "'claude --version' produced no output"
   printf '%s\n' "$version" > /etc/porterclaude/claude-version
   log "claude installed: $version  ($resolved)"
+  # Machine-readable marker: the server picks it out of the build output so an uncached
+  # build needs no extra container to learn what it actually installed (server/src/images
+  # /service.ts VERSION_LOG_RE). A cached build prints nothing, hence the file above.
+  printf 'PORTERCLAUDE_CLAUDE_VERSION=%s\n' "$version"
   # An exact request that did not come out the other end means the label lies — say so
   # loudly instead of shipping an image that disagrees with porterclaude.claude-version.
   case "$requested" in

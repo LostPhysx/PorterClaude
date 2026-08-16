@@ -9,6 +9,8 @@ import { bus, EVENTS } from './bus.js';
 /** Close codes (mirror of server/src/terminals/protocol.ts TERMINAL_CLOSE). FROZEN. */
 export const CLOSE = Object.freeze({
   normal: 1000,
+  /** client -> server: the user closed this pane, kill its tmux session (INT-06) */
+  paneClosed: 4001,
   badRequest: 4400,
   unauthorized: 4401,
   sessionNotFound: 4404,
@@ -17,6 +19,18 @@ export const CLOSE = Object.freeze({
   internal: 4500,
 });
 
+/**
+ * Client -> server "the user closed this pane on purpose" (INT-06, api.md ClientMessage).
+ * Closing a pane must also end the tmux session `pc_<name>` inside the container, otherwise
+ * closed panes leave detached-but-alive shells (and their processes) behind. A reload or a
+ * lost connection must NOT do this - that is exactly what tmux reattach is for - so it is
+ * only ever sent from `dispose({ kill: true })`.
+ *
+ * Both carriers the server accepts are used, in order: the `kill` frame, then the
+ * `CLOSE.paneClosed` close code as the fallback for a teardown that could not send a frame.
+ */
+export const KILL_MESSAGE = Object.freeze({ type: 'kill' });
+
 /** Reconnect backoff per api.md: 1s -> 15s with jitter. */
 export const RECONNECT_MIN_MS = 1000;
 export const RECONNECT_MAX_MS = 15000;
@@ -24,6 +38,14 @@ export const RECONNECT_MAX_MS = 15000;
 export const PING_MS = 25000;
 /** A socket that stayed open at least this long resets the backoff. */
 export const STABLE_MS = 10000;
+
+/**
+ * Exec exit statuses that mean "the container went away under us" rather than "the shell
+ * exited": 128+SIGKILL and 128+SIGTERM, i.e. what `docker stop` / `docker kill` produce.
+ * For these the pane must offer "Start session" instead of claiming the shell exited
+ * (INT-05; api.md "WebSocket: terminals").
+ */
+export const CONTAINER_SIGNAL_EXITS = Object.freeze([137, 143]);
 
 /** @typedef {'bash'|'claude'|'sh'} Shell */
 /** @typedef {'connecting'|'open'|'closed'|'reconnecting'|'fatal'} PaneStatus */
@@ -107,6 +129,10 @@ export class TerminalPane {
     this._openedAt = 0;
     this._lastError = null;
     this._awaitEnter = false;
+    /** banner held back because the exit status looks like a container stop, not a logout */
+    this._deferredExit = null;
+    /** wipe the (now meaningless) scrollback on the next `ready`: the container restarted */
+    this._resetOnReady = false;
   }
 
   // -------------------------------------------------------------------------
@@ -175,6 +201,7 @@ export class TerminalPane {
     this._clearRetryTimer();
     this._awaitEnter = false;
     this._lastError = null;
+    this._deferredExit = null;
     this._setStatus('connecting');
     this._clearNote('conn');
 
@@ -240,6 +267,13 @@ export class TerminalPane {
         this.reattached = msg.reattached === true;
         this._retryDelay = RECONNECT_MIN_MS;
         this._clearNote('conn');
+        // The container was stopped and started again while this pane was open: everything
+        // on screen belongs to a dead shell (and would keep showing a stale exit banner),
+        // so start from a clean buffer. INT-05.
+        if (this._resetOnReady) {
+          this._resetOnReady = false;
+          try { this.term?.reset(); } catch (err) { console.debug('[terminal] reset failed', err); }
+        }
         this._setStatus('open', { tmux: this.tmux, reattached: this.reattached });
         if (this.tmux === false) {
           this._renderNote('tmux', {
@@ -263,9 +297,18 @@ export class TerminalPane {
         this._lastError = String(msg.message || msg.code || 'terminal error');
         this.term?.writeln(`\r\n${ANSI_RED}${this._lastError}${ANSI_RESET}`);
         break;
-      case 'exit':
-        this._writeDim(`[process exited${msg.code === null || msg.code === undefined ? '' : ` (${msg.code})`}]`);
+      case 'exit': {
+        const code = msg.code === null || msg.code === undefined ? null : Number(msg.code);
+        const banner = `[process exited${code === null ? '' : ` (${code})`}]`;
+        // 137/143 nearly always means the container was stopped, not that the user typed
+        // `exit`: hold the banner back until _onClose knows which it was (INT-05).
+        if (code !== null && CONTAINER_SIGNAL_EXITS.includes(code)) {
+          this._deferredExit = banner;
+        } else {
+          this._writeDim(banner);
+        }
         break;
+      }
       case 'pong':
         break;
       default:
@@ -320,9 +363,19 @@ export class TerminalPane {
     }
   }
 
-  /** Idempotent teardown: timers, socket, xterm, DOM. */
-  dispose() {
+  /**
+   * Idempotent teardown: timers, socket, xterm, DOM.
+   *
+   * `kill: true` additionally asks the server to end the tmux session inside the container
+   * (INT-06). Pass it ONLY for an explicit pane close by the user - a reload, a layout
+   * restore or an auth-loss teardown must leave the shell running so reconnecting with the
+   * same pane name reattaches. Nothing can be killed when the socket is not open (the pane
+   * was already disconnected); tmux then keeps the shell, as it does today.
+   * @param {{kill?:boolean}} [opts]
+   */
+  dispose(opts = {}) {
     if (this.disposed) return;
+    const kill = opts.kill === true;
     this.disposed = true;
     this._stopPing();
     this._clearRetryTimer();
@@ -331,7 +384,15 @@ export class TerminalPane {
     this.ws = null;
     if (ws) {
       ws.onopen = null; ws.onmessage = null; ws.onerror = null; ws.onclose = null;
-      try { ws.close(CLOSE.normal, 'pane closed'); } catch { /* ignore */ }
+      // The text frame is queued before the close frame, so a server that understands it
+      // sees the kill request first; the close code repeats the intent for a server that
+      // only looks at that.
+      if (kill && ws.readyState === 1) {
+        try { ws.send(JSON.stringify(KILL_MESSAGE)); } catch { /* ignore */ }
+      }
+      try {
+        ws.close(kill ? CLOSE.paneClosed : CLOSE.normal, kill ? 'pane closed by user' : 'pane closed');
+      } catch { /* ignore */ }
     }
     const term = this.term;
     this.term = null;
@@ -378,8 +439,14 @@ export class TerminalPane {
     if (code === CLOSE.normal || code === 1005) {
       this._setStatus('closed');
       this._awaitEnter = true;
-      this._writeDim('[process exited] press Enter to restart');
       this._clearNote('conn');
+      if (this._deferredExit) {
+        // Held-back 137/143: show the "not running / Start session" note instead of the
+        // exit banner, and only print the banner if the session is running after all.
+        void this._noteIfSessionStopped({ deferred: true });
+        return;
+      }
+      this._writeDim('[process exited] press Enter to restart');
       void this._noteIfSessionStopped();
       return;
     }
@@ -409,6 +476,8 @@ export class TerminalPane {
     }
 
     if (code === CLOSE.sessionNotRunning) {
+      this._deferredExit = null;
+      this._resetOnReady = true;
       this._scheduleReconnect(detail || `session "${this.session}" is not running`, [
         { label: 'Start session', onClick: () => this._startSession() },
       ]);
@@ -456,18 +525,34 @@ export class TerminalPane {
    * closes 4409 in that case, but a racing stop (or an older server) can still close 1000,
    * which alone would only say "[process exited]". Confirm the session state and, when it is
    * not running, show the same note the 4409 path shows instead of a bare exit line.
+   *
+   * With `deferred` the exit banner has NOT been written yet (the exec ended 137/143, which
+   * normally means `docker stop`): the note replaces it entirely, and the banner is only
+   * printed after all if the session turns out to be running. INT-05.
+   * @param {{deferred?:boolean}} [opts]
    */
-  async _noteIfSessionStopped() {
+  async _noteIfSessionStopped(opts = {}) {
+    const deferred = opts.deferred === true;
+    const banner = this._deferredExit;
     let status = null;
     try {
       const res = await api.sessions.get(this.session);
       const view = (res && res.session) || null;
       status = view && typeof view.status === 'string' ? view.status : null;
     } catch {
-      return; // cannot tell (offline / 401 / gone): leave the plain exit line alone
+      // cannot tell (offline / 401 / gone)
+      if (deferred) this._flushDeferredExit(banner);
+      return;
     }
     // only decorate the close we are still sitting in
-    if (this.disposed || this.ws || !this._awaitEnter || !status || status === 'running') return;
+    if (this.disposed || this.ws || !this._awaitEnter) return;
+    if (!status || status === 'running') {
+      if (deferred) this._flushDeferredExit(banner);
+      return;
+    }
+    this._deferredExit = null;
+    // the container is down: whatever is on screen dies with it
+    this._resetOnReady = true;
     this._renderNote('conn', {
       variant: 'warning',
       text: `session "${this.session}" is not running`,
@@ -475,9 +560,18 @@ export class TerminalPane {
     });
   }
 
+  /** Print a held-back exit banner (the exit was a real one after all). @param {string|null} banner */
+  _flushDeferredExit(banner) {
+    if (this.disposed || !banner || this._deferredExit !== banner) return;
+    this._deferredExit = null;
+    this._writeDim(`${banner} press Enter to restart`);
+  }
+
   /** Ask the API to start the session, then reconnect immediately on success. */
   async _startSession() {
     this._renderNote('conn', { variant: 'warning', text: `starting session "${this.session}"…` });
+    this._deferredExit = null;
+    this._resetOnReady = true;
     try {
       await api.sessions.start(this.session);
       this._retryDelay = RECONNECT_MIN_MS;

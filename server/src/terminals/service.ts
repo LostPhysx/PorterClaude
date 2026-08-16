@@ -168,6 +168,36 @@ export class TerminalService {
     }
   }
 
+  /**
+   * `tmux kill-session -t pc_<name>` — end the shell of a pane the USER closed.
+   *
+   * Without this a closed pane leaves a detached tmux session (and whatever ran in it)
+   * alive in the container until it is restarted, and nothing in the UI can reach it any
+   * more. Called ONLY on an explicit close (a `kill` message or close code 4001), never on
+   * a reload or a dropped connection — those must keep the session so the next connect
+   * re-attaches.
+   *
+   * Best effort by construction: it is called while the socket is going away, so a stopped
+   * container, a missing tmux or a dead backend is logged and swallowed. Never throws.
+   */
+  async killTmuxSession(session: string, terminalName: string): Promise<boolean> {
+    const target = shQuote(tmuxSessionName(terminalName));
+    try {
+      const { containerId } = await this.sessions.requireRunningContainer(session);
+      const backend = this.deps.backends.get();
+      const res = await backend.runExec(
+        containerId,
+        ['sh', '-lc', `tmux kill-session -t ${target} >/dev/null 2>&1 || true`],
+        { timeoutMs: 10_000 },
+      );
+      this.deps.log.info({ session, name: terminalName, exitCode: res.exitCode }, 'tmux session killed');
+      return res.exitCode === 0;
+    } catch (err) {
+      this.deps.log.debug({ err, session, name: terminalName }, 'killing the tmux session failed (ignored)');
+      return false;
+    }
+  }
+
   /** Track open streams so shutdown can close them. */
   register(terminalId: string, stream: ExecStream): void {
     this.streams.set(terminalId, stream);

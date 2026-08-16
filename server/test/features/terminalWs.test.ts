@@ -31,6 +31,7 @@ let openError: unknown = null;
 let sessionStateError: unknown = null;
 let execExitCode: number | null = 0;
 let unregistered: string[] = [];
+let killed: string[] = [];
 
 function makeCtx(): AppContext {
   return {
@@ -47,6 +48,10 @@ function makeCtx(): AppContext {
         };
       },
       unregister: (id: string) => unregistered.push(id),
+      killTmuxSession: async (session: string, name: string) => {
+        killed.push(`${session}/${name}`);
+        return true;
+      },
     },
     sessions: {
       requireRunningContainer: async () => {
@@ -93,6 +98,7 @@ beforeEach(async () => {
   sessionStateError = null;
   execExitCode = 0;
   unregistered = [];
+  killed = [];
   stream = stubExecStream() as ReturnType<typeof stubExecStream> & TestStream;
   server = http.createServer((_req, res) => res.end('ok'));
   handle = attachTerminalWs(server, makeCtx());
@@ -274,5 +280,40 @@ describe('attachTerminalWs', () => {
     ws.close();
     await vi.waitFor(() => expect(stream.closed).toBe(true));
     expect(unregistered).toContain('t1');
+  });
+});
+
+// INT-06: a closed pane left its tmux session (and everything running in it) alive in the
+// container forever, while a reload MUST keep it so the next connect re-attaches.
+describe('ending a pane for good', () => {
+  it('kills the tmux session on a {type:kill} message and closes 1000', async () => {
+    const ws = connect();
+    await nextText(ws);
+    const closed = nextClose(ws);
+    ws.send(JSON.stringify({ type: 'kill' }));
+    expect(await closed).toBe(TERMINAL_CLOSE.normal);
+    await vi.waitFor(() => expect(killed).toEqual(['web/main']));
+    expect(stream.closed).toBe(true);
+  });
+
+  it('kills it when the client closes with 4001', async () => {
+    const ws = connect();
+    await nextText(ws);
+    ws.close(TERMINAL_CLOSE.paneClosed, 'pane closed');
+    await vi.waitFor(() => expect(killed).toEqual(['web/main']));
+  });
+
+  it('keeps it on a plain disconnect (reload) and on an exec exit', async () => {
+    const first = connect();
+    await nextText(first);
+    first.close();
+    await vi.waitFor(() => expect(stream.closed).toBe(true));
+
+    const second = connect();
+    await nextText(second);
+    const closed = nextClose(second);
+    stream.emitClose(1006);
+    await closed;
+    expect(killed).toEqual([]);
   });
 });

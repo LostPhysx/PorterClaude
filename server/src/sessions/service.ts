@@ -91,6 +91,13 @@ function asNumber(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
+/** The concrete image ref a session runs: recipes resolve to <ns>/<recipe>:latest. */
+function resolvedImageRefFor(cfg: SessionConfig, general: GeneralConfig): string {
+  return cfg.image.type === 'recipe'
+    ? recipeImageRef(general.imageNamespace, cfg.image.recipe)
+    : cfg.image.ref;
+}
+
 /** true for a container user that is root (or unset, which means root). */
 function isRootUser(user: string): boolean {
   const u = user.trim();
@@ -127,22 +134,49 @@ export class SessionService {
     }
 
     const inspects = await this.inspectAll(containers);
-    const used = new Set<string>();
     const views: SessionView[] = [];
 
-    for (const cfg of configs) {
-      const container = this.matchContainer(containers, cfg.name, general);
-      if (container) used.add(container.id);
+    const matched = configs.map((cfg) => ({ cfg, container: this.matchContainer(containers, cfg.name, general) }));
+    const used = new Set(matched.map((m) => m.container?.id).filter((id): id is string => Boolean(id)));
+    const orphanContainers = containers.filter((c) => !used.has(c.id));
+
+    // One image inspect per distinct ref: the stored sessions' image refs (so a view can
+    // tell whether the container still runs what <ns>/<recipe>:latest points at, see
+    // SessionView.imageOutdated) plus the images of the orphan containers (whose config is
+    // reconstructed from them).
+    const images = await this.inspectRefs([
+      ...matched.map((m) => resolvedImageRefFor(m.cfg, general)),
+      ...orphanContainers.map((c) => c.image),
+    ]);
+
+    for (const { cfg, container } of matched) {
       const extra = backendWarning ? [backendWarning] : [];
-      views.push(this.toView(cfg, container, container ? inspects.get(container.id) ?? null : null, general, false, extra));
+      views.push(
+        this.toView(cfg, container, container ? inspects.get(container.id) ?? null : null, general, false, extra, images),
+      );
     }
 
-    const orphanContainers = containers.filter((c) => !used.has(c.id));
-    const images = await this.inspectImagesOf(orphanContainers);
-    for (const container of orphanContainers) {
+    const orphans = orphanContainers.map((container) => {
       const inspect = inspects.get(container.id) ?? null;
-      const cfg = this.synthesizeConfig(container, inspect, general, images.get(container.image) ?? null);
-      views.push(this.toView(cfg, container, inspect, general, true, []));
+      return {
+        container,
+        inspect,
+        cfg: this.synthesizeConfig(container, inspect, general, images.get(container.image) ?? null),
+      };
+    });
+
+    // An orphan's reconstructed definition names a ref (porterclaude/node:latest) that the
+    // container itself no longer reports — that is precisely the case imageOutdated is for,
+    // so those refs need an inspect too. Second round trip, and only when it adds something.
+    const extraRefs = orphans
+      .map((o) => resolvedImageRefFor(o.cfg, general))
+      .filter((ref) => !images.has(ref));
+    if (extraRefs.length) {
+      for (const [ref, image] of await this.inspectRefs(extraRefs)) images.set(ref, image);
+    }
+
+    for (const { container, inspect, cfg } of orphans) {
+      views.push(this.toView(cfg, container, inspect, general, true, [], images));
     }
 
     views.sort((a, b) => a.name.localeCompare(b.name));
@@ -459,7 +493,7 @@ export class SessionService {
     inspect: ContainerInspect | null,
     general: GeneralConfig,
   ): Promise<SessionConfig> {
-    const images = await this.inspectImagesOf([container]);
+    const images = await this.inspectRefs([container.image]);
     const cfg = this.synthesizeConfig(container, inspect, general, images.get(container.image) ?? null);
     if (!SessionNameSchema.safeParse(cfg.name).success) {
       throw AppError.conflict(
@@ -513,11 +547,12 @@ export class SessionService {
     return out;
   }
 
-  /** image inspects (by ref) for a set of containers; missing/unreachable images map to
-   *  nothing. Used to subtract the image's own env when reconstructing a config. */
-  private async inspectImagesOf(containers: ContainerSummary[]): Promise<Map<string, ImageInspect>> {
+  /** image inspects keyed by ref; missing/unreachable images map to nothing. Used to
+   *  subtract the image's own env when reconstructing a config and to compare the image a
+   *  container runs with the one its ref resolves to today. */
+  private async inspectRefs(wanted: string[]): Promise<Map<string, ImageInspect>> {
     const out = new Map<string, ImageInspect>();
-    const refs = [...new Set(containers.map((c) => c.image).filter((r) => r.length > 0))];
+    const refs = [...new Set(wanted.filter((r) => r.length > 0))];
     if (!refs.length) return out;
     let backend: DockerBackend;
     try {
@@ -1022,6 +1057,7 @@ export class SessionService {
     general: GeneralConfig,
     orphan: boolean,
     extraWarnings: string[],
+    images: Map<string, ImageInspect> = new Map(),
   ): SessionView {
     const warnings = [...(this.warnings.get(cfg.name) ?? []), ...extraWarnings];
     const status: ContainerState | 'absent' = container ? container.state : 'absent';
@@ -1030,42 +1066,59 @@ export class SessionService {
     const uptimeSec =
       running && startedAt ? Math.max(0, Math.round((Date.now() - Date.parse(startedAt)) / 1000)) : null;
 
-    const resolvedImage =
-      cfg.image.type === 'recipe'
-        ? recipeImageRef(general.imageNamespace, cfg.image.recipe)
-        : cfg.image.ref;
+    const resolvedImage = resolvedImageRefFor(cfg, general);
 
     const runtimePorts: PortBinding[] = inspect?.ports ?? container?.ports ?? [];
 
     let needsRecreate = false;
     if (container && !orphan) {
-      const spec = buildContainerSpec({
-        session: cfg,
-        general,
-        resolvedImage,
-        imageType: cfg.image.type,
-        // recover the image PATH the container was created with, otherwise the recomputed
-        // hash of a custom-image session would never match (container.ts composeToolsPath)
-        imageEnvPath: imagePathFromEnv(inspect?.env, general),
-      });
-      const wanted = spec.labels?.[CONTAINER_LABELS.specHash];
-      const actual = container.labels[CONTAINER_LABELS.specHash];
-      needsRecreate = Boolean(wanted && actual && wanted !== actual);
-      if (!actual) needsRecreate = true;
-      // A definition reconstructed from a container (adopted orphan) describes THAT
-      // container by construction: never nag the user to recreate it just because the
-      // reconstruction is not bit-identical. The flag comes back as soon as they edit it.
-      if (needsRecreate && this.adopted.has(cfg.name) && cfg.specHash === actual) {
-        needsRecreate = false;
+      try {
+        const spec = buildContainerSpec({
+          session: cfg,
+          general,
+          resolvedImage,
+          imageType: cfg.image.type,
+          // recover the image PATH the container was created with, otherwise the recomputed
+          // hash of a custom-image session would never match (container.ts composeToolsPath)
+          imageEnvPath: imagePathFromEnv(inspect?.env, general),
+        });
+        const wanted = spec.labels?.[CONTAINER_LABELS.specHash];
+        const actual = container.labels[CONTAINER_LABELS.specHash];
+        needsRecreate = Boolean(wanted && actual && wanted !== actual);
+        if (!actual) needsRecreate = true;
+        // A definition reconstructed from a container (adopted orphan) describes THAT
+        // container by construction: never nag the user to recreate it just because the
+        // reconstruction is not bit-identical. The flag comes back as soon as they edit it.
+        if (needsRecreate && this.adopted.has(cfg.name) && cfg.specHash === actual) {
+          needsRecreate = false;
+        }
+      } catch (err) {
+        // A stored definition this build can no longer turn into a container (e.g. a
+        // workspace hostPath that escapes workspacesRoot) must not break the whole list.
+        needsRecreate = true;
+        warnings.push(`this definition cannot be applied as it is: ${errMessage(err)}`);
       }
     }
+
+    // The image the container actually runs vs. the one its ref points at TODAY. Docker
+    // reports the plain id (`sha256:…`) for a container whose image lost its tag, which is
+    // exactly what a rebuild does — hence the stable ref in resolvedImage and the flag
+    // instead of a bare digest in the UI.
+    const containerImage = container?.image ?? null;
+    const containerImageId = inspect?.imageId ?? container?.imageId ?? null;
+    const currentImageId = images.get(resolvedImage)?.id ?? null;
+    const imageOutdated = Boolean(
+      container && containerImageId && currentImageId && containerImageId !== currentImageId,
+    );
 
     return {
       ...cfg,
       status,
       containerId: container?.id ?? null,
       containerName: container?.name ?? containerNameFor(general.containerPrefix, cfg.name),
-      resolvedImage: container?.image ?? resolvedImage,
+      resolvedImage,
+      containerImage,
+      imageOutdated,
       startedAt,
       uptimeSec,
       runtimePorts,

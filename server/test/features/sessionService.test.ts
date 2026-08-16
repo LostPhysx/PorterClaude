@@ -1,7 +1,8 @@
 // OWNER: B2. SessionService against a stubbed DockerBackend (no docker host).
 import { describe, expect, it } from 'vitest';
 import { AppError, DockerApiError } from '../../src/http/errors.js';
-import { CONTAINER_LABELS } from '../../src/sessions/model.js';
+import { CONTAINER_LABELS, SessionConfigSchema, SessionInputSchema } from '../../src/sessions/model.js';
+import type { ContainerInspect } from '../../src/backends/types.js';
 import { buildContainerSpec } from '../../src/sessions/container.js';
 import { SessionService } from '../../src/sessions/service.js';
 import {
@@ -26,6 +27,40 @@ function makeService(opts: {
   const service = new SessionService(serviceDeps({ config: cfg.store, backends: manager }));
   return { service, cfg, sb };
 }
+
+/** a stub whose container inspect reports `imageId` (the stub default is 'sha256:img'). */
+function backendRunningImage(imageId: string) {
+  return stubBackend({
+    inspectContainer: async (id: string) =>
+      ({
+        id,
+        name: 'pc-web',
+        image: imageId,
+        imageId,
+        state: 'running',
+        running: true,
+        startedAt: new Date().toISOString(),
+        labels: {},
+        env: [],
+        mounts: [],
+        ports: [],
+        raw: {},
+      }) satisfies ContainerInspect,
+  });
+}
+
+describe('the workspace hostPath rule (INT-03)', () => {
+  it('rejects .. segments on the way in but still loads an already stored one', () => {
+    const bad = { type: 'bind', hostPath: '../../../etc' };
+    expect(
+      SessionInputSchema.safeParse({ name: 'web', image: { type: 'recipe', recipe: 'node' }, workspace: bad })
+        .success,
+    ).toBe(false);
+    expect(
+      SessionConfigSchema.safeParse({ ...sessionConfig({ name: 'web' }), workspace: bad }).success,
+    ).toBe(true);
+  });
+});
 
 describe('SessionService.create', () => {
   it('creates volumes, then the container, then starts it, and persists only afterwards', async () => {
@@ -246,6 +281,57 @@ describe('SessionService.list', () => {
     );
     const [view] = await service.list();
     expect(view?.needsRecreate).toBe(false);
+  });
+
+  // INT-01: a recipe rebuild untags the image the container runs, so docker answers a
+  // bare digest for it. The view must still name the recipe image and say "outdated".
+  it('reports the stable image ref plus imageOutdated after a rebuild', async () => {
+    const { service, sb } = makeService({
+      sessions: [sessionConfig({ name: 'web' })],
+      backend: backendRunningImage('sha256:8d4d875a6431'),
+    });
+    sb!.containers.push(containerSummary({ image: 'sha256:8d4d875a6431', imageId: 'sha256:8d4d875a6431' }));
+    sb!.images.set('porterclaude/node:latest', imageInspect({ id: 'sha256:rebuilt' }));
+
+    const [view] = await service.list();
+    expect(view?.resolvedImage).toBe('porterclaude/node:latest');
+    expect(view?.containerImage).toBe('sha256:8d4d875a6431');
+    expect(view?.imageOutdated).toBe(true);
+  });
+
+  it('does not flag imageOutdated while the container runs the current image', async () => {
+    const { service, sb } = makeService({
+      sessions: [sessionConfig({ name: 'web' })],
+      backend: backendRunningImage('sha256:current'),
+    });
+    sb!.containers.push(containerSummary({ imageId: 'sha256:current' }));
+    sb!.images.set('porterclaude/node:latest', imageInspect({ id: 'sha256:current' }));
+
+    const [view] = await service.list();
+    expect(view?.imageOutdated).toBe(false);
+    expect(view?.resolvedImage).toBe('porterclaude/node:latest');
+  });
+
+  it('never flags imageOutdated for a session with no container', async () => {
+    const { service, sb } = makeService({ sessions: [sessionConfig({ name: 'web' })] });
+    sb!.images.set('porterclaude/node:latest', imageInspect({ id: 'sha256:rebuilt' }));
+    const [view] = await service.list();
+    expect(view?.status).toBe('absent');
+    expect(view?.imageOutdated).toBe(false);
+    expect(view?.containerImage).toBeNull();
+  });
+
+  // INT-03: such a config can exist (it was accepted before the rule); listing must not
+  // blow up because buildContainerSpec now refuses to mount it.
+  it('keeps listing a session whose stored hostPath escapes workspacesRoot', async () => {
+    const stored = { ...sessionConfig({ name: 'web' }), workspace: { type: 'bind' as const, hostPath: '../../etc' } };
+    const { service, sb } = makeService({ sessions: [stored] });
+    sb!.containers.push(containerSummary());
+
+    const [view] = await service.list();
+    expect(view?.name).toBe('web');
+    expect(view?.needsRecreate).toBe(true);
+    expect(view?.warnings.join(' ')).toContain('escapes the workspaces root');
   });
 
   it('degrades to stored configs + a warning when the backend is unreachable', async () => {

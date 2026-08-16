@@ -33,9 +33,18 @@ export interface RecipeStatus extends RecipeDef {
   imageRef: string;
   built: boolean;
   imageId: string | null;
+  /** when the ENGINE created the image, i.e. when the build finished */
   builtAt: string | null;
   sizeBytes: number | null;
+  /**
+   * The Claude Code version actually installed in the image, read out of
+   * /etc/porterclaude/claude-version (see docker/recipes/common.sh). `null` while it is
+   * still unknown: the first status call after a restart kicks off the read in the
+   * background and answers it on the next poll.
+   */
   claudeVersion: string | null;
+  /** what the image was BUILT with ('stable' | 'latest' | an exact version) */
+  claudeChannel: string | null;
   /** stored porterclaude.context-hash differs from the current docker/recipes/<name> hash */
   outdated: boolean;
   /** a build job for this recipe is running */
@@ -49,7 +58,10 @@ export interface ToolsStatus {
   /** the tools volume exists on the engine */
   present: boolean;
   lastSyncedAt: string | null;
+  /** the version in the image's /payload/VERSION (null while unknown, see RecipeStatus) */
   claudeVersion: string | null;
+  /** what the image was BUILT with ('stable' | 'latest' | an exact version) */
+  claudeChannel: string | null;
   /** hash of the current docker/tools context (null when it cannot be read) */
   contextHash: string | null;
   /**
@@ -78,6 +90,46 @@ const MAX_JOBS = 50;
 const MAX_JOB_LINES = 2000;
 const TOOLS_SYNC_LABEL = 'porterclaude.tools-sync';
 
+/**
+ * Where an image records the exact Claude Code version it ships: recipes write
+ * /etc/porterclaude/claude-version (docker/recipes/common.sh), the tools image writes
+ * /payload/VERSION (docker/tools/fetch-claude.sh). Neither can be labelled at build time -
+ * the version is only known once the installer ran - so it is read back out of the built
+ * image with a one-shot container.
+ */
+const VERSION_PROBE_CMD =
+  'cat /etc/porterclaude/claude-version 2>/dev/null || cat /payload/VERSION 2>/dev/null || true';
+
+/** the build prints this so an uncached build needs no probe at all (common.sh). */
+const VERSION_LOG_RE = /PORTERCLAUDE_CLAUDE_VERSION=([^\s]+)/;
+
+/** how long a failed version read is remembered before it is tried again. */
+const VERSION_RETRY_MS = 5 * 60_000;
+
+interface VersionEntry {
+  version: string | null;
+  at: number;
+}
+
+/**
+ * Pick the version out of whatever the probe container printed. Docker's non-tty log
+ * framing puts 8 binary bytes in front of every line, so the text is stripped down to
+ * printable ASCII first and a semver-shaped token wins over the rest of the line
+ * (`claude --version` prints "2.1.233 (Claude Code)").
+ */
+export function parseClaudeVersion(raw: string): string | null {
+  for (const line of raw.split('\n')) {
+    const text = line.replace(/[^\x20-\x7e]/g, '').trim();
+    if (!text) continue;
+    const semver = /\d+\.\d+\.\d+[A-Za-z0-9.+-]*/.exec(text);
+    if (semver) return semver[0];
+    // anything else must at least LOOK like a version; log noise ("log output", a docker
+    // error line, ...) is not a version and must stay null rather than reach the UI
+    if (/^\d[A-Za-z0-9._+-]{0,63}$/.test(text)) return text;
+  }
+  return null;
+}
+
 interface JobRecord {
   id: string;
   kind: JobKind;
@@ -97,6 +149,13 @@ function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/** the PORTERCLAUDE_CLAUDE_VERSION=<v> marker common.sh prints, if this line carries it. */
+function versionFromBuildLine(line: BuildLogLine): string | null {
+  const text = line.stream ?? '';
+  const match = VERSION_LOG_RE.exec(text);
+  return match ? (parseClaudeVersion(match[1] ?? '') ?? null) : null;
+}
+
 /** `sha256:0123456789ab…` — enough to identify an image in a job log. */
 function shortImageId(id: string): string {
   const hex = id.startsWith('sha256:') ? id.slice(7) : id;
@@ -106,6 +165,10 @@ function shortImageId(id: string): string {
 export class ImageService {
   private readonly jobs = new Map<string, JobRecord>();
   private lastToolsSyncAt: string | null = null;
+  /** image id -> the Claude Code version that image ships (null = read failed) */
+  private readonly claudeVersions = new Map<string, VersionEntry>();
+  /** in-flight version reads, so a polling UI cannot start one container per poll */
+  private readonly versionProbes = new Map<string, Promise<string | null>>();
 
   constructor(private readonly deps: ServiceDeps) {}
 
@@ -151,9 +214,12 @@ export class ImageService {
           imageRef,
           built: Boolean(inspect),
           imageId: inspect?.id ?? null,
-          builtAt: labels[IMAGE_LABELS.builtAt] ?? inspect?.createdAt ?? null,
+          // the engine stamps Created when the build FINISHES; the legacy
+          // porterclaude.built-at label (build start) only serves images built before.
+          builtAt: inspect?.createdAt ?? labels[IMAGE_LABELS.builtAt] ?? null,
           sizeBytes: inspect?.sizeBytes ?? null,
-          claudeVersion: labels[IMAGE_LABELS.claudeVersion] ?? null,
+          claudeVersion: this.claudeVersionOf(inspect?.id ?? null),
+          claudeChannel: labels[IMAGE_LABELS.claudeVersion] ?? null,
           outdated: Boolean(inspect && contextHash && labels[IMAGE_LABELS.contextHash] !== contextHash),
           building: Boolean(job),
           jobId: job?.id ?? null,
@@ -165,8 +231,18 @@ export class ImageService {
   /**
    * Start a build job (returns immediately; poll the job for output).
    * 409 (AppError.conflict) when a build for that recipe is already running.
+   *
+   * A rebuild whose context hash still matches the built image is SKIPPED (exactly like
+   * syncTools): a fully cached rebuild used to produce a new image id anyway - the labels
+   * carried a fresh timestamp - which untagged the image every existing session runs, so
+   * those sessions started reporting a bare `sha256:…` and the old image could not be
+   * collected. `force` (or `noCache`/`pull`, which only make sense when the user wants a
+   * real rebuild, e.g. to pick up a new base image) always builds.
    */
-  async buildRecipe(name: string, opts?: { noCache?: boolean; pull?: boolean }): Promise<JobSummary> {
+  async buildRecipe(
+    name: string,
+    opts?: { noCache?: boolean; pull?: boolean; force?: boolean },
+  ): Promise<JobSummary> {
     const recipe = getRecipe(name);
     if (!recipe) throw AppError.notFound(`unknown recipe '${name}'`);
     const running = this.runningJobFor('build', name);
@@ -175,6 +251,7 @@ export class ImageService {
     const general = this.deps.config.general();
     const backend = this.deps.backends.get();
     const tag = recipeImageRef(general.imageNamespace, recipe.name);
+    const forced = Boolean(opts?.force || opts?.noCache || opts?.pull);
 
     return this.startJob('build', recipe.name, async (job) => {
       const context = this.recipeContext(recipe.name);
@@ -182,28 +259,47 @@ export class ImageService {
 
       // Remembered BEFORE the build so the image this tag is about to leave behind can be
       // collected afterwards (see removeReplacedImage).
-      const previousId = (await backend.inspectImage(tag).catch(() => null))?.id ?? null;
+      const existing = await backend.inspectImage(tag).catch(() => null);
+      const previousId = existing?.id ?? null;
 
       const contextHash = await hashContext(context);
+      if (!forced && existing && existing.labels[IMAGE_LABELS.contextHash] === contextHash) {
+        this.append(
+          job,
+          `${tag} is up to date (context hash ${contextHash.slice(0, 12)}); nothing to build. ` +
+            'Use force to rebuild anyway.',
+        );
+        await this.recordClaudeVersion(job, existing.id, null);
+        return;
+      }
+
       this.append(job, `building ${tag} (context hash ${contextHash.slice(0, 12)})`);
 
       const stream = this.contextStream(job, context);
+      let logged: string | null = null;
       await backend.buildImage({
         tag,
         context: stream,
         dockerfile: 'Dockerfile',
+        // No porterclaude.built-at label: it made every rebuild produce a different image
+        // id even when nothing changed, and it recorded the build START. The engine's
+        // own image Created timestamp is the build finish time and is used instead.
         labels: {
           [IMAGE_LABELS.recipe]: recipe.name,
           [IMAGE_LABELS.contextHash]: contextHash,
-          [IMAGE_LABELS.builtAt]: new Date().toISOString(),
         },
         pull: opts?.pull ?? false,
         noCache: opts?.noCache ?? false,
-        onLog: (line) => this.appendBuildLine(job, line),
+        onLog: (line) => {
+          logged = logged ?? versionFromBuildLine(line);
+          this.appendBuildLine(job, line);
+        },
         signal: job.abort.signal,
       });
       stream.destroy();
       this.append(job, `built ${tag}`);
+      const built = await backend.inspectImage(tag).catch(() => null);
+      await this.recordClaudeVersion(job, built?.id ?? null, logged);
       await this.removeReplacedImage(job, previousId, tag);
     });
   }
@@ -235,6 +331,7 @@ export class ImageService {
 
     let present = false;
     let claudeVersion: string | null = null;
+    let claudeChannel: string | null = null;
     let lastSyncedAt = this.lastToolsSyncAt;
     let imageHash: string | null = null;
     let built = false;
@@ -256,9 +353,10 @@ export class ImageService {
       try {
         const inspect = await backend.inspectImage(imageRef);
         built = Boolean(inspect);
-        claudeVersion = inspect?.labels[IMAGE_LABELS.claudeVersion] ?? null;
+        claudeVersion = this.claudeVersionOf(inspect?.id ?? null);
+        claudeChannel = inspect?.labels[IMAGE_LABELS.claudeVersion] ?? null;
         imageHash = inspect?.labels[IMAGE_LABELS.contextHash] ?? null;
-        lastSyncedAt = lastSyncedAt ?? inspect?.labels[IMAGE_LABELS.builtAt] ?? null;
+        lastSyncedAt = lastSyncedAt ?? inspect?.createdAt ?? inspect?.labels[IMAGE_LABELS.builtAt] ?? null;
       } catch (err) {
         this.deps.log.debug({ err, imageRef }, 'inspecting tools image failed');
       }
@@ -274,6 +372,7 @@ export class ImageService {
       present,
       lastSyncedAt,
       claudeVersion,
+      claudeChannel,
       contextHash,
       outdated,
       syncing: Boolean(job),
@@ -317,20 +416,26 @@ export class ImageService {
             : `context hash ${storedHash ? storedHash.slice(0, 12) : 'missing'} -> ${contextHash.slice(0, 12)}`;
         this.append(job, `building ${imageRef} (${why})`);
         const stream = this.contextStream(job, context);
+        let logged: string | null = null;
         await backend.buildImage({
           tag: imageRef,
           context: stream,
           dockerfile: 'Dockerfile',
+          // see buildRecipe: no built-at label, the engine's Created is the build finish
           labels: {
             [IMAGE_LABELS.contextHash]: contextHash,
-            [IMAGE_LABELS.builtAt]: new Date().toISOString(),
           },
           pull: Boolean(opts?.force),
           noCache: Boolean(opts?.force),
-          onLog: (line) => this.appendBuildLine(job, line),
+          onLog: (line) => {
+            logged = logged ?? versionFromBuildLine(line);
+            this.appendBuildLine(job, line);
+          },
           signal: job.abort.signal,
         });
         stream.destroy();
+        const built = await backend.inspectImage(imageRef).catch(() => null);
+        await this.recordClaudeVersion(job, built?.id ?? null, logged);
         await this.removeReplacedImage(job, previousId, imageRef);
       } else {
         this.append(job, `reusing existing image ${imageRef} (context hash ${contextHash.slice(0, 12)})`);
@@ -407,6 +512,96 @@ export class ImageService {
         `note: the previous image ${shortImageId(previousId)} is still in use and was kept ` +
           `(${errMessage(err)})`,
       );
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // the Claude Code version an image actually ships
+  // -------------------------------------------------------------------------
+
+  /**
+   * Cached real version of an image id.
+   *
+   * Reading it costs a one-shot container, so it is never done inline: a miss answers
+   * `null` and starts the read in the background, and the next poll of
+   * GET /api/images/recipes (or /tools) has the answer. A failed read is remembered for
+   * VERSION_RETRY_MS so a broken/rootless image cannot turn a poll into a container storm.
+   */
+  private claudeVersionOf(imageId: string | null): string | null {
+    if (!imageId) return null;
+    const entry = this.claudeVersions.get(imageId);
+    if (entry && (entry.version !== null || Date.now() - entry.at < VERSION_RETRY_MS)) {
+      return entry.version;
+    }
+    void this.probeClaudeVersion(imageId);
+    return entry?.version ?? null;
+  }
+
+  /**
+   * Record the version of a freshly built image. `logged` is what the build printed
+   * (docker/recipes/common.sh emits PORTERCLAUDE_CLAUDE_VERSION=<v>), which is free but
+   * absent from a cached build; otherwise the image is read.
+   */
+  private async recordClaudeVersion(job: JobRecord, imageId: string | null, logged: string | null): Promise<void> {
+    if (!imageId) return;
+    if (logged) {
+      this.claudeVersions.set(imageId, { version: logged, at: Date.now() });
+      this.append(job, `claude version: ${logged}`);
+      return;
+    }
+    const version = await this.probeClaudeVersion(imageId);
+    this.append(job, version ? `claude version: ${version}` : 'could not read the claude version of the image');
+  }
+
+  /** dedup wrapper around readClaudeVersion; never rejects. */
+  private async probeClaudeVersion(imageId: string): Promise<string | null> {
+    const inflight = this.versionProbes.get(imageId);
+    if (inflight) return inflight;
+    const probe = this.readClaudeVersion(imageId)
+      .catch((err: unknown) => {
+        this.deps.log.debug({ err, imageId }, 'reading the claude version of an image failed');
+        return null;
+      })
+      .then((version) => {
+        this.claudeVersions.set(imageId, { version, at: Date.now() });
+        this.versionProbes.delete(imageId);
+        return version;
+      });
+    this.versionProbes.set(imageId, probe);
+    return probe;
+  }
+
+  /**
+   * `cat /etc/porterclaude/claude-version` in a one-shot container built from the image -
+   * the only way to see a file inside an image. Deliberately its own entrypoint/cmd so it
+   * also works for the tools image (whose CMD would populate a volume).
+   */
+  private async readClaudeVersion(imageId: string): Promise<string | null> {
+    const backend = this.deps.backends.tryGet();
+    if (!backend) return null;
+    const name = `porterclaude-version-${shortId(4)}`;
+    let containerId: string | null = null;
+    try {
+      const created = await backend.createContainer({
+        name,
+        image: imageId,
+        entrypoint: ['/bin/sh', '-c'],
+        cmd: [VERSION_PROBE_CMD],
+        labels: { 'porterclaude.probe': 'true' },
+        restartPolicy: 'no',
+      });
+      containerId = created.id;
+      await backend.startContainer(containerId);
+      await backend.waitContainer(containerId);
+      return parseClaudeVersion(await backend.containerLogs(containerId, { tail: 20 }));
+    } finally {
+      if (containerId) {
+        try {
+          await backend.removeContainer(containerId, { force: true, removeVolumes: false });
+        } catch (err) {
+          this.deps.log.debug({ err, containerId }, 'removing the version probe container failed');
+        }
+      }
     }
   }
 

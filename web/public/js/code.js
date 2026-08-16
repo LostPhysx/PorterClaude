@@ -7,7 +7,7 @@ import { api } from './api.js';
 import { bus, EVENTS } from './bus.js';
 import { byId, toast, toastError, debounce, escapeHtml, storage, LS_PREFIX } from './util.js';
 import { TerminalPane, makeTerminalName } from './terminal.js';
-import { getSessions, reload as reloadSessions } from './sessions.js';
+import { getSessions, reload as reloadSessions, imageOutdated } from './sessions.js';
 import { getSettings } from './settings.js';
 
 /** localStorage key for the layout blob (server copy lives in settings.ui.layout). FROZEN. */
@@ -66,22 +66,20 @@ let restorePending = false;
 // ---------------------------------------------------------------------------
 // GoldenLayout module loading
 //
-// golden-layout ships `dist/esm/**` whose relative specifiers have no `.js`
-// extension (bundler-targeted) and - as of 2.6.0 - no prebuilt browser bundle,
-// so a plain `import` of it fails in a browser. We therefore try, in order:
-//   1. `/vendor/golden-layout/bundle/esm/golden-layout.js`  (the path api.md documents;
-//      present in bundled builds)
-//   2. `/vendor/golden-layout/esm/index.js`                 (works when the static mount
-//      resolves extensionless imports, see docs/design/requests/F2.md)
-//   3. a tiny in-page loader that fetches the (acyclic, 33 module) ESM graph and rewrites
-//      the relative specifiers to blob URLs.
+// golden-layout 2.6.0 ships `dist/esm/**` only - there is no `dist/bundle/`, so the
+// `bundle/esm/golden-layout.js` path older notes mention never existed and probing it just
+// logged a 404 on every page load (INT-04). api.md documents `/vendor/golden-layout/esm/index.js`
+// as THE entry; the vendor mount passes `extensions: ['js']` so the browser can resolve its
+// extensionless relative specifiers. We therefore try, in order:
+//   1. `/vendor/golden-layout/esm/index.js`  (a plain dynamic import - the normal path)
+//   2. a tiny in-page loader that fetches the (acyclic, 33 module) ESM graph and rewrites
+//      the relative specifiers to blob URLs (for servers without `extensions: ['js']`).
 // ---------------------------------------------------------------------------
 
-const GL_ENTRY_URLS = [
-  '/vendor/golden-layout/bundle/esm/golden-layout.js',
-  '/vendor/golden-layout/esm/index.js',
-];
-const GL_SHIM_ENTRY = '/vendor/golden-layout/esm/index.js';
+/** THE golden-layout ESM entry (api.md "Static assets"). FROZEN alongside VENDOR_ROUTES. */
+export const GL_ENTRY_URL = '/vendor/golden-layout/esm/index.js';
+const GL_ENTRY_URLS = [GL_ENTRY_URL];
+const GL_SHIM_ENTRY = GL_ENTRY_URL;
 
 /** `from './x'` / `import './x'` with a RELATIVE specifier (never touches other strings). */
 const REL_SPEC_RE = /\b(from|import)(\s*)(['"])(\.{1,2}\/[^'"]*)\3/g;
@@ -163,7 +161,7 @@ export async function loadGoldenLayout() {
       /* try the next strategy */
     }
   }
-  console.warn('[code] golden-layout has no browser bundle here; loading its ESM graph through a blob shim');
+  console.warn(`[code] ${GL_ENTRY_URL} did not import directly; loading the ESM graph through a blob shim`);
   // shimModule resolves specifiers with `new URL(spec, base)`, which needs an ABSOLUTE base.
   const entry = await shimModule(new URL(GL_SHIM_ENTRY, window.location.href).href);
   const mod = await import(entry);
@@ -584,7 +582,11 @@ function buildTerminalComponent(container, rawState) {
   container.on('resize', fitSoon);
   container.on('show', fitSoon);
   container.on('destroy', () => {
-    pane.dispose();
+    // Closing a pane on purpose must also end the shell inside the container (INT-06);
+    // a programmatic teardown (layout restore, reset, auth loss) must not, so that
+    // reopening the pane reattaches its tmux session. `suspendPersist` is set around every
+    // loadLayout()/clear(), and `suspended` covers the auth-loss teardown.
+    pane.dispose({ kill: !suspendPersist && !suspended });
     panes.delete(state.name);
     toggleEmpty();
     updateStatus();
@@ -664,11 +666,19 @@ function renderRail(sessions) {
     .map((s) => {
       const name = escapeHtml(s.name);
       const stopped = s.status !== 'running';
-      const title = escapeHtml(`${s.name} - ${s.status}${s.displayName ? ` (${s.displayName})` : ''}`);
+      // INT-01: never show the raw image id here - only whether a newer build is waiting.
+      const stale = imageOutdated(s);
+      const title = escapeHtml(
+        `${s.name} - ${s.status}${s.displayName ? ` (${s.displayName})` : ''}` +
+        (stale ? ' - image updated, recreate to pick it up' : ''),
+      );
+      const staleIcon = stale
+        ? '<i class="bi bi-arrow-repeat text-warning ms-1" title="image updated \u2014 recreate the container to pick it up" aria-label="image updated - recreate"></i>'
+        : '';
       return (
         `<div class="pc-rail-item${stopped ? ' is-stopped' : ''}" data-session="${name}" title="${title}">` +
         `<span class="pc-dot ${dotClass(s.status)}"></span>` +
-        `<span class="pc-rail-name text-truncate flex-grow-1">${name}</span>` +
+        `<span class="pc-rail-name text-truncate flex-grow-1">${name}${staleIcon}</span>` +
         '<span class="pc-rail-actions">' +
         `<button type="button" class="btn btn-sm btn-link p-0" data-open="bash" data-session="${name}" title="Open bash" aria-label="Open bash in ${name}"><i class="bi bi-terminal"></i></button>` +
         `<button type="button" class="btn btn-sm btn-link p-0 ms-1" data-open="claude" data-session="${name}" title="Open claude" aria-label="Open claude in ${name}"><i class="bi bi-stars"></i></button>` +

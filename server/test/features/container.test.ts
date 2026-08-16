@@ -176,6 +176,29 @@ describe('workspaceMountFor', () => {
     ).toBe('/srv/porterclaude/workspaces/proj');
   });
 
+  // INT-03: path.posix.join does not confine, so '../../../etc' used to be bind-mounted
+  // as /etc while the config claimed a path "under workspacesRoot". The API schema rejects
+  // such a path today, so these bypass it — exactly like a config.json stored before the
+  // rule existed, which is what this second line of defence is for.
+  const storedBind = (hostPath: string) => ({
+    ...sessionConfig(),
+    workspace: { type: 'bind' as const, hostPath },
+  });
+
+  it('refuses a relative host path that escapes workspacesRoot', () => {
+    for (const hostPath of ['../../../etc', 'a/../../..', '..']) {
+      expect(() => workspaceMountFor(storedBind(hostPath), general)).toThrowError(/escapes the workspaces root/);
+    }
+  });
+
+  it('keeps a relative path that stays inside, and normalises it', () => {
+    expect(workspaceMountFor(storedBind('a/../proj/'), general).source).toBe('/srv/porterclaude/workspaces/proj');
+  });
+
+  it('still allows any absolute host path (single admin user)', () => {
+    expect(workspaceMountFor(storedBind('/etc'), general).source).toBe('/etc');
+  });
+
   it('gives a git workspace a named volume', () => {
     const mount = workspaceMountFor(
       sessionConfig({ workspace: { type: 'git', url: 'https://example.com/x.git' } }),

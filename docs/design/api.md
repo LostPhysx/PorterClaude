@@ -183,6 +183,12 @@ Debug aid: `{ "routes": [ { "route": "/vendor/bootstrap", "dir": "…", "mounted
   "image": { "type": "recipe", "recipe": "node" },// or { "type":"custom", "ref":"nginx:1.27" }
   "workspace": { "type": "volume" },              // or {"type":"bind","hostPath":"/srv/x"}
                                                   // or {"type":"git","url":"…","branch":"main"}
+                                                  // hostPath: absolute = any host path;
+                                                  // relative = under `workspacesRoot`.
+                                                  // `.`/`..` segments, `\` and NUL are
+                                                  // rejected (422) and a relative path
+                                                  // that still resolves outside
+                                                  // `workspacesRoot` is a 400.
   "env": { "FOO": "bar" },                        // keys: ^[A-Za-z_][A-Za-z0-9_]*$
   "ports": [ { "containerPort": 3000, "hostPort": 3000, "protocol": "tcp" } ],
   "extraMounts": [ { "type": "volume", "source": "cache", "target": "/cache", "readOnly": false } ],
@@ -201,7 +207,13 @@ Debug aid: `{ "routes": [ { "route": "/vendor/bootstrap", "dir": "…", "mounted
   "createdAt": "2026-08-15T10:00:00.000Z", "updatedAt": "…", "specHash": "…",
   "status": "running",            // created|running|paused|restarting|removing|exited|dead|unknown|absent
   "containerId": "3f2a…", "containerName": "pc-web",
-  "resolvedImage": "porterclaude/node:latest",
+  "resolvedImage": "porterclaude/node:latest",   // STABLE ref: <ns>/<recipe>:latest, or
+                                                 // image.ref for a custom image
+  "containerImage": "sha256:8d4d875a6431",       // what docker says the container runs
+                                                 // (a bare digest after a rebuild); null
+                                                 // when there is no container
+  "imageOutdated": true,                         // the container runs an older image than
+                                                 // resolvedImage points at today
   "startedAt": "…", "uptimeSec": 3600,
   "runtimePorts": [ { "containerPort": 3000, "hostPort": 3000, "protocol": "tcp" } ],
   "needsRecreate": false, "orphan": false, "warnings": [] }
@@ -222,6 +234,11 @@ Debug aid: `{ "routes": [ { "route": "/vendor/bootstrap", "dir": "…", "mounted
 | POST | `/api/sessions/reconcile` | – | `{ "report": { "known": 3, "running": 2, "orphans": [], "adopted": ["x"], "missing": ["y"] } }` |
 
 Notes
+* `resolvedImage` is never the raw docker value: a recipe rebuild retags
+  `<ns>/<recipe>:latest`, after which docker reports a bare `sha256:…` for every container
+  created before it. That digest is `containerImage`; `imageOutdated` says whether
+  recreating the session would pick up a newer image (`false` without a container, and
+  `false` while the image ref cannot be inspected).
 * `PUT` = edit = **recreate**: stop → remove container (volumes kept) → create → start if
   it was running or `autoStart`. `name` is immutable; a rename is a new session.
 * `DELETE` removes the container and the stored definition; `removeVolumes=1` also deletes
@@ -249,14 +266,31 @@ Notes
   "name": "node", "title": "Node.js 22", "description": "…", "baseImage": "node:22-bookworm",
   "defaultPorts": [], "imageRef": "porterclaude/node:latest",
   "built": true, "imageId": "sha256:…", "builtAt": "2026-08-14T…", "sizeBytes": 1234567890,
-  "claudeVersion": "1.2.3", "outdated": false, "building": false, "jobId": null } ] }
+  "claudeVersion": "2.1.233", "claudeChannel": "stable",
+  "outdated": false, "building": false, "jobId": null } ] }
 ```
 `outdated` = the image's `porterclaude.context-hash` label differs from the hash of the
 current `docker/recipes/<name>` context (plus `common.sh`).
 
+`builtAt` is the image's **Created** timestamp, i.e. when the build finished.
+
+`claudeVersion` is the Claude Code version the image really ships, read out of
+`/etc/porterclaude/claude-version` inside it (the tools image: `/payload/VERSION`);
+`claudeChannel` is what the build *asked* for (`stable`, `latest` or an exact version, from
+the `porterclaude.claude-version` label) and is never a real version. Reading the file
+needs a one-shot container, so `claudeVersion` may be `null` on the first call after a
+server restart and is filled in for the next poll — treat `null` as "not known yet", not as
+"no claude".
+
 ### `POST /api/images/recipes/:name/build`
-Body `{ "noCache"?: boolean, "pull"?: boolean }` → `202 { "job": JobSummary }`.
+Body `{ "noCache"?: boolean, "pull"?: boolean, "force"?: boolean }` → `202 { "job": JobSummary }`.
 `409 conflict` when a build for that recipe is already running.
+
+A build whose context hash still matches the built image is **skipped** (the job succeeds
+and logs `… is up to date`): rebuilding an unchanged recipe would only produce a new image
+id, untag the image every existing session runs and leave those sessions on an
+orphaned image. `force`, `noCache` or `pull` build unconditionally — that is how a new base
+image is picked up.
 
 ### Jobs (build / pull / tools-sync)
 `JobSummary`:
@@ -277,13 +311,16 @@ streamed — `since`/`nextIndex` give an append-only cursor.
 `GET /api/images/tools` →
 ```json
 { "status": { "volume": "porterclaude-tools", "imageRef": "porterclaude/tools:latest",
-              "present": true, "lastSyncedAt": "…", "claudeVersion": "1.2.3",
+              "present": true, "lastSyncedAt": "…", "claudeVersion": "2.1.233",
+              "claudeChannel": "stable",
               "contextHash": "9f86d081…", "outdated": false,
               "syncing": false, "jobId": null } }
 ```
 `contextHash` is the hash of the current `docker/tools` context; `outdated` = the image's
 stored `porterclaude.context-hash` differs from it (or the volume is populated from an image
-that no longer exists) — the same rule as `RecipeStatus.outdated`.
+that no longer exists) — the same rule as `RecipeStatus.outdated`. `claudeVersion` /
+`claudeChannel` / `lastSyncedAt` follow the `RecipeStatus` rules above (`lastSyncedAt`
+falls back to the image's Created timestamp until this process has run a sync).
 
 `POST /api/images/tools/sync` body `{ "force"?: boolean }` → `202 { "job": JobSummary }`.
 The sync **rebuilds `<ns>/tools:latest` whenever it is missing or outdated** and only then
@@ -331,7 +368,15 @@ Upgrade: websocket          Cookie: pc_session=…   (sent automatically, same o
 { "type": "resize", "cols": 120, "rows": 32 }
 { "type": "ping" }
 { "type": "signal", "signal": "SIGINT" }
+{ "type": "kill" }
 ```
+
+`kill` = **the user closed this pane**. The server runs `tmux kill-session -t pc_<name>`
+and closes the socket with `1000`, so the pane's shell (and everything running in it) does
+not stay alive in the container forever. Closing the socket with code `4001` does the same
+thing and is the fallback for a pane teardown that cannot send a frame first. Nothing else
+ever kills a tmux session: a reload, a lost connection or a normal close (`1000`) leave it
+running, which is what makes reconnecting re-attach.
 
 `ServerMessage`:
 ```json
@@ -358,12 +403,19 @@ the shell exited.
 | code | meaning |
 |---|---|
 | 1000 | normal (the shell itself exited, or the client closed the socket) |
+| 4001 | client → server: the user closed the pane — kill `pc_<name>` (same as `{"type":"kill"}`) |
 | 4400 | bad request (invalid query) |
 | 4401 | unauthorized — the upgrade is rejected with an HTTP `401` before the handshake |
 | 4404 | session not found |
 | 4409 | session exists but is not running |
 | 4502 | backend error (Docker/Portainer) |
 | 4500 | internal error |
+
+Client side (INT-06): `TerminalPane.dispose({ kill: true })` sends the `kill` frame and then
+closes with `4001`. `code.js` passes `kill: true` **only** for an explicit pane close (the
+tab close button, the "Close pane" note action); a layout restore, a `resetLayout()` and the
+auth-loss teardown dispose without it, so those panes reattach when they come back. Nothing
+is sent when the socket is not open — there is no live exec to kill from the client's side.
 
 ### Reconnect semantics
 
@@ -451,3 +503,29 @@ unless a bullet says otherwise.
 
 6. **`GET /api/settings/vendor`** is used by QA as the vendor-mount smoke test; please keep
    `mounted:false` entries in the response rather than omitting them.
+
+7. **`SessionView` image identity (INT-01).** The UI no longer renders `resolvedImage` when
+   it is a bare `sha256:…` digest — that happens for every session created before a recipe
+   rebuild and reads as noise. It renders the *recipe ref* instead plus an
+   "image updated — recreate" badge. It reads, in order of preference and all optional:
+
+   * `SessionView.imageRef` — the ref the session's image spec points at *now*
+     (`RecipeStatus.imageRef` for `image.type === 'recipe'`, `image.ref` for custom).
+   * `SessionView.imageOutdated` (aliases accepted: `imageUpdated`, `imageStale`,
+     `resolvedImageOutdated`) — `true` when the container runs an image id that is no longer
+     what `imageRef` resolves to, i.e. recreating the container would pick up a newer build.
+
+   **Answered (backend, 2026-08-16).** `resolvedImage` IS that stable ref now — it is never
+   a digest — so the requested `imageRef` is not added as a second name for the same value.
+   `SessionView.imageOutdated` exists exactly as described, and `SessionView.containerImage`
+   carries the raw docker value (the bare digest) for anyone who wants to show it. The
+   client-side derivation ("`resolvedImage` looks like a digest") no longer fires and can be
+   dropped. A cached rebuild also no longer moves the tag at all
+   (`POST /api/images/recipes/:name/build` skips it), so the flag only appears after a
+   build that really changed something.
+
+   **Confirmed (frontend, 2026-08-16).** The UI renders `resolvedImage` plus an
+   "image updated — recreate" badge driven by `imageOutdated`, in the Sessions table and as
+   a ⟳ marker in the Code tab's session rail; it never renders `containerImage`. The
+   digest-looking-`resolvedImage` derivation is kept only as an inert fallback for an older
+   server, so the two sides can ship independently.

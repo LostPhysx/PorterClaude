@@ -43,6 +43,7 @@ const ClientMessageSchema = z.discriminatedUnion('type', [
   }),
   z.object({ type: z.literal('ping') }),
   z.object({ type: z.literal('signal'), signal: z.literal('SIGINT') }),
+  z.object({ type: z.literal('kill') }),
 ]);
 
 /**
@@ -163,6 +164,10 @@ async function handleConnection(ws: WebSocket, req: IncomingMessage, ctx: AppCon
   let terminalId: string | null = null;
   let closed = false;
   let lastPong = Date.now();
+  /** the user closed the pane (kill message / close code 4001) -> end the tmux session */
+  let killRequested = false;
+  /** set once the query parsed; kill needs the session + pane name */
+  let target: { session: string; name: string } | null = null;
 
   const cleanup = (): void => {
     if (closed) return;
@@ -175,6 +180,11 @@ async function handleConnection(ws: WebSocket, req: IncomingMessage, ctx: AppCon
       } catch (err) {
         log.debug({ err }, 'closing exec stream failed');
       }
+    }
+    // Only an EXPLICIT close ends the shell: a reload or a dropped connection must leave
+    // the tmux session alone, that is what makes re-attaching work (INT-06).
+    if (killRequested && target) {
+      void ctx.terminals.killTmuxSession(target.session, target.name);
     }
   };
 
@@ -198,7 +208,8 @@ async function handleConnection(ws: WebSocket, req: IncomingMessage, ctx: AppCon
   ws.on('error', (err) => {
     log.debug({ err }, 'terminal websocket error');
   });
-  ws.on('close', () => {
+  ws.on('close', (code: number) => {
+    if (code === TERMINAL_CLOSE.paneClosed) killRequested = true;
     cleanup();
   });
 
@@ -213,6 +224,7 @@ async function handleConnection(ws: WebSocket, req: IncomingMessage, ctx: AppCon
       return;
     }
     query = parsed.data;
+    target = { session: query.session, name: query.name };
   } catch {
     fail(ws, 'bad_request', 'invalid terminal query', TERMINAL_CLOSE.badRequest);
     cleanup();
@@ -368,6 +380,16 @@ async function handleConnection(ws: WebSocket, req: IncomingMessage, ctx: AppCon
           break;
         case 'signal':
           stream.write('\x03');
+          break;
+        case 'kill':
+          // the pane is gone for good: cleanup() kills pc_<name> after the socket closed
+          killRequested = true;
+          try {
+            ws.close(TERMINAL_CLOSE.normal, 'pane closed');
+          } catch {
+            /* ignore */
+          }
+          cleanup();
           break;
       }
     } catch (err) {

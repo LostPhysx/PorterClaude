@@ -9,14 +9,22 @@ import { parseBody, parseParams, parseQuery } from '../http/validate.js';
 const RecipeParams = z.object({ name: z.string().min(1).max(64) });
 const JobParams = z.object({ id: z.string().min(1).max(64) });
 const SinceQuery = z.object({ since: z.coerce.number().int().min(0).optional().default(0) });
-const BuildBody = z.object({ noCache: z.boolean().optional(), pull: z.boolean().optional() }).default({});
+const BuildBody = z
+  .object({
+    noCache: z.boolean().optional(),
+    pull: z.boolean().optional(),
+    /** build even when the context hash still matches the built image */
+    force: z.boolean().optional(),
+  })
+  .default({});
 const SyncBody = z.object({ force: z.boolean().optional() }).default({});
 const ImageBody = z.object({ image: z.string().min(1).max(400) });
 
 /**
  * GET  /api/images                       -> { images: ImageSummary[] }
  * GET  /api/images/recipes               -> { recipes: RecipeStatus[] }
- * POST /api/images/recipes/:name/build   { noCache?, pull? } -> 202 { job: JobSummary }
+ * POST /api/images/recipes/:name/build   { noCache?, pull?, force? } -> 202 { job: JobSummary }
+ *   (a build whose context hash still matches the built image is skipped unless forced)
  * GET  /api/images/jobs                  -> { jobs: JobSummary[] }
  * GET  /api/images/jobs/:id?since=<n>    -> { job, lines, nextIndex }
  * POST /api/images/jobs/:id/cancel       -> { job: JobSummary }

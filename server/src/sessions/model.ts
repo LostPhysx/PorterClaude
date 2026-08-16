@@ -28,13 +28,53 @@ export const ImageRefSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('custom'), ref: z.string().min(1) }),
 ]);
 
+/**
+ * A bind workspace host path: absolute (a path ON THE DOCKER HOST) or relative to
+ * `general.workspacesRoot`.
+ *
+ * `.`/`..` segments are rejected for the same reason the path-like general settings reject
+ * them (config/schema.ts): a relative `../../../etc` is joined to workspacesRoot and would
+ * silently resolve to `/etc`, i.e. the documented "relative = under workspacesRoot"
+ * contract would not hold. Backslashes and NUL are rejected because they cannot appear in
+ * a POSIX host path the engine can bind-mount. container.ts additionally resolves the path
+ * and asserts it stays under workspacesRoot (defence in depth for stored configs, which
+ * are validated laxly on purpose - see SessionConfigSchema).
+ */
+export const WorkspaceHostPathSchema = z
+  .string()
+  .min(1)
+  .max(512)
+  .refine((p) => !/[\0\\]/.test(p), 'hostPath must not contain a backslash or a NUL byte')
+  .refine(
+    (p) => p.split('/').every((seg) => seg !== '.' && seg !== '..'),
+    "hostPath must not contain '.' or '..' segments",
+  );
+
+/** named volume; `volume` defaults to porterclaude-ws-<session> */
+const VolumeWorkspaceSchema = z.object({ type: z.literal('volume'), volume: z.string().min(1).optional() });
+/** named volume seeded by cloning a git repo on first start */
+const GitWorkspaceSchema = z.object({
+  type: z.literal('git'),
+  url: z.string().min(1),
+  branch: z.string().min(1).optional(),
+  volume: z.string().min(1).optional(),
+});
+/** bind mount of a path ON THE DOCKER HOST (or relative to general.workspacesRoot) */
+const BindWorkspaceSchema = z.object({ type: z.literal('bind'), hostPath: WorkspaceHostPathSchema });
+
 export const WorkspaceSchema = z.discriminatedUnion('type', [
-  /** named volume; `volume` defaults to porterclaude-ws-<session> */
-  z.object({ type: z.literal('volume'), volume: z.string().min(1).optional() }),
-  /** bind mount of a path ON THE DOCKER HOST */
+  VolumeWorkspaceSchema,
+  BindWorkspaceSchema,
+  GitWorkspaceSchema,
+]);
+
+/** Stored form: see SessionConfigSchema - a config.json written before the hostPath rule
+ *  existed must not quarantine the whole file. buildContainerSpec still refuses to mount
+ *  a path that escapes workspacesRoot. */
+export const WorkspaceStoredSchema = z.discriminatedUnion('type', [
+  VolumeWorkspaceSchema,
   z.object({ type: z.literal('bind'), hostPath: z.string().min(1) }),
-  /** named volume seeded by cloning a git repo on first start */
-  z.object({ type: z.literal('git'), url: z.string().min(1), branch: z.string().min(1).optional(), volume: z.string().min(1).optional() }),
+  GitWorkspaceSchema,
 ]);
 
 export const LimitsSchema = z.object({
@@ -76,6 +116,10 @@ export const SessionConfigSchema = SessionInputSchema.extend({
    *  env var the engine accepted before this rule existed, and rejecting it here would
    *  fail AppConfigSchema and quarantine the whole config.json. */
   env: z.record(z.string(), z.string()).default({}),
+  /** laxer than the input for the same reason as `env`: an existing config.json (or an
+   *  adopted container) may carry a hostPath that today's rule rejects, and failing here
+   *  would quarantine every stored session. */
+  workspace: WorkspaceStoredSchema.default({ type: 'volume' }),
   createdAt: z.string(),
   updatedAt: z.string(),
   /** sha256 of the normalised spec that produced the running container */
@@ -93,8 +137,18 @@ export interface SessionView extends SessionConfig {
   status: ContainerState | 'absent';
   containerId: string | null;
   containerName: string;
-  /** the concrete image ref the container runs / would run */
+  /**
+   * The STABLE image ref of this session: `<imageNamespace>/<recipe>:latest` for a recipe,
+   * the custom ref otherwise. Deliberately not what docker reports for the container: a
+   * recipe rebuild untags the image the container runs, and docker then answers a bare
+   * `sha256:…` digest that means nothing to a user (see containerImage/imageOutdated).
+   */
   resolvedImage: string;
+  /** what docker says the container runs — a ref or, after a rebuild, a bare `sha256:…` */
+  containerImage: string | null;
+  /** the container runs an older image than `resolvedImage` resolves to today: recreate
+   *  the session to pick the new one up (never true without a container) */
+  imageOutdated: boolean;
   startedAt: string | null;
   uptimeSec: number | null;
   runtimePorts: PortBinding[];

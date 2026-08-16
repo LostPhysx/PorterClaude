@@ -206,6 +206,20 @@ describe('TerminalService.open PATH handling (BE-6)', () => {
     expect(exec.user).toBe('1000:1000');
   });
 
+  // INT-06: only an explicit pane close reaches this; a reload must never call it.
+  it('kills the tmux session of a closed pane', async () => {
+    const { terminals, sb } = makeTerminals(false);
+    await expect(terminals.killTmuxSession('usr', 'usr-bash-2')).resolves.toBe(true);
+    const exec = sb.log.filter((c) => c.method === 'runExec').pop()!.args[1] as string[];
+    expect(exec[2]).toContain('tmux kill-session -t');
+    expect(exec[2]).toContain("'pc_usr-bash-2'");
+  });
+
+  it('swallows a kill for a session that is not running', async () => {
+    const { terminals } = makeTerminals(false);
+    await expect(terminals.killTmuxSession('gone', 'main')).resolves.toBe(false);
+  });
+
   it('leaves a recipe session alone', async () => {
     const { terminals, sb } = makeTerminals(false);
     await terminals.open({ session: 'usr', shell: 'claude', name: 'main', cols: 80, rows: 24 });

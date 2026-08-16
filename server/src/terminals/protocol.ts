@@ -28,7 +28,14 @@ export type ClientMessage =
   | { type: 'resize'; cols: number; rows: number }
   | { type: 'ping' }
   /** optional convenience; server writes the matching control byte to stdin */
-  | { type: 'signal'; signal: 'SIGINT' };
+  | { type: 'signal'; signal: 'SIGINT' }
+  /**
+   * The USER closed this pane (not a reload, not a lost connection): end the shell for
+   * good. The server runs `tmux kill-session -t pc_<name>` and closes the socket, so the
+   * pane's processes do not keep running in the container forever. A plain disconnect
+   * never kills anything — that is what makes a reload re-attach.
+   */
+  | { type: 'kill' };
 
 export type ServerMessage =
   | {
@@ -61,6 +68,9 @@ export type TerminalErrorCode =
 /** WebSocket close codes used by the server (4xxx = application range). */
 export const TERMINAL_CLOSE = {
   normal: 1000,
+  /** client -> server: the user closed the pane; equivalent to a `kill` message (the
+   *  browser cannot always send one before it closes the socket) */
+  paneClosed: 4001,
   unauthorized: 4401,
   badRequest: 4400,
   sessionNotFound: 4404,

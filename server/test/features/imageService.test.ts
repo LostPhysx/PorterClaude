@@ -3,7 +3,7 @@ import { describe, expect, it, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { ImageService } from '../../src/images/service.js';
+import { ImageService, parseClaudeVersion } from '../../src/images/service.js';
 import { RECIPES } from '../../src/images/recipes.js';
 import { IMAGE_LABELS } from '../../src/sessions/model.js';
 import { hashContext } from '../../src/images/tarContext.js';
@@ -85,8 +85,11 @@ describe('recipeStatuses', () => {
     const node = (await service.recipeStatuses()).find((s) => s.name === 'node');
     expect(node?.built).toBe(true);
     expect(node?.outdated).toBe(false);
-    expect(node?.claudeVersion).toBe('1.2.3');
-    expect(node?.builtAt).toBe('2026-02-02T00:00:00.000Z');
+    // the label only says WHAT WAS REQUESTED; the installed version is read from the image
+    expect(node?.claudeChannel).toBe('1.2.3');
+    // the engine's image Created is the build FINISH time; the legacy built-at label
+    // (build start) is only a fallback for images built before this changed
+    expect(node?.builtAt).toBe('2026-01-01T00:00:00.000Z');
 
     sb.images.set('porterclaude/node:latest', imageInspect({ labels: { [IMAGE_LABELS.contextHash]: 'stale' } }));
     expect((await service.recipeStatuses()).find((s) => s.name === 'node')?.outdated).toBe(true);
@@ -158,7 +161,9 @@ describe('buildRecipe', () => {
     expect(opts.tag).toBe('porterclaude/node:latest');
     expect(opts.labels[IMAGE_LABELS.recipe]).toBe('node');
     expect(opts.labels[IMAGE_LABELS.contextHash]).toMatch(/^[0-9a-f]{64}$/);
-    expect(opts.labels[IMAGE_LABELS.builtAt]).toBeTruthy();
+    // no built-at label: it changed on every rebuild and therefore produced a new image id
+    // even for a fully cached build (INT-01)
+    expect(opts.labels[IMAGE_LABELS.builtAt]).toBeUndefined();
     expect(service.getJob(job.id)?.status).toBe('success');
   });
 
@@ -190,6 +195,142 @@ describe('buildRecipe', () => {
     const finished = service.getJob(job.id);
     expect(finished?.status).toBe('error');
     expect(finished?.error).toContain('does not exist');
+  });
+});
+
+/** hash of the temporary node recipe context (dir + common.sh), as the service computes it. */
+async function nodeContextHash(): Promise<string> {
+  return hashContext({
+    dir: path.join(dockerDir, 'recipes', 'node'),
+    extraFiles: [{ source: path.join(dockerDir, 'recipes', 'common.sh'), name: 'common.sh' }],
+  });
+}
+
+describe('a rebuild whose context did not change (INT-01)', () => {
+  // A fully cached rebuild used to produce a NEW image id (the built-at label changed),
+  // which untagged the image every existing session runs.
+  it('skips the build and leaves the image alone', async () => {
+    const { service, sb } = makeService();
+    sb.images.set(
+      'porterclaude/node:latest',
+      imageInspect({ id: 'sha256:built', labels: { [IMAGE_LABELS.contextHash]: await nodeContextHash() } }),
+    );
+
+    const job = await service.buildRecipe('node');
+    await settle(service, job.id);
+
+    expect(service.getJob(job.id)?.status).toBe('success');
+    expect(sb.calls).not.toContain('buildImage');
+    expect(sb.calls).not.toContain('removeImage');
+    expect(service.getJobLines(job.id).lines.join(' ')).toContain('up to date');
+    expect((await service.recipeStatuses()).find((s) => s.name === 'node')?.imageId).toBe('sha256:built');
+  });
+
+  it.each([{ force: true }, { noCache: true }, { pull: true }])('builds anyway with %o', async (opts) => {
+    const { service, sb } = makeService();
+    sb.images.set(
+      'porterclaude/node:latest',
+      imageInspect({ id: 'sha256:built', labels: { [IMAGE_LABELS.contextHash]: await nodeContextHash() } }),
+    );
+    const job = await service.buildRecipe('node', opts);
+    await settle(service, job.id);
+    expect(service.getJob(job.id)?.status).toBe('success');
+    expect(sb.calls).toContain('buildImage');
+  });
+
+  it('builds when the context hash moved on', async () => {
+    const { service, sb } = makeService();
+    sb.images.set('porterclaude/node:latest', imageInspect({ labels: { [IMAGE_LABELS.contextHash]: 'stale' } }));
+    const job = await service.buildRecipe('node');
+    await settle(service, job.id);
+    expect(sb.calls).toContain('buildImage');
+  });
+});
+
+describe('the claude version an image really ships (INT-02)', () => {
+  /** a backend whose build produces an image and whose containers print `version`. */
+  function versionBackend(version: string, opts: { logMarker?: string } = {}) {
+    const sb = stubBackend({
+      buildImage: async (build) => {
+        if (opts.logMarker) build.onLog?.({ stream: `${opts.logMarker}\n` });
+        sb.images.set(build.tag, imageInspect({ id: 'sha256:new', tags: [build.tag] }));
+      },
+      containerLogs: async () => version,
+    });
+    return sb;
+  }
+
+  it('reads it out of the built image with a one-shot container', async () => {
+    const sb = versionBackend('2.1.233 (Claude Code)');
+    const { service } = makeService(sb);
+    const job = await service.buildRecipe('node');
+    await settle(service, job.id);
+
+    const created = sb.log.find((c) => c.method === 'createContainer')?.args[0] as {
+      image: string;
+      cmd: string[];
+    };
+    expect(created.image).toBe('sha256:new');
+    expect(created.cmd.join(' ')).toContain('/etc/porterclaude/claude-version');
+    expect(sb.calls).toContain('removeContainer');
+    expect(service.getJobLines(job.id).lines.join(' ')).toContain('claude version: 2.1.233');
+
+    const node = (await service.recipeStatuses()).find((s) => s.name === 'node');
+    expect(node?.claudeVersion).toBe('2.1.233');
+  });
+
+  it('takes it from the build output when the build printed it (no extra container)', async () => {
+    const sb = versionBackend('unused', { logMarker: '[porterclaude] PORTERCLAUDE_CLAUDE_VERSION=2.1.233' });
+    const { service } = makeService(sb);
+    const job = await service.buildRecipe('node');
+    await settle(service, job.id);
+
+    expect(sb.calls).not.toContain('createContainer');
+    expect((await service.recipeStatuses()).find((s) => s.name === 'node')?.claudeVersion).toBe('2.1.233');
+  });
+
+  it('reads an image built by an earlier process in the background', async () => {
+    const sb = versionBackend('2.1.233');
+    const { service } = makeService(sb);
+    sb.images.set('porterclaude/node:latest', imageInspect({ id: 'sha256:old-build' }));
+
+    // the first call must not block on a container: it answers null and starts the read
+    expect((await service.recipeStatuses()).find((s) => s.name === 'node')?.claudeVersion).toBeNull();
+
+    let version: string | null = null;
+    for (let i = 0; i < 50 && version === null; i += 1) {
+      await new Promise((r) => setTimeout(r, 10));
+      version = (await service.recipeStatuses()).find((s) => s.name === 'node')?.claudeVersion ?? null;
+    }
+    expect(version).toBe('2.1.233');
+    // …and it is cached: repeated polling does not start a container per poll
+    const containers = sb.calls.filter((c) => c === 'createContainer').length;
+    await service.recipeStatuses();
+    expect(sb.calls.filter((c) => c === 'createContainer').length).toBe(containers);
+  });
+
+  it('stays null when the image records no version', async () => {
+    const sb = versionBackend('cat: /etc/porterclaude/claude-version: No such file');
+    const { service } = makeService(sb);
+    const job = await service.buildRecipe('node');
+    await settle(service, job.id);
+    expect((await service.recipeStatuses()).find((s) => s.name === 'node')?.claudeVersion).toBeNull();
+    expect(service.getJobLines(job.id).lines.join(' ')).toContain('could not read the claude version');
+  });
+});
+
+describe('parseClaudeVersion', () => {
+  it.each([
+    ['2.1.233\n', '2.1.233'],
+    ['2.1.233 (Claude Code)', '2.1.233'],
+    ['      2.1.233', '2.1.233'],
+    ['1.0.0-beta.2', '1.0.0-beta.2'],
+  ])('reads %j as %j', (raw, expected) => {
+    expect(parseClaudeVersion(raw)).toBe(expected);
+  });
+
+  it.each(['', '\n\n', 'log output', 'cat: no such file'])('ignores %j', (raw) => {
+    expect(parseClaudeVersion(raw)).toBeNull();
   });
 });
 
