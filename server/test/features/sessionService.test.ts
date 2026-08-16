@@ -594,6 +594,62 @@ describe('SessionService custom-image bootstrap (BE-6)', () => {
     expect(spec.env?.PATH).toBe('/opt/porterclaude/bin:/home/dev/.local/bin:/usr/bin:/bin');
   });
 
+  it('installs the root-only tools bits (profile.d snippet + /usr/local/bin/claude)', async () => {
+    const { service, sb } = makeService();
+    sb!.images.set('alpine:3.20', imageInspect({ tags: ['alpine:3.20'], env: ['PATH=/usr/bin:/bin'] }));
+
+    await service.create(
+      sessionInput({ name: 'usr', image: { type: 'custom', ref: 'alpine:3.20' }, user: '1000:1000' }),
+    );
+
+    const script = homeExecs(sb!)
+      .map((c) => ({ script: String((c.args[1] as string[])[2]), opts: c.args[2] as { user?: string } }))
+      .find((c) => c.script.includes('/etc/profile.d/porterclaude.sh'));
+    expect(script).toBeTruthy();
+    expect(script!.opts.user).toBe('0'); // only uid 0 can write either path
+    // a login shell whose /etc/profile hard-sets PATH (alpine, debian) still finds claude
+    expect(script!.script).toContain('export PATH="/opt/porterclaude/bin:/home/dev/.local/bin:$PATH"');
+    // ...but only once: the container env and $HOME/.profile carry the prefix as well
+    expect(script!.script).toContain('*":/opt/porterclaude/bin:"*) ;;');
+    // and so does an exec that starts from the standard PATH
+    expect(script!.script).toContain('exec "/opt/porterclaude/bin/claude" "$@"');
+    expect(script!.script).toContain('/usr/local/bin/claude');
+    // marker guard: never clobber a claude binary or profile snippet the image shipped
+    expect(script!.script).toContain('grep -q "porterclaude (generated)"');
+  });
+
+  it('re-runs the bootstrap on restart, but never adopts an orphan doing so', async () => {
+    const stored = sessionConfig({
+      name: 'usr',
+      image: { type: 'custom', ref: 'alpine:3.20' },
+      user: '1000:1000',
+    });
+    const container = containerSummary({
+      id: 'c-usr',
+      name: 'pc-usr',
+      names: ['pc-usr'],
+      image: 'alpine:3.20',
+      labels: { 'porterclaude.managed': 'true', 'porterclaude.session': 'usr' },
+    });
+
+    const withConfig = makeService({ sessions: [stored] });
+    withConfig.sb!.containers.push(container);
+    await withConfig.service.restart('usr');
+    expect(withConfig.sb!.calls).toContain('restartContainer');
+    expect(
+      homeExecs(withConfig.sb!).some((c) =>
+        String((c.args[1] as string[])[2]).includes('/etc/profile.d/porterclaude.sh'),
+      ),
+    ).toBe(true);
+
+    // the same container without a stored config: restart must not persist a definition
+    const orphaned = makeService();
+    orphaned.sb!.containers.push(container);
+    await orphaned.service.restart('usr');
+    expect(orphaned.sb!.calls).toContain('restartContainer');
+    expect(orphaned.cfg.sessions.has('usr')).toBe(false);
+  });
+
   it('does not touch the home of a root custom image or of a recipe session', async () => {
     const { service, sb } = makeService();
     sb!.images.set('alpine:3.20', imageInspect({ tags: ['alpine:3.20'] }));

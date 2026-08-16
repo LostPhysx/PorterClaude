@@ -10,7 +10,8 @@ ENV LANG=C.UTF-8 \
     PORTERCLAUDE_RECIPE=php \
     PC_HTTP_PORT=80 \
     COMPOSER_HOME=/home/dev/.composer \
-    COMPOSER_ALLOW_SUPERUSER=0
+    COMPOSER_ALLOW_SUPERUSER=0 \
+    PORTERCLAUDE_PATH_EXTRA=/home/dev/.composer/vendor/bin
 
 COPY common.sh /tmp/common.sh
 RUN bash /tmp/common.sh && rm -f /tmp/common.sh
@@ -77,7 +78,7 @@ COPY supervisord.conf /etc/supervisor/supervisord.conf
 COPY www/index.php /workspace/public/index.php
 
 # every path the runtime user writes to must be owned by uid 1000 (or live under /tmp)
-RUN mkdir -p /workspace/public /tmp/nginx /home/dev/.composer /var/log/nginx /var/lib/nginx \
+RUN mkdir -p /workspace/public /tmp/nginx /home/dev/.composer/vendor/bin /var/log/nginx /var/lib/nginx \
  && chown -R 1000:1000 /workspace /home/dev /var/log/nginx /var/lib/nginx /tmp/nginx \
  && chmod 0644 /etc/nginx/nginx.conf /etc/supervisor/supervisord.conf
 

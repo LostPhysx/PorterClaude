@@ -71,9 +71,17 @@ the container** — every step logs on failure and continues:
    (`/root` for the root images most people use) would put the Claude credentials outside
    them and break "log in once, every session is authenticated". The server pins the same
    `HOME` in the container env, so `docker exec`ed terminals agree;
-2. puts `$PORTERCLAUDE_TOOLS/bin` on `PATH` and persists it for login shells
-   (`/etc/profile.d/porterclaude.sh`, `~/.profile`, `~/.bashrc`, each guarded by a marker so
-   restarts do not duplicate lines);
+2. puts `$PORTERCLAUDE_TOOLS/bin` on `PATH` **together with the PATH the container was created
+   with** (the server pins `<tools>/bin` + the image's own `ENV PATH` there) and persists both
+   for login shells (`/etc/profile.d/porterclaude.sh`, `~/.profile`, `~/.bashrc`, each guarded
+   by a marker so restarts do not duplicate lines). Baking the image PATH in is not optional:
+   `/etc/profile` on Debian & co *replaces* `PATH` with a fixed list, so a snippet that only
+   re-added the tools directory would leave e.g. a `golang:1.23-bookworm` session without
+   `/usr/local/go/bin` — `which go` in a terminal would fail although PID 1 has it. The
+   snippet ships a `pc_path_compose` helper that drops empty and duplicate entries, so
+   sourcing it twice (login shell + `~/.bashrc`) cannot grow `PATH`. The marker carries a
+   version (`porterclaude (generated v2)`), so a container bootstrapped by an older tools
+   volume gets the new block appended instead of being skipped;
 3. as root, drops a `/usr/local/bin/claude` wrapper for non-login shells;
 4. best-effort installs `git` and `tmux` when missing and only when root, via the first of
    `apt-get / apk / dnf / microdnf / yum / zypper / pacman` it finds, with a 300 s timeout and

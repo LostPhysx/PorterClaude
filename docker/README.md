@@ -32,6 +32,23 @@ recipes, so the Images panel flips every one of them to *outdated*. That is inte
 uid-1000 account such as `node` is *renamed*, never deleted), Claude Code via the native
 installer, `/etc/profile.d/porterclaude.sh` and `/usr/local/bin/pc-entrypoint.sh`.
 
+### PATH in terminals
+
+Terminals open **login** shells, and Debian's `/etc/profile` unconditionally *replaces* `PATH`
+with `/usr/local/bin:/usr/bin:/bin:…` — everything the base image put into its `ENV PATH`
+(`golang`: `/usr/local/go/bin`, which has no symlink in `/usr/local/bin`) is gone by then. So
+`common.sh` bakes the **build-time** `PATH` into `/etc/profile.d/porterclaude.sh` and rebuilds
+it there as
+
+```
+$HOME/.local/bin : $PORTERCLAUDE_PATH_EXTRA : /usr/local/bin : <image ENV PATH> : $PATH
+```
+
+with duplicates dropped (`pc_path_compose`, so sourcing it twice is a no-op). A recipe
+Dockerfile adds directories that only exist at runtime by setting `ENV PORTERCLAUDE_PATH_EXTRA`
+**before** it runs `common.sh`: `go` → `/home/dev/go/bin` (`$GOPATH/bin`), `dotnet` →
+`/home/dev/.dotnet/tools`, `php` → `/home/dev/.composer/vendor/bin`.
+
 Builds go through the **classic** builder: no BuildKit-only features at all (no syntax
 directive, no build mounts, no per-build platform override, no heredoc `COPY`). Nothing may
 hardcode an architecture — use `dpkg --print-architecture` or a `uname -m` `case`.
@@ -80,10 +97,10 @@ whose `sleep` rejects `infinity` still stay up and `docker stop` is still honour
 | Recipe | Base | Extra |
 |---|---|---|
 | `node` | `node:22-bookworm` | `corepack enable` (pnpm/yarn); npm cache under `/home/dev/.npm`; the base's uid-1000 `node` user is renamed to `dev` |
-| `dotnet` | `mcr.microsoft.com/dotnet/sdk:9.0` | telemetry off, `NUGET_PACKAGES` + `DOTNET_CLI_HOME` under `/home/dev` |
-| `php` | `php:8.3-fpm-bookworm` | nginx + supervisord + composer, `pdo_mysql opcache zip intl`, serves `/workspace/public` on port 80 |
+| `dotnet` | `mcr.microsoft.com/dotnet/sdk:9.0` | telemetry off, `NUGET_PACKAGES` + `DOTNET_CLI_HOME` under `/home/dev`, `~/.dotnet/tools` on the login PATH |
+| `php` | `php:8.3-fpm-bookworm` | nginx + supervisord + composer (`~/.composer/vendor/bin` on the login PATH), `pdo_mysql opcache zip intl`, serves `/workspace/public` on port 80 |
 | `python` | `python:3.13-bookworm` | `uv` + `pipx` |
-| `go` | `golang:1.23-bookworm` | `GOPATH` / `GOCACHE` under `/home/dev` |
+| `go` | `golang:1.23-bookworm` | `GOPATH` / `GOCACHE` under `/home/dev`, `$GOPATH/bin` + the image's `/usr/local/go/bin` on the login PATH |
 | `base` | `debian:bookworm-slim` | nothing beyond `common.sh` |
 
 ### php: port 80 as an unprivileged user

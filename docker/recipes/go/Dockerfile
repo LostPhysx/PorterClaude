@@ -8,6 +8,7 @@ ENV LANG=C.UTF-8 \
     PORTERCLAUDE_RECIPE=go \
     GOPATH=/home/dev/go \
     GOCACHE=/home/dev/.cache/go-build \
+    PORTERCLAUDE_PATH_EXTRA=/home/dev/go/bin \
     GOFLAGS=-buildvcs=false
 
 COPY common.sh /tmp/common.sh

@@ -3,7 +3,7 @@ import type { ServiceDeps } from '../context.js';
 import type { ExecStream } from '../backends/types.js';
 import type { GeneralConfig } from '../config/schema.js';
 import type { SessionService } from '../sessions/service.js';
-import { composeToolsPath, toolsPathPrefix } from '../sessions/container.js';
+import { composeToolsPath } from '../sessions/container.js';
 import { shortId } from '../util/ids.js';
 import { shQuote, tmuxSessionName } from '../util/slug.js';
 import type { TerminalShell } from './protocol.js';
@@ -69,7 +69,10 @@ export class TerminalService {
     // that - or one whose /etc/profile resets PATH, which Debian's does - would still not
     // find claude, and a non-root image cannot persist PATH in an rc file it may not write.
     // So the exec gets the tools PATH explicitly AND the command re-exports it after the
-    // login shell has sourced its profiles.
+    // login shell has sourced its profiles. The re-export carries the WHOLE composed PATH,
+    // tools prefix *and* the image's own entries (/usr/local/go/bin & co): /etc/profile
+    // replaces PATH wholesale, so re-adding only the tools dirs would leave a golang or
+    // rust custom session without its toolchain in every terminal (OPS-7).
     const custom = config.image.type === 'custom';
     const toolsPath = custom ? await this.toolsPath(containerId, general) : null;
 
@@ -78,7 +81,7 @@ export class TerminalService {
       name: input.name,
       tmux,
       hasBash,
-      ...(custom ? { pathPrefix: toolsPathPrefix(general) } : {}),
+      ...(toolsPath ? { pathPrefix: toolsPath.split(':').filter((p) => p.length > 0) } : {}),
     });
 
     const { execId } = await backend.execCreate({
@@ -229,10 +232,11 @@ export class TerminalService {
  * The tmux session name is sanitised by tmuxSessionName() and then shell-quoted, so a
  * user-supplied pane name can never break out of the `sh -lc` string.
  *
- * `pathPrefix` (custom images: `<toolsMount>/bin`, `<containerHome>/.local/bin`) is
- * re-exported INSIDE the `sh -lc` command, i.e. after the login shell sourced /etc/profile
- * - which on Debian & co unconditionally overwrites PATH and would otherwise hide the
- * claude binaries of the tools volume from an image that cannot persist an rc file.
+ * `pathPrefix` (custom images: `<toolsMount>/bin`, `<containerHome>/.local/bin` and the
+ * image's own PATH entries) is re-exported INSIDE the `sh -lc` command, i.e. after the login
+ * shell sourced /etc/profile - which on Debian & co unconditionally overwrites PATH and would
+ * otherwise hide both the claude binaries of the tools volume and the image's toolchain
+ * (/usr/local/go/bin & co) from an image that cannot persist an rc file.
  */
 export function buildTerminalCommand(opts: {
   shell: TerminalShell;

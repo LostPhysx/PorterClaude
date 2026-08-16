@@ -198,7 +198,11 @@ describe('TerminalService.open PATH handling (BE-6)', () => {
       user?: string;
     };
     expect(exec.env?.PATH).toBe('/opt/porterclaude/bin:/home/dev/.local/bin:/usr/bin:/bin');
-    expect(exec.cmd[2]).toContain("PATH='/opt/porterclaude/bin:/home/dev/.local/bin':$PATH");
+    // OPS-7: the re-export after /etc/profile carries the image's own PATH entries too,
+    // otherwise a golang/rust custom image loses its toolchain in every terminal.
+    expect(exec.cmd[2]).toContain(
+      "PATH='/opt/porterclaude/bin:/home/dev/.local/bin:/usr/bin:/bin':$PATH",
+    );
     expect(exec.user).toBe('1000:1000');
   });
 

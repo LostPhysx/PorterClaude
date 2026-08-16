@@ -9,13 +9,14 @@ ENV LANG=C.UTF-8 \
     DOTNET_CLI_TELEMETRY_OPTOUT=1 \
     DOTNET_NOLOGO=1 \
     DOTNET_CLI_HOME=/home/dev \
-    NUGET_PACKAGES=/home/dev/.nuget/packages
+    NUGET_PACKAGES=/home/dev/.nuget/packages \
+    PORTERCLAUDE_PATH_EXTRA=/home/dev/.dotnet/tools
 
 COPY common.sh /tmp/common.sh
 RUN bash /tmp/common.sh && rm -f /tmp/common.sh
 
 # writable NuGet / CLI state inside the session home (the SDK itself stays root-owned)
-RUN mkdir -p /home/dev/.nuget/packages /home/dev/.dotnet /home/dev/.templateengine \
+RUN mkdir -p /home/dev/.nuget/packages /home/dev/.dotnet/tools /home/dev/.templateengine \
  && chown -R 1000:1000 /home/dev \
  && dotnet --info
 

@@ -29,6 +29,14 @@ set -u
 
 TOOLS="${PORTERCLAUDE_TOOLS:-/opt/porterclaude}"
 
+# The PATH the container was CREATED with. The server pins <tools>/bin + the image's own ENV
+# PATH there (sessions/container.ts composeToolsPath), so this variable is the only place the
+# image's toolchain directories (/usr/local/go/bin, /usr/local/cargo/bin, /usr/local/openjdk/bin,
+# ...) survive: login shells source /etc/profile, which on Debian & co REPLACES PATH with a
+# fixed list. setup_path() below bakes this value into the persisted profile snippets, so that
+# `which go` in a terminal of a golang:* custom session finds the toolchain again.
+ORIG_PATH="${PATH:-}"
+
 # The home the image's passwd entry gives our uid — /root for the root images most people
 # pick. This is what `su -`, `sudo -i`, login(1) and every getpwuid() caller resolve `~` to,
 # no matter what $HOME says.
@@ -59,7 +67,11 @@ esac
 TERM="${TERM:-xterm-256color}"
 export TERM
 BOOTSTRAP_LOG=/tmp/porterclaude-bootstrap.log
-MARKER="# porterclaude (generated) - do not duplicate"
+# v2: the persisted snippet now also restores the image's own PATH (see setup_path). The
+# version is part of the marker on purpose — a container bootstrapped by an older tools
+# volume gets the new block appended instead of being skipped by the idempotency guard.
+MARKER_TAG="porterclaude (generated v2)"
+MARKER="# $MARKER_TAG - do not duplicate"
 
 # uid:gid the recipe images give their session user (docker/recipes/common.sh). It is the
 # canonical owner of the shared login volumes while they are still root-owned.
@@ -81,9 +93,70 @@ idle_forever() {
   done
 }
 
-# 1. PATH: $TOOLS/bin first, persisted for the login shells the terminals open.
+# pc_path_compose <colon-list> ... : join the lists, dropping empty and duplicate entries
+# (first occurrence wins). Same helper the generated profile snippet carries.
+pc_path_compose() {
+  _new=''
+  for _p in "$@"; do
+    _rest="$_p"
+    while [ -n "$_rest" ]; do
+      case "$_rest" in
+        *:*) _d="${_rest%%:*}"; _rest="${_rest#*:}" ;;
+        *)   _d="$_rest";       _rest='' ;;
+      esac
+      [ -n "$_d" ] || continue
+      case ":$_new:" in
+        *":$_d:"*) continue ;;
+      esac
+      if [ -n "$_new" ]; then _new="$_new:$_d"; else _new="$_d"; fi
+    done
+  done
+  printf '%s' "$_new"
+}
+
+# The block appended to every rc/profile file. $TOOLS and the image PATH are baked in as
+# literals (they must survive /etc/profile's PATH reset), $HOME stays dynamic.
+path_snippet() {
+  printf '%s\n' "$MARKER"
+  cat <<'SNIPPET'
+pc_path_compose() {
+  _new=''
+  for _p in "$@"; do
+    _rest="$_p"
+    while [ -n "$_rest" ]; do
+      case "$_rest" in
+        *:*) _d="${_rest%%:*}"; _rest="${_rest#*:}" ;;
+        *)   _d="$_rest";       _rest='' ;;
+      esac
+      [ -n "$_d" ] || continue
+      case ":$_new:" in
+        *":$_d:"*) continue ;;
+      esac
+      if [ -n "$_new" ]; then _new="$_new:$_d"; else _new="$_d"; fi
+    done
+  done
+  printf '%s' "$_new"
+}
+SNIPPET
+  # single quotes would break the assignments; no real PATH entry contains one
+  printf "PORTERCLAUDE_TOOLS='%s'\n" "$(printf '%s' "$TOOLS" | tr -d "'")"
+  printf "PORTERCLAUDE_IMAGE_PATH='%s'\n" "$(printf '%s' "$ORIG_PATH" | tr -d "'")"
+  cat <<'SNIPPET'
+export PORTERCLAUDE_TOOLS PORTERCLAUDE_IMAGE_PATH
+PATH="$(pc_path_compose "$PORTERCLAUDE_TOOLS/bin:$HOME/.local/bin" \
+                        "$PORTERCLAUDE_IMAGE_PATH" "$PATH")"
+export PATH
+export TERM="${TERM:-xterm-256color}"
+export COLORTERM=truecolor
+SNIPPET
+}
+
+# 1. PATH: $TOOLS/bin first, then the image's own PATH ($ORIG_PATH — see the top of this
+#    file), persisted for the login shells the terminals open. Without the $ORIG_PATH part
+#    a terminal in e.g. a golang:1.23-bookworm session has no `go`: /etc/profile throws the
+#    image's ENV PATH away and only what we persist here comes back.
 setup_path() {
-  PATH="$TOOLS/bin:$HOME/.local/bin:$PATH"
+  PATH="$(pc_path_compose "$TOOLS/bin:$HOME/.local/bin" "$ORIG_PATH" "$PATH")"
   export PATH
 
   files="/etc/profile.d/porterclaude.sh $HOME/.profile $HOME/.bashrc"
@@ -97,15 +170,10 @@ setup_path() {
     if [ ! -d "$d" ]; then
       mkdir -p "$d" 2>/dev/null || continue
     fi
-    if [ -f "$f" ] && grep -q 'porterclaude (generated)' "$f" 2>/dev/null; then
+    if [ -f "$f" ] && grep -qF "$MARKER_TAG" "$f" 2>/dev/null; then
       continue
     fi
-    {
-      printf '%s\n' "$MARKER"
-      printf 'export PATH="%s/bin:$HOME/.local/bin:$PATH"\n' "$TOOLS"
-      printf 'export TERM="${TERM:-xterm-256color}"\n'
-      printf 'export COLORTERM=truecolor\n'
-    } >> "$f" 2>/dev/null || warn "cannot persist PATH in $f"
+    path_snippet >> "$f" 2>/dev/null || warn "cannot persist PATH in $f"
   done
 }
 

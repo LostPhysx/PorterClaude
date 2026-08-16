@@ -238,7 +238,17 @@ Flows
      container runs as root before the entrypoint - and then re-runs
      `<toolsMount>/entrypoint.sh --porterclaude-bootstrap` as the session user, which now
      persists PATH and links `~/.claude.json`. Both steps are best effort.
-  3. `TerminalService.open` additionally passes `PATH` in the exec env and re-exports it
+  3. The same root exec installs the two files the re-bootstrap still cannot write,
+     because it runs as the session user: `/etc/profile.d/porterclaude.sh` (sourced by
+     every login shell *after* `/etc/profile` has hard-set PATH — alpine and debian both
+     do — so `bash -l` terminals and tmux panes find `<toolsMount>/bin` even without an rc
+     file in `$HOME`) and the `/usr/local/bin/claude` wrapper (so `claude` resolves in an
+     exec that starts from the standard PATH). Both are marker-guarded
+     (`# porterclaude (generated)`): a `claude` or profile snippet the image itself ships
+     is never overwritten, and the PATH export is skipped when the prefix is already
+     there. `start` and `restart` re-run all of this (idempotent), which is how a user
+     applies a tools-volume update to a running session.
+  4. `TerminalService.open` additionally passes `PATH` in the exec env and re-exports it
      inside the `sh -lc` command (see section 8), because a login shell re-sources
      `/etc/profile`, which on Debian & co overwrites PATH unconditionally.
 * **private history**: `porterclaude-hist-<slug>` overlays `<home>/.claude/projects`, a

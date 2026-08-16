@@ -420,8 +420,8 @@ ws.binaryType = 'arraybuffer'
    * `curl -sI localhost:8080/vendor/golden-layout/esm/index.js` → `200`
    * `curl -sI localhost:8080/#/sessions`-equivalent: `curl -sI localhost:8080/anything`
      → `200` + `index.html` (SPA fallback)
-   * `curl -s localhost:8080/api/settings/vendor | jq '.routes[] | select(.mounted==false)'`
-     → empty
+   * `curl -s -b pc_session=<cookie> localhost:8080/api/settings/vendor | jq '.routes[] | select(.mounted==false)'`
+     → empty (the endpoint needs the session cookie like every `/api/settings/*` route)
    * `curl -s localhost:8080/api/sessions` → `401` + `{"error":{"code":"unauthorized"…}}`
 4. Grep guards: `grep -rn "from '[a-z@]" web/public/js` must return nothing (no bare
    specifiers); `grep -rn "apiKey" web/public/js` must show no persistence to localStorage.

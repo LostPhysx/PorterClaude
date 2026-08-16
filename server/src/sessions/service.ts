@@ -29,6 +29,7 @@ import {
   imagePathFromEnv,
   sharedClaudeTargetFor,
   toolsMountFor,
+  toolsPathPrefix,
   workspaceMountFor,
 } from './container.js';
 
@@ -41,6 +42,9 @@ const HISTORY_INIT_MOUNT = '/pc-hist';
 /** uid:gid the recipe images give their session user - the canonical owner of the shared
  *  login volumes while they are still root-owned (docker/recipes/common.sh). */
 const SHARED_VOLUME_OWNER = '1000:1000';
+
+/** marker every file generated inside a container carries (docker/tools/entrypoint.sh). */
+const GENERATED_MARKER = '# porterclaude (generated) - do not duplicate';
 
 export interface RemoveOptions {
   /** also delete porterclaude-ws-<slug> / porterclaude-hist-<slug> */
@@ -268,6 +272,12 @@ export class SessionService {
     this.assertKnown(name, container);
     if (!container) throw AppError.conflict(`session '${name}' has no container; recreate it first`);
     await backend.restartContainer(container.id, { timeoutSec: 10 });
+    // Same post-start repairs as start(): the container layer survives a restart, but the
+    // tools volume (and with it the bootstrap the server installs from the outside) may
+    // have been updated in the meantime - a restart is how a user applies that. Orphans
+    // are skipped on purpose: a restart must not adopt them (see reconcile).
+    const stored = this.deps.config.getSession(name);
+    if (stored) await this.afterStart(backend, stored, general, container.id);
     return this.get(name);
   }
 
@@ -694,6 +704,13 @@ export class SessionService {
       '  [ "$own" = "0" ] || [ -z "$(ls -A "$d" 2>/dev/null)" ] || continue;',
       `  chown -R ${shQuote(user)} "$d" 2>/dev/null || echo "chown $d failed" >&2;`,
       'done',
+      // The two root-only bits of the entrypoint (install_claude_wrapper, the
+      // /etc/profile.d snippet): the re-bootstrap below runs as the SESSION user and can
+      // still not write either of them. They are what makes `claude` resolvable in a login
+      // shell whose /etc/profile hard-sets PATH (alpine, debian) and in a `docker exec`
+      // that starts from the standard PATH. Both are marker-guarded, so we never clobber a
+      // binary or a profile snippet the image itself shipped.
+      ...this.rootOnlyToolingScript(general),
       'exit 0',
     ].join('\n');
 
@@ -718,6 +735,53 @@ export class SessionService {
     } catch (err) {
       this.deps.log.debug({ err, containerId }, 're-running the tools bootstrap failed (ignored)');
     }
+  }
+
+  /**
+   * The two pieces of the tools bootstrap that only uid 0 can install, which the
+   * (unprivileged) entrypoint of a non-root custom image therefore always skips:
+   *
+   *   * `/etc/profile.d/porterclaude.sh` — sourced by every login shell AFTER
+   *     `/etc/profile` has hard-set PATH (alpine and debian both do), so a `bash -l`
+   *     terminal and the shells inside tmux panes find `<toolsMount>/bin` even when the
+   *     rc files in `$HOME` are missing or unwritable;
+   *   * `/usr/local/bin/claude` — a wrapper on the standard PATH, so `claude` resolves in
+   *     any exec, whatever PATH it starts from.
+   *
+   * Both are skipped when the path exists without our marker: an image that ships its own
+   * `claude` or profile snippet keeps it. Pure string building, no I/O — the caller runs
+   * this as part of its root exec.
+   */
+  private rootOnlyToolingScript(general: GeneralConfig): string[] {
+    const prefix = toolsPathPrefix(general);
+    const profileBody = [
+      GENERATED_MARKER,
+      // The container env already carries the prefix and the entrypoint prepends it in
+      // $HOME/.profile too: only add it when it is really missing, so a login shell does
+      // not end up with three copies of it.
+      `case ":$PATH:" in`,
+      `  *":${prefix[0]}:"*) ;;`,
+      `  *) export PATH="${prefix.join(':')}:$PATH" ;;`,
+      'esac',
+      'export TERM="${TERM:-xterm-256color}"',
+      'export COLORTERM=truecolor',
+    ].join('\n');
+    const wrapperBody = [
+      '#!/bin/sh',
+      GENERATED_MARKER,
+      `exec "${toolsMountFor(general)}/bin/claude" "$@"`,
+    ].join('\n');
+    const mine = '"porterclaude (generated)"';
+    return [
+      'pcprof=/etc/profile.d/porterclaude.sh; pcwrap=/usr/local/bin/claude',
+      `pcprofbody=${shQuote(profileBody)}; pcwrapbody=${shQuote(wrapperBody)}`,
+      `if mkdir -p /etc/profile.d 2>/dev/null && { [ ! -e "$pcprof" ] || grep -q ${mine} "$pcprof" 2>/dev/null; }; then`,
+      '  printf \'%s\\n\' "$pcprofbody" > "$pcprof" 2>/dev/null && chmod 0644 "$pcprof" 2>/dev/null || echo "cannot write $pcprof" >&2',
+      'fi',
+      `if mkdir -p /usr/local/bin 2>/dev/null && { [ ! -e "$pcwrap" ] || grep -q ${mine} "$pcwrap" 2>/dev/null; }; then`,
+      '  printf \'%s\\n\' "$pcwrapbody" > "$pcwrap" 2>/dev/null && chmod 0755 "$pcwrap" 2>/dev/null || echo "cannot write $pcwrap" >&2',
+      'fi',
+    ];
   }
 
   /**
