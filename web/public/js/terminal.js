@@ -47,6 +47,15 @@ export const STABLE_MS = 10000;
  */
 export const CONTAINER_SIGNAL_EXITS = Object.freeze([137, 143]);
 
+/**
+ * After such an exit (and after any close that leaves the pane on a dead shell) the pane
+ * confirms the session state with GET /api/sessions/<name>. Stopping a container needs
+ * ~170 ms to land, far longer than the exec takes to die, so a single read right after the
+ * socket closed still answers "running" - poll for a short while instead (INT-05).
+ */
+export const SESSION_STATE_POLL_MS = 3000;
+export const SESSION_STATE_POLL_INTERVAL_MS = 250;
+
 /** @typedef {'bash'|'claude'|'sh'} Shell */
 /** @typedef {'connecting'|'open'|'closed'|'reconnecting'|'fatal'} PaneStatus */
 
@@ -64,6 +73,10 @@ export function makeTerminalName(session, shell, n) {
   const name = `${session}-${shell}-${n}`.toLowerCase();
   if (!TERMINAL_NAME_RE.test(name)) throw new Error(`invalid terminal name: ${name}`);
   return name;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /** Backoff with +-25% jitter so many panes do not reconnect in lockstep. */
@@ -129,8 +142,12 @@ export class TerminalPane {
     this._openedAt = 0;
     this._lastError = null;
     this._awaitEnter = false;
-    /** banner held back because the exit status looks like a container stop, not a logout */
-    this._deferredExit = null;
+    /** exec status of the last `exit` frame, rendered when the socket closes */
+    this._exitCode = null;
+    /** that status when it looks like a container stop (137/143): no exit banner is shown */
+    this._signalExit = null;
+    /** the "[process exited ...]" line on screen, so a later "not running" answer replaces it */
+    this._exitBanner = null;
     /** wipe the (now meaningless) scrollback on the next `ready`: the container restarted */
     this._resetOnReady = false;
   }
@@ -201,7 +218,9 @@ export class TerminalPane {
     this._clearRetryTimer();
     this._awaitEnter = false;
     this._lastError = null;
-    this._deferredExit = null;
+    this._exitCode = null;
+    this._signalExit = null;
+    this._exitBanner = null;
     this._setStatus('connecting');
     this._clearNote('conn');
 
@@ -267,6 +286,10 @@ export class TerminalPane {
         this.reattached = msg.reattached === true;
         this._retryDelay = RECONNECT_MIN_MS;
         this._clearNote('conn');
+        // a reconnect / "Start session" succeeded: nothing from the dead shell is current
+        this._exitCode = null;
+        this._signalExit = null;
+        this._exitBanner = null;
         // The container was stopped and started again while this pane was open: everything
         // on screen belongs to a dead shell (and would keep showing a stale exit banner),
         // so start from a clean buffer. INT-05.
@@ -299,14 +322,11 @@ export class TerminalPane {
         break;
       case 'exit': {
         const code = msg.code === null || msg.code === undefined ? null : Number(msg.code);
-        const banner = `[process exited${code === null ? '' : ` (${code})`}]`;
-        // 137/143 nearly always means the container was stopped, not that the user typed
-        // `exit`: hold the banner back until _onClose knows which it was (INT-05).
-        if (code !== null && CONTAINER_SIGNAL_EXITS.includes(code)) {
-          this._deferredExit = banner;
-        } else {
-          this._writeDim(banner);
-        }
+        this._exitCode = code;
+        // 137/143 = 128+SIGKILL/SIGTERM: the container was stopped under this shell, the user
+        // did not type `exit`. No exit banner is ever printed for those - the close handler
+        // shows the "session is not running" note with its Start action instead (INT-05).
+        this._signalExit = code !== null && CONTAINER_SIGNAL_EXITS.includes(code) ? code : null;
         break;
       }
       case 'pong':
@@ -440,13 +460,17 @@ export class TerminalPane {
       this._setStatus('closed');
       this._awaitEnter = true;
       this._clearNote('conn');
-      if (this._deferredExit) {
-        // Held-back 137/143: show the "not running / Start session" note instead of the
-        // exit banner, and only print the banner if the session is running after all.
-        void this._noteIfSessionStopped({ deferred: true });
+      if (this._signalExit !== null) {
+        // The exec died with its container (137/143), so never claim the shell exited: show
+        // the "not running / Start session" note right away and confirm it in the background
+        // (INT-05). The server closes 4409 for this; 1000 is the racing case.
+        this._showNotRunningNote();
+        void this._confirmSignalExit();
         return;
       }
-      this._writeDim('[process exited] press Enter to restart');
+      this._writeBanner(
+        `[process exited${this._exitCode === null ? '' : ` (${this._exitCode})`}] press Enter to restart`,
+      );
       void this._noteIfSessionStopped();
       return;
     }
@@ -476,8 +500,10 @@ export class TerminalPane {
     }
 
     if (code === CLOSE.sessionNotRunning) {
-      this._deferredExit = null;
+      this._signalExit = null;
       this._resetOnReady = true;
+      // a "[process exited]" line printed a moment ago was wrong: overwrite it
+      this._replaceBanner(detail || `session "${this.session}" is not running`);
       this._scheduleReconnect(detail || `session "${this.session}" is not running`, [
         { label: 'Start session', onClick: () => this._startSession() },
       ]);
@@ -524,53 +550,91 @@ export class TerminalPane {
    * Defence in depth for "the session was stopped while this pane was open": the server
    * closes 4409 in that case, but a racing stop (or an older server) can still close 1000,
    * which alone would only say "[process exited]". Confirm the session state and, when it is
-   * not running, show the same note the 4409 path shows instead of a bare exit line.
-   *
-   * With `deferred` the exit banner has NOT been written yet (the exec ended 137/143, which
-   * normally means `docker stop`): the note replaces it entirely, and the banner is only
-   * printed after all if the session turns out to be running. INT-05.
-   * @param {{deferred?:boolean}} [opts]
+   * not running, show the same note the 4409 path shows - replacing the exit line. INT-05.
    */
-  async _noteIfSessionStopped(opts = {}) {
-    const deferred = opts.deferred === true;
-    const banner = this._deferredExit;
-    let status = null;
-    try {
-      const res = await api.sessions.get(this.session);
-      const view = (res && res.session) || null;
-      status = view && typeof view.status === 'string' ? view.status : null;
-    } catch {
-      // cannot tell (offline / 401 / gone)
-      if (deferred) this._flushDeferredExit(banner);
-      return;
-    }
+  async _noteIfSessionStopped() {
+    const stopped = await this._sessionStopped();
     // only decorate the close we are still sitting in
     if (this.disposed || this.ws || !this._awaitEnter) return;
-    if (!status || status === 'running') {
-      if (deferred) this._flushDeferredExit(banner);
-      return;
+    if (stopped !== true) return;
+    this._showNotRunningNote();
+  }
+
+  /**
+   * The exec ended 137/143 and the "not running" note is already on screen: make sure that
+   * was true. If the container is up after all (something SIGKILLed the shell itself) the
+   * note would be a lie - drop it and reconnect, tmux still has the pane. INT-05.
+   */
+  async _confirmSignalExit() {
+    const stopped = await this._sessionStopped();
+    if (this.disposed || this.ws || !this._awaitEnter) return;
+    if (stopped !== false) return; // not running, or no answer: keep the note
+    this._resetOnReady = false;
+    this._clearNote('conn');
+    this._scheduleReconnect('the shell was terminated');
+  }
+
+  /**
+   * Poll GET /api/sessions/<name> until it reports a non-running state, for at most
+   * SESSION_STATE_POLL_MS. The first answer after a stop is regularly a stale "running".
+   * @returns {Promise<boolean|null>} true = not running, false = running, null = cannot tell
+   */
+  async _sessionStopped() {
+    const deadline = Date.now() + SESSION_STATE_POLL_MS;
+    for (;;) {
+      let status = null;
+      try {
+        const res = await api.sessions.get(this.session);
+        const view = (res && res.session) || null;
+        status = view && typeof view.status === 'string' ? view.status : null;
+      } catch {
+        return null; // offline / 401 / gone: cannot tell
+      }
+      if (this.disposed || !status) return null;
+      if (status !== 'running') return true;
+      if (Date.now() >= deadline) return false;
+      await sleep(SESSION_STATE_POLL_INTERVAL_MS);
+      if (this.disposed) return null;
     }
-    this._deferredExit = null;
-    // the container is down: whatever is on screen dies with it
+  }
+
+  /** The pane's "session ... is not running / Start session" state (INT-05). */
+  _showNotRunningNote() {
+    this._signalExit = null;
+    // the container is down: whatever is on screen died with it
     this._resetOnReady = true;
+    const text = `session "${this.session}" is not running`;
+    this._replaceBanner(text);
     this._renderNote('conn', {
       variant: 'warning',
-      text: `session "${this.session}" is not running`,
+      text,
       actions: [{ label: 'Start session', onClick: () => this._startSession() }],
     });
   }
 
-  /** Print a held-back exit banner (the exit was a real one after all). @param {string|null} banner */
-  _flushDeferredExit(banner) {
-    if (this.disposed || !banner || this._deferredExit !== banner) return;
-    this._deferredExit = null;
-    this._writeDim(`${banner} press Enter to restart`);
+  /** Write an exit banner and remember it, so a later "not running" answer can replace it. */
+  _writeBanner(text) {
+    this._exitBanner = text;
+    this._writeDim(text);
+  }
+
+  /**
+   * Replace the exit banner written a moment ago - nothing else can have been written after
+   * it, the socket is closed - with `text`. No-op when no banner is on screen.
+   * @param {string} text
+   */
+  _replaceBanner(text) {
+    if (!this._exitBanner) return;
+    this._exitBanner = null;
+    // cursor up, column 0, erase the line, then the correction
+    this.term?.write(`\x1b[A\r\x1b[2K${ANSI_DIM}${text}${ANSI_RESET}\r\n`);
   }
 
   /** Ask the API to start the session, then reconnect immediately on success. */
   async _startSession() {
     this._renderNote('conn', { variant: 'warning', text: `starting session "${this.session}"…` });
-    this._deferredExit = null;
+    this._signalExit = null;
+    this._exitBanner = null;
     this._resetOnReady = true;
     try {
       await api.sessions.start(this.session);

@@ -8,7 +8,7 @@ import { WebSocket } from 'ws';
 import type { AppContext } from '../../src/context.js';
 import { AppError } from '../../src/http/errors.js';
 import { TERMINAL_CLOSE } from '../../src/terminals/protocol.js';
-import { attachTerminalWs } from '../../src/terminals/ws.js';
+import { attachTerminalWs, STOP_RECHECK } from '../../src/terminals/ws.js';
 import { silentLog, stubExecStream } from './helpers.js';
 
 const authState = vi.hoisted(() => ({ ok: true }));
@@ -29,6 +29,9 @@ let handle: ReturnType<typeof attachTerminalWs>;
 let stream: ReturnType<typeof stubExecStream> & TestStream;
 let openError: unknown = null;
 let sessionStateError: unknown = null;
+/** how many requireRunningContainer() calls still answer "running" before the error hits */
+let sessionStateErrorAfter = 1;
+let sessionStateChecks = 0;
 let execExitCode: number | null = 0;
 let unregistered: string[] = [];
 let killed: string[] = [];
@@ -55,7 +58,8 @@ function makeCtx(): AppContext {
     },
     sessions: {
       requireRunningContainer: async () => {
-        if (sessionStateError) throw sessionStateError;
+        sessionStateChecks += 1;
+        if (sessionStateError && sessionStateChecks >= sessionStateErrorAfter) throw sessionStateError;
         return { containerId: 'c1', config: {} };
       },
     },
@@ -96,7 +100,12 @@ beforeEach(async () => {
   authState.ok = true;
   openError = null;
   sessionStateError = null;
+  sessionStateErrorAfter = 1;
+  sessionStateChecks = 0;
   execExitCode = 0;
+  // INT-05: the real window is 250 ms x 3 s; the tests only care that it re-checks
+  STOP_RECHECK.intervalMs = 5;
+  STOP_RECHECK.timeoutMs = 60;
   unregistered = [];
   killed = [];
   stream = stubExecStream() as ReturnType<typeof stubExecStream> & TestStream;
@@ -224,6 +233,50 @@ describe('attachTerminalWs', () => {
     expect(await message).toMatchObject({ type: 'error', code: 'session_not_running' });
     expect(await closed).toBe(TERMINAL_CLOSE.sessionNotRunning);
     expect(unregistered).toContain('t1');
+  });
+
+  // INT-05: stopping a session kills the exec ~60 ms after the request, but the engine
+  // needs ~170 ms to report the container as exited - so the first state check still says
+  // "running" and the pane used to get `exit 137` + 1000 ("[process exited (137)]").
+  it.each([137, 143, null])(
+    're-checks the container state after exit %s and closes 4409 once the stop lands',
+    async (exitCode) => {
+      execExitCode = exitCode;
+      sessionStateError = AppError.conflict("session 'web' is not running");
+      sessionStateErrorAfter = 3; // the first two checks race the stop and see "running"
+      const ws = connect();
+      await nextText(ws);
+      const message = nextText(ws);
+      const closed = nextClose(ws);
+      stream.emitClose(1006);
+      expect(await message).toMatchObject({ type: 'error', code: 'session_not_running' });
+      expect(await closed).toBe(TERMINAL_CLOSE.sessionNotRunning);
+      expect(sessionStateChecks).toBeGreaterThanOrEqual(3);
+    },
+  );
+
+  it('does not re-check the container state for a normal shell exit', async () => {
+    execExitCode = 0;
+    const ws = connect();
+    await nextText(ws);
+    const exit = nextText(ws);
+    const closed = nextClose(ws);
+    stream.emitClose(1006);
+    expect(await exit).toEqual({ type: 'exit', code: 0 });
+    expect(await closed).toBe(TERMINAL_CLOSE.normal);
+    expect(sessionStateChecks).toBe(1);
+  });
+
+  it('reports exit 137 when the container is still running after the re-check window', async () => {
+    execExitCode = 137;
+    const ws = connect();
+    await nextText(ws);
+    const exit = nextText(ws);
+    const closed = nextClose(ws);
+    stream.emitClose(1006);
+    expect(await exit).toEqual({ type: 'exit', code: 137 });
+    expect(await closed).toBe(TERMINAL_CLOSE.normal);
+    expect(sessionStateChecks).toBeGreaterThan(1);
   });
 
   it('closes 4404 when the exec ends because the session is gone', async () => {

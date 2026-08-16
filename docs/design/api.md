@@ -398,6 +398,20 @@ because the container is no longer running, the server does not send `exit` at a
 `4404` when the session is gone), so the pane can offer "Start session" instead of claiming
 the shell exited.
 
+**Deciding which one it was (INT-05).** Stopping a session kills the exec within ~60 ms while
+the engine needs longer (~170 ms, more through Portainer) to report the container as exited, so
+a single state check right after the exec died still answers "running". When the exit status
+is `137`/`143` (128+SIGKILL / 128+SIGTERM, what stopping a container produces) or cannot be
+read at all, the server therefore re-inspects the container every 250 ms for up to 3 s and
+closes `4409`/`4404` as soon as the stop shows up; only if the container is still running at
+the end of that window does it send `exit` and close `1000`. Any other status (`0` & co) is
+answered on the first check, as before — a normal shell exit is never delayed.
+
+Client rule for the same reason: a pane must **not** print "[process exited] press Enter to
+restart" for `exit.code` `137`/`143` or after a `4409` close — it shows the "session … is not
+running" note with its **Start session** action instead (and replaces an exit line it had
+already printed when a late `4409` / session-state answer contradicts it).
+
 ### Close codes
 
 | code | meaning |

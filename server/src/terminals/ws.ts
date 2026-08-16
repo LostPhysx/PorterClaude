@@ -130,6 +130,31 @@ function fail(ws: WebSocket, code: TerminalErrorCode, message: string, closeCode
   }
 }
 
+/**
+ * Exec exit statuses that mean "the container went away under this shell" rather than "the
+ * user typed exit": 128+SIGKILL and 128+SIGTERM, i.e. exactly what stopping (or killing) a
+ * container produces. `null` = the engine could not report a status at all, which happens
+ * for the same reason. INT-05.
+ */
+export const CONTAINER_STOP_EXIT_CODES: readonly number[] = [137, 143];
+
+export function looksLikeContainerStop(exitCode: number | null): boolean {
+  return exitCode === null || CONTAINER_STOP_EXIT_CODES.includes(exitCode);
+}
+
+/**
+ * How long the server keeps re-checking the container state after such an exit before it
+ * accepts "the container is still running" (INT-05). Mutable so tests can shrink the window.
+ */
+export const STOP_RECHECK = { intervalMs: 250, timeoutMs: 3_000 };
+
+function delay(ms: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    // unref'd: a pending recheck must never hold the process open on shutdown
+    setTimeout(resolve, ms).unref();
+  });
+}
+
 /** AppError -> (terminal error code, websocket close code). */
 export function mapError(err: unknown): { code: TerminalErrorCode; close: TerminalCloseCode; message: string } {
   const appErr: AppError = toAppError(err);
@@ -302,24 +327,30 @@ async function handleConnection(ws: WebSocket, req: IncomingMessage, ctx: AppCon
   // engine for the real exit status, and when the container is no longer running close with
   // 4409 instead of pretending the shell exited normally: the pane then shows the
   // "session is not running" note with its Start action rather than "[process exited]".
-  const onStreamClosed = async (): Promise<void> => {
-    if (closed) return;
-    let stopped: unknown = null;
+  //
+  // INT-05: one state check races the stop. POST /sessions/:name/stop kills the exec within
+  // ~60 ms while the engine needs ~170 ms (portainer a bit more) to report the container as
+  // exited, so the inspect right after the exec died still answered "running" and the pane
+  // got `exit 137` + 1000. When the exit status looks like a container stop (128+SIGKILL /
+  // 128+SIGTERM) or cannot be read at all, keep re-checking for a short while before
+  // believing "running". A normal shell exit (0 or any other status while the container is
+  // still up) is unaffected: it is answered on the first check, as before.
+  const sessionStopReason = async (): Promise<AppError | null> => {
     try {
       await ctx.sessions.requireRunningContainer(query.session);
+      return null;
     } catch (err) {
       const appErr = toAppError(err);
       // only a definite "gone"/"stopped" answer overrides the normal exit path
-      if (appErr.code === 'not_found' || appErr.code === 'conflict') stopped = appErr;
-      else log.debug({ err }, 'could not confirm the session state after the exec ended');
+      if (appErr.code === 'not_found' || appErr.code === 'conflict') return appErr;
+      log.debug({ err }, 'could not confirm the session state after the exec ended');
+      return null;
     }
-    if (closed || ws.readyState !== WebSocket.OPEN) return;
-    if (stopped) {
-      const mapped = mapError(stopped);
-      fail(ws, mapped.code, mapped.message, mapped.close);
-      cleanup();
-      return;
-    }
+  };
+
+  const onStreamClosed = async (): Promise<void> => {
+    if (closed) return;
+    // the real process status first: it decides how hard we look at the container state
     let code: number | null = null;
     try {
       code = (await ctx.backends.get().execInspect(execId)).exitCode;
@@ -327,6 +358,27 @@ async function handleConnection(ws: WebSocket, req: IncomingMessage, ctx: AppCon
       log.debug({ err, terminalId }, 'inspecting the finished exec failed');
     }
     if (closed || ws.readyState !== WebSocket.OPEN) return;
+
+    let stopped = await sessionStopReason();
+    if (!stopped && looksLikeContainerStop(code)) {
+      const deadline = Date.now() + STOP_RECHECK.timeoutMs;
+      while (!stopped && Date.now() < deadline) {
+        await delay(STOP_RECHECK.intervalMs);
+        if (closed || ws.readyState !== WebSocket.OPEN) return;
+        stopped = await sessionStopReason();
+      }
+    }
+    if (closed || ws.readyState !== WebSocket.OPEN) return;
+    if (stopped) {
+      const mapped = mapError(stopped);
+      log.info(
+        { terminalId, session: query.session, exitCode: code, close: mapped.close },
+        'the exec died with its container: closing the terminal as "session not running"',
+      );
+      fail(ws, mapped.code, mapped.message, mapped.close);
+      cleanup();
+      return;
+    }
     send(ws, { type: 'exit', code });
     ws.close(TERMINAL_CLOSE.normal, 'shell exited');
     cleanup();
