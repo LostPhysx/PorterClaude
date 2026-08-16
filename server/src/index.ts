@@ -8,7 +8,8 @@
 //   5. new ConfigStore({...}); await store.init()      (migrates v1 -> v2, seeds APP_PASSWORD / PORTAINER_*)
 //   6. new CredentialStore(...), new HostManager(...), new AgentRegistry(...)
 //      config.on('change', () => hosts.invalidateChanged())
-//   7. new SessionService(deps), new ImageService(deps), new TerminalService(deps, sessions)
+//   7. new ImageService(deps), new SessionService(deps, images),
+//      new TerminalService(deps, sessions, images)
 //   8. createAuthService(...) -> AppContext
 //   9. createApp(ctx) -> http.createServer(app)
 //  10. attachTerminalWs(server, ctx)      (B2, terminals/ws.ts)
@@ -76,9 +77,12 @@ export async function start(): Promise<StartedServer> {
   config.on('change', () => hosts.invalidateChanged());
 
   const deps: ServiceDeps = { env, log, paths, config, hosts, agents, backends: hosts.legacyAccess() };
-  const sessions = new SessionService(deps);
   const images = new ImageService(deps);
-  const terminals = new TerminalService(deps, sessions);
+  // the second argument is the tools-volume gate for CREATING a session: a host that was
+  // never synced can only produce crash-looping containers (see SessionService)
+  const sessions = new SessionService(deps, images);
+  // the third argument is the tools-volume gate for `shell=agent:<id>` (see TerminalService)
+  const terminals = new TerminalService(deps, sessions, images);
   const auth = createAuthService({ config, secrets, env, log });
 
   const ctx: AppContext = {

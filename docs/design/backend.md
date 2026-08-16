@@ -588,7 +588,12 @@ work for containers created by an older tools volume and for non-root images.
 **Terminals**: `shell=agent:<id>` runs `agentCommandLine(def)` = `command` + `args`, every
 element shell-quoted. An agent that is not in the session's `resolvedAgents` is refused with
 `agent_not_available` / close 4410 — starting it anyway would run an *unauthenticated* agent
-with no auth volume and confuse the user.
+with no auth volume and confuse the user. The same 4410 also covers the second half of the
+gate: an agent the container MOUNTS but the host's tools volume never received (enabling does
+not install — that needs a sync), which `ImageService.agentInstallState(hostId, id)` reports as
+`missing` from `AGENTS.json`; there is no shim on the PATH for it, so the pane would die with
+`bash: <command>: command not found`. A manifest that could not be READ answers `unknown` and
+never blocks a pane (an unreachable host or a pre-v0.2 tools volume has no manifest to show).
 
 ## 12.4 Migration (v1 → v2) and the legacy claude login
 
@@ -643,7 +648,11 @@ marker. Without this the deployed instance would silently ask for `/login` again
 * Every public `ImageService` method takes `hostId` first; jobs carry `hostId`, are listed per
   host and their "already running" checks are per host.
 * `ToolsStatus.agents` is read from `<toolsMount>/AGENTS.json` with a one-shot container
-  (same trick as `readClaudeVersion`), cached per host and invalidated after a sync.
+  (same trick as `readClaudeVersion`), cached per host and invalidated after a sync. Only a
+  SUCCESSFUL read is cached: a manifest that is null because the engine did not answer would
+  otherwise keep a recovered host at `installed:false` for the rest of the TTL. The failure
+  reason travels on as `ToolsStatus.error` and as every `HostAgentView.error`, so the panel
+  can tell "not installed" from "could not read the tools volume".
 * `syncTools(hostId)` = build `<ns>/tools:latest` when missing/outdated → ensure the volume →
   run the populate container **with `PORTERCLAUDE_AGENTS`** → legacy claude import (once) →
   invalidate the cached manifest. A single agent failing to install is a job warning, not a

@@ -11,6 +11,7 @@ import type { SessionConfig } from '../sessions/model.js';
 import type { HostConfig, PortainerCredentialConfig } from '../hosts/model.js';
 import { LEGACY_HOST_ID } from '../hosts/model.js';
 import { DEFAULT_ENABLED_AGENT_IDS } from '../agents/builtin.js';
+import { AgentDefinitionSchema } from '../agents/model.js';
 import type { AgentDefinition } from '../agents/model.js';
 import type { SecretBox } from './crypto.js';
 import { hashPassword } from './crypto.js';
@@ -107,13 +108,41 @@ export class ConfigStore extends EventEmitter {
     } catch {
       return null;
     }
-    const migrated = this.migrate(json);
+    const migrated = this.dropInvalidCustomAgents(this.migrate(json));
     const parsed = AppConfigSchema.safeParse(migrated);
     if (!parsed.success) {
       this.deps.log.error({ issues: parsed.error.issues }, 'config.json does not match the schema');
       return null;
     }
     return parsed.data;
+  }
+
+  /**
+   * Drop stored custom agents that no longer satisfy `AgentDefinitionSchema` (a definition
+   * written before the path rules of `AgentPathSchema` existed, e.g. a `sharedPaths` entry
+   * with a `..` segment). Without this the whole config.json would fail to parse and be
+   * renamed to .corrupt-<ts> - losing hosts, credentials and sessions because of ONE bad
+   * agent. The offending definition is logged and simply not loaded.
+   */
+  private dropInvalidCustomAgents(raw: unknown): unknown {
+    if (!raw || typeof raw !== 'object') return raw;
+    const obj = raw as Record<string, unknown>;
+    const agents = obj.agents as Record<string, unknown> | undefined;
+    if (!agents || !Array.isArray(agents.custom)) return obj;
+
+    const kept = agents.custom.filter((entry) => {
+      const parsed = AgentDefinitionSchema.safeParse(entry);
+      if (!parsed.success) {
+        const id = (entry as { id?: unknown } | null)?.id;
+        this.deps.log.error(
+          { id, issues: parsed.error.issues },
+          'dropping a stored custom agent that does not match the schema',
+        );
+      }
+      return parsed.success;
+    });
+    if (kept.length === agents.custom.length) return obj;
+    return { ...obj, agents: { ...agents, custom: kept } };
   }
 
   /**

@@ -181,10 +181,10 @@
             <select id="agents-host-select" class="form-select form-select-sm w-auto" aria-label="Host"></select>
             <button id="btn-agents-refresh" class="btn btn-sm btn-outline-secondary" type="button" title="Refresh"><i class="bi bi-arrow-clockwise"></i></button>
             <div class="btn-group">
-              <button id="btn-agents-sync" class="btn btn-sm btn-outline-secondary" type="button"><i class="bi bi-download me-1"></i>Install / update on this host</button>
-              <button id="btn-agents-sync-more" class="btn btn-sm btn-outline-secondary dropdown-toggle dropdown-toggle-split" type="button" data-bs-toggle="dropdown" aria-expanded="false"><span class="visually-hidden">More install options</span></button>
+              <button id="btn-agents-sync" class="btn btn-sm btn-outline-secondary" type="button" title="install every agent enabled on this host into its tools volume"><i class="bi bi-download me-1"></i>Sync tools</button>
+              <button id="btn-agents-sync-more" class="btn btn-sm btn-outline-secondary dropdown-toggle dropdown-toggle-split" type="button" data-bs-toggle="dropdown" aria-expanded="false"><span class="visually-hidden">More sync options</span></button>
               <ul class="dropdown-menu dropdown-menu-end">
-                <li><h6 class="dropdown-header">Install / update installs what is missing</h6></li>
+                <li><h6 class="dropdown-header">Sync tools installs what is missing</h6></li>
                 <li><button id="btn-agents-sync-force" class="dropdown-item" type="button"><i class="bi bi-arrow-up-circle me-1"></i>Upgrade all agents (reinstall)</button></li>
                 <li><div class="dropdown-item-text small text-secondary" style="max-width:24rem">An installed agent is kept as it is while its definition is unchanged, so a new upstream release is only picked up by an upgrade. This rebuilds the tools image and reinstalls every enabled agent and runtime &mdash; minutes, and it re-downloads a few hundred MB.</div></li>
               </ul>
@@ -211,9 +211,11 @@
           <div class="d-flex align-items-center gap-2 mb-2">
             <h6 class="mb-0 me-auto">Recipe images</h6>
             <select id="images-host-select" class="form-select form-select-sm w-auto" aria-label="Host"></select>
-            <button id="btn-tools-sync" class="btn btn-sm btn-outline-secondary" type="button"><i class="bi bi-download me-1"></i>Sync tools volume</button>
+            <button id="btn-tools-sync" class="btn btn-sm btn-outline-secondary" type="button" title="populate this host's tools volume with every enabled agent"><i class="bi bi-download me-1"></i>Sync tools</button>
             <button id="btn-images-refresh" class="btn btn-sm btn-outline-secondary" type="button"><i class="bi bi-arrow-clockwise"></i></button>
           </div>
+          <!-- "this host is unreachable" banner, rendered by js/images.js -->
+          <div id="images-alert"></div>
           <div id="tools-status" class="small text-secondary mb-2"></div>
           <!-- installed agents + versions of THIS host's tools volume -->
           <div id="tools-agents" class="mb-3"></div>

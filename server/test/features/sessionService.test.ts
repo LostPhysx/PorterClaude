@@ -989,14 +989,51 @@ describe('SessionService across hosts', () => {
     });
   });
 
-  it('filters by hostId and only talks to that host', async () => {
+  // B-5: `?hostId=` filters the RESULT, not the scan. Narrowing the scan to one host left the
+  // same-engine dedupe with a single scan, so a label-less container was reported under EVERY
+  // host filter (and adopted by whichever host was filtered).
+  it('filters by hostId but still scans the other hosts (same-engine dedupe)', async () => {
     const { service, home, edge } = makeHosts();
     home.containers.push(containerSummary());
     edge!.containers.push(edgeContainer());
 
     const views = await service.list({ hostId: EDGE });
     expect(views.map((v) => v.name)).toEqual(['api']);
-    expect(home.calls).not.toContain('listContainers');
+    expect(home.calls).toContain('listContainers');
+  });
+
+  it('assigns a label-less container of a SHARED engine to one host under every filter', async () => {
+    // one engine, two hosts: both scans see the same container ids
+    const engine = stubBackend();
+    engine.images.set('porterclaude/node:latest', imageInspect());
+    engine.containers.push(
+      containerSummary({
+        id: 'c-orph',
+        name: 'pc-orph',
+        names: ['pc-orph'],
+        labels: { 'porterclaude.managed': 'true', 'porterclaude.session': 'orph' },
+      }),
+    );
+    const cfg = stubConfigStore([]);
+    const hosts = stubHosts([
+      { host: hostConfig(), backend: engine.backend },
+      { host: otherHostConfig(), backend: engine.backend },
+    ]);
+    const service = new SessionService(serviceDeps({ config: cfg.store, hosts }));
+
+    // the orphan belongs to exactly ONE host - the default one (no stored session, same prefix)
+    expect((await service.list()).map((v) => [v.name, v.hostId])).toEqual([['orph', 'default']]);
+    expect((await service.list({ hostId: 'default' })).map((v) => v.name)).toEqual(['orph']);
+    expect(await service.list({ hostId: EDGE })).toEqual([]);
+
+    // ...and a filtered reconcile of the OTHER host must not adopt it
+    const report = await service.reconcile({ adopt: true, hostId: EDGE });
+    expect(report.adopted).toEqual([]);
+    expect(cfg.store.getSession('orph')).toBeFalsy();
+
+    const own = await service.reconcile({ adopt: true, hostId: 'default' });
+    expect(own.adopted).toEqual(['orph']);
+    expect(cfg.store.getSession('orph')?.hostId).toBe('default');
   });
 
   it('degrades only the sessions of a failing host', async () => {
@@ -1218,6 +1255,28 @@ describe('SessionService.resolveAgents', () => {
     expect(service.resolveAgents(sessionConfig({ name: 'd', agents: [] }))).toEqual([]);
   });
 
+  // B-8: resolveAgents DROPS unknown ids, so a typo used to be stored and echoed back in
+  // `agents` forever while nothing was ever mounted. PUT /api/hosts/:id/agents 422s the same
+  // input, so creating/updating a session must too.
+  it('422s an unknown agent id on create and update instead of silently dropping it', async () => {
+    const { service, cfg, sb } = makeService();
+    sb!.images.set('porterclaude/node:latest', imageInspect());
+    await expect(
+      service.create(sessionInput({ name: 'web', agents: ['claude', 'nope'] })),
+    ).rejects.toMatchObject({ code: 'validation_error' });
+    expect(cfg.store.getSession('web')).toBeFalsy();
+
+    await service.create(sessionInput({ name: 'web', agents: ['claude'] }));
+    await expect(
+      service.update('web', sessionInput({ name: 'web', agents: ['ghost'] })),
+    ).rejects.toMatchObject({ code: 'validation_error' });
+    expect(cfg.store.getSession('web')?.agents).toEqual(['claude']);
+
+    // null (inherit the host) and an empty list stay legal
+    await service.update('web', sessionInput({ name: 'web', agents: null }));
+    expect(cfg.store.getSession('web')?.agents).toBeNull();
+  });
+
   it('sorts by id so the spec hash does not depend on the config order', async () => {
     const host = hostConfig({ agents: { enabled: ['opencode', 'claude'] } });
     const { service } = makeService({ host, sessions: [] });
@@ -1281,5 +1340,164 @@ describe('SessionService.resolveAgents', () => {
     await expect(service.requireRunningContainer('web')).resolves.toMatchObject({
       containerAgents: ['claude'],
     });
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// INT2-2: a host whose tools volume was never synced can only produce
+// crash-looping containers (tini: exec <toolsMount>/entrypoint.sh failed)
+// ---------------------------------------------------------------------------
+describe('SessionService tools-volume gate (INT2-2)', () => {
+  function toolsService(
+    answer: 'ready' | 'unsynced' | 'unknown',
+    opts: { sessions?: ReturnType<typeof sessionConfig>[] } = {},
+  ) {
+    const cfg = stubConfigStore(opts.sessions ?? []);
+    const sb = stubBackend();
+    sb.images.set('porterclaude/node:latest', imageInspect());
+    const probes: Array<{ hostId: string; probeImage?: string }> = [];
+    const service = new SessionService(
+      serviceDeps({ config: cfg.store, hosts: stubHostManager(sb.backend) }),
+      {
+        toolsReadiness: async (hostId: string, o?: { probeImage?: string }) => {
+          probes.push({ hostId, probeImage: o?.probeImage });
+          return answer;
+        },
+      },
+    );
+    return { service, sb, cfg, probes };
+  }
+
+  it('refuses to create a session on a host whose tools volume was never synced', async () => {
+    const { service, sb, cfg, probes } = toolsService('unsynced');
+
+    await expect(service.create(sessionInput({ name: 'web' }))).rejects.toMatchObject({
+      code: 'conflict',
+      details: { reason: 'tools_not_synced', hostId: 'default', toolsVolume: 'porterclaude-tools' },
+    });
+    await expect(service.create(sessionInput({ name: 'web' }))).rejects.toThrow(/tools sync/i);
+
+    // nothing was created on the engine and nothing was stored: no empty tools volume, no
+    // container that restarts forever, no 201 with warnings:[]
+    expect(sb.calls).not.toContain('createContainer');
+    expect(sb.calls).not.toContain('createVolume');
+    expect(cfg.sessions.size).toBe(0);
+    // the probe gets an image that provably exists on THAT engine (the session's own)
+    expect(probes[0]).toEqual({ hostId: 'default', probeImage: 'porterclaude/node:latest' });
+  });
+
+  it('creates as before when the probe cannot tell (unknown never blocks)', async () => {
+    const { service, sb } = toolsService('unknown');
+    const view = await service.create(sessionInput({ name: 'web' }));
+    expect(view.name).toBe('web');
+    expect(view.warnings).toEqual([]);
+    expect(sb.calls).toContain('createContainer');
+  });
+
+  it('creates without a probe at all (the gate is optional)', async () => {
+    const { service, sb } = makeService();
+    sb!.images.set('porterclaude/node:latest', imageInspect());
+    await expect(service.create(sessionInput({ name: 'web' }))).resolves.toMatchObject({ name: 'web' });
+  });
+
+  it('warns instead of refusing when an EXISTING container is started', async () => {
+    const { service, sb } = toolsService('unsynced', { sessions: [sessionConfig({ name: 'web' })] });
+    sb.containers.push(containerSummary({ state: 'exited' }));
+
+    const view = await service.start('web');
+    expect(sb.calls).toContain('startContainer');
+    expect(view.warnings.join(' ')).toMatch(/has not been synced yet/);
+    expect(view.warnings.join(' ')).toMatch(/porterclaude-tools/);
+  });
+
+  it('says nothing when the volume is ready', async () => {
+    const { service, sb } = toolsService('ready', { sessions: [sessionConfig({ name: 'web' })] });
+    sb.containers.push(containerSummary({ state: 'exited' }));
+    expect((await service.start('web')).warnings).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// INT2-3: a `kind:file` shared path is a symlink into the auth volume, so the
+// source has to exist - a dangling link kills aider on every start
+// ---------------------------------------------------------------------------
+describe('SessionService file-kind agent paths (INT2-3)', () => {
+  function aiderScript(sb: ReturnType<typeof stubBackend>): string {
+    return (
+      sb.log
+        .filter((c) => c.method === 'runExec')
+        .map((c) => String((c.args[1] as string[])[2]))
+        .find((sc) => sc.includes('.porterclaude/agents')) ?? ''
+    );
+  }
+
+  async function createWithAider() {
+    const cfg = stubConfigStore([]);
+    const sb = stubBackend();
+    sb.images.set('porterclaude/node:latest', imageInspect());
+    const service = new SessionService(
+      serviceDeps({
+        config: cfg.store,
+        hosts: stubHostManager(sb.backend, { host: hostConfig({ agents: { enabled: ['aider'] } }) }),
+        agents: stubAgentRegistry(BUILTIN_AGENTS),
+      }),
+    );
+    await service.create(sessionInput({ name: 'web' }));
+    return { sb, script: aiderScript(sb) };
+  }
+
+  it('seeds the link source of a file path so the symlink is never dangling', async () => {
+    const { script } = await createWithAider();
+    const conf = "'/home/dev/.porterclaude/agents/aider/aider.conf.yml'";
+    // the link itself ...
+    expect(script).toContain(`ln -sfn ${conf} '/home/dev/.aider.conf.yml'`);
+    // ... and the file it points at, with the same `{}` seed the entrypoint writes: an empty
+    // (or missing) YAML makes aider die with FileNotFoundError / "NoneType instead of dict"
+    expect(script).toContain(`if [ ! -e ${conf} ]; then`);
+    expect(script).toContain(`printf '%s\\n' '{}' > ${conf}`);
+    expect(script).toContain(`elif [ -f ${conf} ] && [ ! -s ${conf} ]; then`);
+    // the second file path of aider is seeded too
+    expect(script).toContain(
+      `printf '%s\\n' '{}' > '/home/dev/.porterclaude/agents/aider/aider.model.settings.yml'`,
+    );
+  });
+
+  it('creates a dir path as a directory, never as a seeded file', async () => {
+    const { script } = await createWithAider();
+    expect(script).toContain(`mkdir -p '/home/dev/.porterclaude/agents/aider/aider'`);
+    expect(script).not.toContain(`> '/home/dev/.porterclaude/agents/aider/aider' `);
+  });
+
+  it('seeds a non-structured file path with an empty file', async () => {
+    const plain = {
+      ...BUILTIN_AGENTS[0]!,
+      id: 'plain',
+      sharedPaths: [{ path: '~/.plainrc', kind: 'file' as const }],
+      historyPath: null,
+    };
+    const cfg = stubConfigStore([]);
+    const sb = stubBackend();
+    sb.images.set('porterclaude/node:latest', imageInspect());
+    const service = new SessionService(
+      serviceDeps({
+        config: cfg.store,
+        hosts: stubHostManager(sb.backend, { host: hostConfig({ agents: { enabled: ['plain'] } }) }),
+        agents: stubAgentRegistry([plain]),
+      }),
+    );
+    await service.create(sessionInput({ name: 'web' }));
+    const script = aiderScript(sb);
+    expect(script).toContain(`: > '/home/dev/.porterclaude/agents/plain/plainrc'`);
+    expect(script).not.toContain("'{}'");
+  });
+
+  it('still migrates a real file the image shipped instead of seeding over it', async () => {
+    // the seed runs AFTER the replace block, so `cp -a <target> <source>` wins
+    const { script } = await createWithAider();
+    const cp = script.indexOf("cp -a '/home/dev/.aider.conf.yml'");
+    const seed = script.indexOf("printf '%s\\n' '{}' > '/home/dev/.porterclaude/agents/aider/aider.conf.yml'");
+    expect(cp).toBeGreaterThan(-1);
+    expect(seed).toBeGreaterThan(cp);
   });
 });

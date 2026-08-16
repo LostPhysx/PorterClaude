@@ -244,10 +244,13 @@ link_one() {
       *.json|*.yml|*.yaml) _seed='{}' ;;
     esac
     if [ ! -e "$_s" ]; then
+      # NOTE: never use `: > file` here — `:` is a POSIX *special* builtin, so a failed
+      # redirection aborts the whole script under dash (exit 2) instead of taking the `||`
+      # branch, and the container crash-loops. printf is a regular builtin and fails softly.
       if [ -n "$_seed" ]; then
         printf '%s\n' "$_seed" > "$_s" 2>/dev/null
       else
-        : > "$_s" 2>/dev/null
+        printf '' > "$_s" 2>/dev/null
       fi || {
         warn "cannot seed the link source $_s (the agent volume is not writable for this uid yet)"
         return 0

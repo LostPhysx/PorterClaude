@@ -11,8 +11,9 @@
 //   * getHosts() returns the last known HostView[] (never null; [] before the first load).
 //   * hostLabel(id) never throws and never returns '' (unknown id renders as the id).
 //   * GET /api/hosts is called WITHOUT probe on every refresh (it answers from a <=15s cache
-//     and never blocks on a dead engine); probe=1 is only used by the explicit refresh button
-//     and after a save.
+//     and never blocks on a dead engine); probe=1 is only used by the explicit refresh button,
+//     after a save/import, and ONCE after a plain load that still reports status 'unknown'
+//     (nothing has probed that engine yet - FE-QA-03).
 //
 // MODULE GRAPH: this module must NOT import sessions.js (HostView.sessionCount carries the
 // only number it needs) and it deliberately does not import agents.js either - agents.js
@@ -49,6 +50,8 @@ let agentDefs = [];
 const testResults = new Map();
 /** true while #credential-modal was opened FROM the host modal ("+ Add credential...") */
 let credentialFromHostForm = false;
+/** true while the automatic "resolve the unknown statuses" probe is in flight */
+let probingUnknown = false;
 /** the default socket path a fresh host starts with (mirrors SocketConnectionSchema) */
 const DEFAULT_SOCKET_PATH = '/var/run/docker.sock';
 /** Portainer endpoint types the server treats as docker (hosts/manager.ts import rules). */
@@ -180,6 +183,40 @@ function modalFor(id) {
   const el = byId(id);
   if (!el || typeof bootstrap === 'undefined') return null;
   return bootstrap.Modal.getOrCreateInstance(el);
+}
+
+// --- stacked modals (FE-QA-04) ------------------------------------------------------
+// Bootstrap 5 has no stacking support: "+ Add credential..." opens #credential-modal ON TOP
+// of #host-modal, and closing it strips the scroll lock (body.modal-open + the scrollbar
+// compensation) although the host modal underneath is still shown - the page behind starts
+// scrolling and jumps by the scrollbar width. Both dialogs also share z-index 1055, so the
+// topmost one is only on top by DOM order.
+
+/** z-index of the dialog opened ON TOP of another one (base modal = 1055). */
+const STACKED_MODAL_Z = 1065;
+
+/** True when a modal other than `except` is currently shown. */
+function otherModalOpen(except) {
+  return Array.from(document.querySelectorAll('.modal.show')).some((el) => el !== except);
+}
+
+/** Lift `el` (and the backdrop that came with it) above the modal it was opened over. */
+function liftStackedModal(el) {
+  if (!el || !otherModalOpen(el)) return;
+  el.style.zIndex = String(STACKED_MODAL_Z);
+  const backdrops = document.querySelectorAll('.modal-backdrop');
+  const last = backdrops[backdrops.length - 1];
+  if (last) last.style.zIndex = String(STACKED_MODAL_Z - 5);
+}
+
+/** Re-apply the scroll lock Bootstrap removed while a modal underneath is still open. */
+function restoreScrollLockIfStacked() {
+  if (!document.querySelector('.modal.show')) return;
+  const body = document.body;
+  body.classList.add('modal-open');
+  const gap = window.innerWidth - document.documentElement.clientWidth;
+  if (gap > 0) body.style.paddingRight = `${gap}px`;
+  body.style.overflow = 'hidden';
 }
 
 function setText(id, message) {
@@ -368,6 +405,30 @@ export async function reload(opts = {}) {
   }
   renderHosts();
   await reloadCredentials();
+  if (!opts.probe) await resolveUnknownStatuses();
+}
+
+/**
+ * `GET /api/hosts` reports `unknown` for every engine nobody has probed yet, so the panel
+ * (and the navbar chip) would sit on "unknown" until the user pressed Refresh. Follow the
+ * cheap cached load with exactly ONE probing load while a status is still unknown; a failing
+ * probe changes nothing (the plain render already happened). FE-QA-03.
+ * Exported because app.js runs it once after the boot load, so the navbar host chip resolves
+ * too - not only the panel.
+ * @returns {Promise<void>}
+ */
+export async function resolveUnknownStatuses() {
+  if (probingUnknown) return;
+  if (!hosts.some((h) => h && h.status === 'unknown')) return;
+  probingUnknown = true;
+  try {
+    await loadHosts({ probe: true });
+    renderHosts();
+  } catch {
+    /* keep the statuses of the plain load */
+  } finally {
+    probingUnknown = false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1062,11 +1123,14 @@ export async function saveCredential(event) {
       : await api.credentials.portainer.create(input);
     const saved = (res && res.credential) || null;
     const wasCreate = !editingCredential;
+    // read BEFORE hide()/await: the modal's hidden.bs.modal handler clears the flag while
+    // reloadCredentials() is still in flight (FE-QA-04)
+    const fromHostForm = credentialFromHostForm;
     editingCredential = null;
     const modal = modalFor('credential-modal');
     if (modal) modal.hide();
     await reloadCredentials();
-    if (credentialFromHostForm && saved) {
+    if (fromHostForm && saved) {
       // the host modal is still open behind this one: point it at the new credential
       credentialFromHostForm = false;
       const select = byId('hf-credential');
@@ -1212,7 +1276,8 @@ export async function runImport() {
         skippedHtml +
         '</div>';
     }
-    await reload();
+    // the freshly imported hosts have never been probed - resolve their status right away
+    await reload({ probe: true });
   } catch (err) {
     if (out) {
       out.innerHTML = `<div class="alert alert-danger py-2 mb-0">${escapeHtml((err && err.message) || 'the import failed')}</div>`;
@@ -1316,11 +1381,15 @@ const hostsPanel = {
     if (hostModal) hostModal.addEventListener('hidden.bs.modal', () => { editingHost = null; });
     const credModal = byId('credential-modal');
     if (credModal) {
+      // opened over #host-modal: lift it above the dialog below and keep the scroll lock
+      credModal.addEventListener('shown.bs.modal', () => liftStackedModal(credModal));
       credModal.addEventListener('hidden.bs.modal', () => {
         editingCredential = null;
         credentialFromHostForm = false;
+        credModal.style.zIndex = '';
         const key = byId('cf-apikey');
         if (key) key.value = ''; // the typed key never survives the dialog
+        restoreScrollLockIfStacked();
       });
     }
     const importModal = byId('import-modal');

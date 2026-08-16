@@ -785,15 +785,41 @@ describe('the agents of a host (AGENTS.json)', () => {
     ]);
     const service = new ImageService(serviceDeps({ config: cfg.store, hosts, paths: imagePaths() }));
 
+    // B-7: installed:false, but WITH the reason - otherwise the panel cannot tell
+    // "not installed" from "could not read the tools volume" (api.md: an unreachable host
+    // answers installed:false plus an error string instead of a 502)
     const agents = await service.agentStatuses(TEST_HOST_ID);
     expect(agents).toEqual([
-      { id: 'claude', installed: false, version: null, installedAt: null, error: null },
-      { id: 'opencode', installed: false, version: null, installedAt: null, error: null },
+      { id: 'claude', installed: false, version: null, installedAt: null, error: expect.stringContaining('no docker backend') },
+      { id: 'opencode', installed: false, version: null, installedAt: null, error: expect.stringContaining('no docker backend') },
     ]);
     // ...and the panel still renders for that host
     const status = await service.toolsStatus(TEST_HOST_ID);
     expect(status).toMatchObject({ hostId: TEST_HOST_ID, present: false });
+    expect(status.error).toContain('no docker backend');
     expect(status.agents).toHaveLength(2);
+  });
+
+  // B-7: a null manifest that came from a TRANSPORT error must not be cached, or a host that
+  // comes back keeps reporting installed:false for the rest of the TTL.
+  it('does not cache a manifest read that FAILED', async () => {
+    let fail = true;
+    const sb = stubBackend({
+      containerLogs: async () => {
+        if (fail) throw new Error('connect ECONNREFUSED');
+        return JSON.stringify(manifest);
+      },
+    });
+    sb.images.set('porterclaude/tools:latest', imageInspect({ tags: ['porterclaude/tools:latest'] }));
+    sb.volumes.push({ name: 'porterclaude-tools', driver: 'local', labels: {} });
+    const { service } = makeService(sb, { host: hostConfig({ agents: { enabled: ['claude'] } }) });
+
+    const first = await service.agentStatuses(TEST_HOST_ID);
+    expect(first[0]).toMatchObject({ id: 'claude', installed: false, error: 'connect ECONNREFUSED' });
+
+    fail = false;
+    const second = await service.agentStatuses(TEST_HOST_ID);
+    expect(second[0]).toMatchObject({ id: 'claude', installed: true, version: '2.1.233', error: null });
   });
 
   it('answers an empty list for an unknown host', async () => {
@@ -807,6 +833,84 @@ describe('the agents of a host (AGENTS.json)', () => {
     expect(await service.agentStatuses(TEST_HOST_ID)).toEqual([
       { id: 'claude', installed: false, version: null, installedAt: null, error: null },
     ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// INT2-2: a tools volume without <toolsMount>/entrypoint.sh crash-loops EVERY
+// session on that host, so sessions ask before they create a container
+// ---------------------------------------------------------------------------
+describe('toolsReadiness (INT2-2)', () => {
+  const BOOTSTRAP = 'PC_TOOLS_BOOTSTRAP_OK\n';
+
+  function volumeBackend(logs: string, opts: { toolsImage?: boolean; volume?: boolean } = {}) {
+    const sb = stubBackend({ containerLogs: async () => logs });
+    if (opts.toolsImage !== false) {
+      sb.images.set('porterclaude/tools:latest', imageInspect({ tags: ['porterclaude/tools:latest'] }));
+    }
+    if (opts.volume !== false) sb.volumes.push({ name: 'porterclaude-tools', driver: 'local', labels: {} });
+    return sb;
+  }
+
+  it('is ready when the volume carries the bootstrap', async () => {
+    const { service } = makeService(volumeBackend(BOOTSTRAP));
+    expect(await service.toolsReadiness(TEST_HOST_ID)).toBe('ready');
+  });
+
+  it('is unsynced when the volume does not exist yet', async () => {
+    const { service, sb } = makeService(volumeBackend(BOOTSTRAP, { volume: false }));
+    expect(await service.toolsReadiness(TEST_HOST_ID)).toBe('unsynced');
+    // ... and no container is started to find that out
+    expect(sb.calls).not.toContain('createContainer');
+  });
+
+  it('is unsynced when the volume EXISTS but is empty (docker created it for a session)', async () => {
+    const { service } = makeService(volumeBackend('cat: /out/AGENTS.json: No such file'));
+    expect(await service.toolsReadiness(TEST_HOST_ID)).toBe('unsynced');
+  });
+
+  it('reads the volume with the session image when the tools image is gone', async () => {
+    const sb = volumeBackend(BOOTSTRAP, { toolsImage: false });
+    sb.images.set('porterclaude/node:latest', imageInspect());
+    const { service } = makeService(sb);
+
+    // without an image on the engine there is nothing to read the volume with: 'unknown',
+    // never a refusal
+    expect(await service.toolsReadiness(TEST_HOST_ID)).toBe('unknown');
+    expect(await service.toolsReadiness(TEST_HOST_ID, { probeImage: 'porterclaude/node:latest' })).toBe(
+      'ready',
+    );
+    const probe = sb.log
+      .filter((c) => c.method === 'createContainer')
+      .map((c) => c.args[0] as { image: string })
+      .at(-1);
+    expect(probe?.image).toBe('porterclaude/node:latest');
+  });
+
+  it('is unknown when the host has no transport', async () => {
+    const cfg = stubConfigStore([]);
+    const hosts = stubHosts([{ host: hostConfig(), backend: null }]);
+    const service = new ImageService(serviceDeps({ config: cfg.store, hosts, paths: imagePaths() }));
+    expect(await service.toolsReadiness(TEST_HOST_ID)).toBe('unknown');
+  });
+
+  it('is unknown for a host this install does not have', async () => {
+    const { service } = makeService(volumeBackend(BOOTSTRAP));
+    expect(await service.toolsReadiness('nope')).toBe('unknown');
+  });
+
+  it('caches per (host, volume): repointing a host is not answered from the old volume', async () => {
+    const sb = volumeBackend(BOOTSTRAP);
+    sb.volumes.push({ name: 'other-tools', driver: 'local', labels: {} });
+    const cfg = stubConfigStore([]);
+    const hosts = stubHosts([{ host: hostConfig(), backend: sb.backend }]);
+    const service = new ImageService(serviceDeps({ config: cfg.store, hosts, paths: imagePaths() }));
+
+    expect(await service.toolsReadiness(TEST_HOST_ID)).toBe('ready');
+    const probes = sb.calls.filter((c) => c === 'createContainer').length;
+    // same volume: served from the cache
+    expect(await service.toolsReadiness(TEST_HOST_ID)).toBe('ready');
+    expect(sb.calls.filter((c) => c === 'createContainer').length).toBe(probes);
   });
 });
 
@@ -872,9 +976,15 @@ describe('the one-time legacy claude import', () => {
       { type: 'volume', source: 'porterclaude-auth-claude', target: '/auth', readOnly: false },
     ]);
     const script = runs[0]?.cmd?.[0] ?? '';
-    expect(script).toContain('cp -a /legacy/. /auth/claude/');
     expect(script).toContain('cp -a /legacy-home/.claude.json /auth/claude.json');
     expect(script).toContain('.pc-import-v1');
+    // entry by entry and never clobbering: a target volume that already holds an agent's
+    // scratch state (cache/, projects/) must still receive the missing .credentials.json.
+    // A whole-directory "only when empty" guard silently loses the v0.1 login instead.
+    expect(script).toContain('for p in /legacy/.[!.]* /legacy/..?* /legacy/*; do');
+    expect(script).toContain('[ -e "/auth/claude/$b" ] && continue');
+    expect(script).toContain('cp -a "$p" "/auth/claude/$b"');
+    expect(script).not.toContain('ls -A /auth/claude');
     // the old volumes are NEVER deleted (a rollback to v0.1 has to keep working)
     expect(sb.calls).not.toContain('removeVolume');
 

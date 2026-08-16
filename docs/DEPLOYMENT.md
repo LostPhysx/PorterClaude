@@ -291,8 +291,14 @@ downtime plus one tools sync per host.
    over unchanged. If anything looks wrong, stop the container, restore the `.v1.bak` file
    and go back to the v0.1 image — nothing on the engine has been touched yet.
 3. **Settings → Agents → Sync tools, once per host.** This is the step that installs the
-   agents: recipe images no longer contain Claude Code, so until the sync has run, sessions
-   come up with no agent on `PATH`. The same sync performs the **one-time login import**: the
+   agents *and* the session bootstrap: every v0.2 container mounts the tools volume read-only
+   and runs `/opt/porterclaude/entrypoint.sh` from it, so on a host whose tools volume has
+   never been synced a session cannot start at all — docker creates the empty volume, the
+   entrypoint is missing and the container restarts forever. PorterClaude therefore refuses to
+   create a session on such a host (`409`, "run the tools sync for this host first") instead
+   of handing you a crash-looping container; existing containers say so in their session
+   warnings, and a restart after the sync brings them up. The same sync performs the
+   **one-time login import**: the
    contents of the v0.1 `porterclaude-claude` and `porterclaude-claude-home` volumes are
    copied into `porterclaude-auth-claude` (marker file `.pc-import-v1`), so **nobody has to
    log in again**. The old volumes are never deleted or modified, which is what keeps a
@@ -332,7 +338,7 @@ After the upgrade, `which claude` inside a session resolves to `/opt/porterclaud
   section above.
 * **An explicit upgrade** to move an installed agent to a newer upstream release: the
   carry-over compares the agent's definition, which does not change when a new CLI version
-  ships. Settings → Agents → caret next to *Install / update on this host* → **Upgrade all
+  ships. Settings → Agents → caret next to *Sync tools* → **Upgrade all
   agents** (API: `POST /api/hosts/:hostId/images/tools/sync {"force":true}`) reinstalls every
   enabled agent and the bundled runtimes, and costs what a first sync costs. Sessions pick the
   new version up when they are restarted.

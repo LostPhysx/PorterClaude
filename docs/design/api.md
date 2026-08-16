@@ -247,6 +247,12 @@ Notes
 * `DELETE` removes the container and the stored definition; `removeVolumes=1` also deletes
   `porterclaude-ws-<name>` and `porterclaude-hist-<name>` (never the shared volumes).
 * `409 conflict` when creating a name that already exists (config or container).
+* `409 conflict` with `details.reason: "tools_not_synced"` when the target host's tools
+  volume carries no `<toolsMount>/entrypoint.sh`: every container runs that bootstrap as its
+  entrypoint, so the session could only crash-loop. The message names the fix (run the tools
+  sync for that host). The check never blocks on a maybe — an unreachable host or a volume
+  that cannot be read lets the create through as before. `POST …/start` and `…/restart` of an
+  EXISTING container do not refuse; they report the same sentence in `warnings`.
 * Route order: `/reconcile` is registered before `/:name`.
 * `POST /reconcile` **adopts**: every container labelled `porterclaude.managed=true` that
   has no stored definition is written back into `config.json` (reconstructed from its
@@ -773,6 +779,10 @@ Ids are part of the API (volume names, `shell=agent:<id>`) and never change.
   or deletable (`409`).
 * Two `sharedPaths` of one definition that produce the same slug (see below) are a
   `422 validation_error` — they would be the same directory in the auth volume.
+* Every `sharedPaths[].path` and `historyPath` must start with `~/` or `/` and must not
+  contain a `..` segment (`422 validation_error`): the bootstrap turns them into symlinks
+  inside the session container, so a traversal would point the link — and everything the
+  agent writes through it — outside that agent's auth volume.
 * `DELETE` is `409` while a host enables the agent or a session pins it; `force=1` also
   strips the id from those hosts/sessions (their containers keep the mount until recreated).
 
@@ -818,6 +828,9 @@ Sessions that are running keep the payload they started with until they are rest
 
 * `PUT /api/sessions/:name` with a different `hostId` is `422 validation_error`
   ("the host of a session is immutable"). Moving = create the session on the other host.
+* An `agents` list naming an id the registry does not know is `422 validation_error`
+  ("unknown agent id(s): …") on create and update — the same rule as
+  `PUT /api/hosts/:hostId/agents`. `null` (inherit the host) and `[]` stay legal.
 * `GET /api/sessions?hostId=<id>` filters; without it every host's sessions are returned
   (sorted by name). A host that is unreachable does not fail the call: its sessions come back
   with `status:"absent"` and a warning.
@@ -858,7 +871,7 @@ POST /api/hosts/:hostId/images/pull                 202 { job }
 { "status": { "hostId": "prod", "volume": "porterclaude-tools",
               "imageRef": "porterclaude/tools:latest", "present": true,
               "lastSyncedAt": "…", "contextHash": "9f86…", "outdated": false,
-              "syncing": false, "jobId": null,
+              "syncing": false, "jobId": null, "error": null,
               "claudeVersion": "2.1.233", "claudeChannel": "stable",
               "agents": [ { "id": "claude", "installed": true, "version": "2.1.233",
                             "installedAt": "…", "error": null },
@@ -867,7 +880,11 @@ POST /api/hosts/:hostId/images/pull                 202 { job }
 ```
 
   `claudeVersion`/`claudeChannel` are kept for compatibility and mirror the `claude` entry of
-  `agents`.
+  `agents`. `error` says why the status is incomplete (no usable transport, or reading the
+  volumes / tools image / `AGENTS.json` failed) and is `null` when everything could be read —
+  that is what separates "nothing was ever synced here" from "the engine did not answer"; the
+  same string is what an unreachable host puts into every `HostAgentView.error`. A read that
+  FAILED is never cached, so a host that comes back reports the truth on the next poll.
 * `POST …/tools/sync` installs **every agent enabled on that host** into the volume and
   writes `AGENTS.json`. A single agent that fails to install is a warning in the job log and
   `installed:false` in the manifest — the job still succeeds.
@@ -898,7 +915,7 @@ New error codes / close codes:
 
 | code | close | when |
 |---|---|---|
-| `agent_not_available` | `4410` | the agent is unknown, or not mounted into this session |
+| `agent_not_available` | `4410` | the agent is unknown, not mounted into this session, or mounted but missing from the host's tools volume (`AGENTS.json` says not installed — run the tools sync) |
 | `host_unavailable` | `4411` | the session's host is gone or its connection type is unsupported |
 
 Both are **terminal** conditions: the client must not auto-reconnect on 4410/4411 (same rule

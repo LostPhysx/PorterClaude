@@ -10,6 +10,7 @@ import { TerminalPane, makeTerminalName, terminalSlug } from './terminal.js';
 import { getSessions, reload as reloadSessions, imageOutdated } from './sessions.js';
 import { getSettings } from './settings.js';
 import { agentLabel, agentIcon } from './agents.js';
+import { getHost, hostLabel } from './hosts.js';
 
 /** localStorage key for the layout blob (server copy lives in settings.ui.layout). FROZEN. */
 export const LS_LAYOUT = `${LS_PREFIX}layout.v1`;
@@ -279,6 +280,7 @@ function paneHostPrefix(state) {
   if (ids.size < 2) return '';
   const id = paneHostId(state);
   if (!id) return '';
+  if (getHost(id)) return `${hostLabel(id)}/`;
   const view = railSessions.find((s) => hostIdOf(s) === id) || null;
   return `${(view && hostNameOf(view)) || id}/`;
 }
@@ -314,10 +316,15 @@ function sessionByName(name) {
 // ---------------------------------------------------------------------------
 // hosts, as seen from the sessions
 //
-// code.js deliberately does NOT import hosts.js: every host fact it needs (`hostId`,
-// `hostName`, `hostMissing`) rides on the SessionView, and the only global it wants - which
-// host is the default one, so its rail group comes first - is in the settings summary
-// (`settings.hosts.defaultHostId`) and on the `hosts:changed` bus event.
+// The host FACTS ride on the SessionView (`hostId`, `hostName`, `hostMissing`); the display
+// NAME is taken from the hosts cache instead (hosts.js -> hostLabel), because `hostName` is
+// only as consistent as the row that carried it - an adopted/orphan row can name the host
+// that scanned it rather than the host its id points at, which labelled every rail group,
+// filter option and tab prefix identically (FE-QA-06). `hostName` stays the fallback for a
+// host the cache does not know (deleted with force, or a pre-v0.2 payload).
+// Importing hosts.js closes no cycle: it imports api/bus/util/settings only.
+// Which host is the default one - so its rail group comes first - still comes from the
+// settings summary (`settings.hosts.defaultHostId`) and the `hosts:changed` bus event.
 // ---------------------------------------------------------------------------
 
 /** @type {string} last `hosts:changed` defaultHostId ('' = unknown) */
@@ -342,8 +349,12 @@ function hostIdOf(session) {
 
 /** @param {any} session @returns {string} the host's display name, never '' */
 function hostNameOf(session) {
+  const id = hostIdOf(session);
+  // the hosts cache is authoritative; SessionView.hostName is the fallback for hosts it
+  // does not know any more (see the note above)
+  if (id && getHost(id)) return hostLabel(id);
   if (session && typeof session.hostName === 'string' && session.hostName) return session.hostName;
-  return hostIdOf(session) || 'unknown host';
+  return id || 'unknown host';
 }
 
 /**
@@ -874,7 +885,7 @@ export function openTerminal(session, shellParam) {
       && !view.resolvedAgents.includes(agentId)) {
     toast(
       `"${agentLabel(agentId)}" is not mounted into "${session}" — enable it on the host ` +
-      '(Settings → Agents), run "Install / update on this host", then recreate the session.',
+      '(Settings → Agents), run "Sync tools", then recreate the session.',
       { variant: 'warning', title: 'Agent not available' },
     );
     return;
@@ -1285,6 +1296,7 @@ async function init(ctx) {
     renderHostFilter(railSessions);
     renderRail(railSessions);
     renderSessionSelect(railSessions);
+    refreshTitles(); // the tab prefix is a host NAME from the cache (FE-QA-06)
   });
   // v0.2: `shell` is the wire value ('bash' | 'sh' | 'agent:<id>'); 'claude' still parses.
   bus.on(EVENTS.OPEN_TERMINAL, ({ session, shell }) => openTerminal(session, shell || 'bash'));

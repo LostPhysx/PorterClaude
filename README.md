@@ -25,7 +25,8 @@ QA-verified end-to-end). See [PLAN.md](PLAN.md), [docs/](docs/) and
 - **Coding agents are data, not code.** Claude Code, opencode, Gemini CLI, Codex CLI and
   Aider ship built in; you can add your own with a JSON definition (npm / pip / installer
   script / plain binary). Recipe images no longer bake an agent in — every session mounts
-  the host's tools volume instead, so upgrading an agent is a *Sync tools*, not a rebuild.
+  the host's tools volume instead, so upgrading an agent is *Upgrade all agents* (a forced
+  **Sync tools**), never an image rebuild.
 - **One login per agent per host.** Each agent gets its own volume
   (`porterclaude-auth-<agentId>`); log in once and every session on that host is
   authenticated. Upgrading from v0.1 imports the existing Claude Code login automatically.

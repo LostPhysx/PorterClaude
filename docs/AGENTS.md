@@ -98,8 +98,8 @@ sync.
 ### Upgrading an agent to a newer release
 
 That carry-over compares the **definition**, not the installed version — and a definition
-does not change when Anthropic, OpenAI or Google ship a new release of their CLI. So *Install
-/ update* alone never moves an installed agent off the version it was installed with. To pick
+does not change when Anthropic, OpenAI or Google ship a new release of their CLI. So a plain
+**Sync tools** never moves an installed agent off the version it was installed with. To pick
 up new upstream versions use the caret next to the button → **Upgrade all agents**:
 
 * every enabled agent is reinstalled from source (`claude` re-resolves its channel, `npm` and
@@ -335,5 +335,5 @@ volume (which is what a `login` command does).
 | the agent asks for a login in every session | a shared path is missing from `sharedPaths`, or the auth volume is still owned by root — recreate the session so the bootstrap re-runs the ownership repair |
 | a login on host A does not work on host B | by design: auth volumes are per host. Log in once per host |
 | a `pip` agent fails on an Alpine session | not supported, see the musl table above — use a glibc image for that session |
-| an agent is stuck on an old version | *Install / update* keeps an installed agent as it is — use **Upgrade all agents** (caret next to the button), then restart the sessions that should get it |
+| an agent is stuck on an old version | a plain *Sync tools* keeps an installed agent as it is — use **Upgrade all agents** (caret next to the button), then restart the sessions that should get it |
 | an agent shows *not installed* with an error | read the error on the card, then the tools sync job log (Settings → Images → Jobs), then `/opt/porterclaude/agents/<id>/ERROR` in any session on that host |

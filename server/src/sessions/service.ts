@@ -19,6 +19,11 @@
 //      (<containerHome>/.porterclaude/agents/<id>) and re-create the agent symlinks.
 //   5. `reconcile()` reads porterclaude.host / porterclaude.agents back from the labels when
 //      it adopts an orphan, and skips hosts it cannot reach.
+//   6. The TOOLS VOLUME of the host is a hard precondition (INT2-2): every v0.2 container
+//      runs `<toolsMount>/entrypoint.sh` as its entrypoint, so a host whose tools volume was
+//      never synced can only produce crash-looping containers. `ToolsReadinessProbe` (the
+//      narrow half of ImageService) is asked before a container is created — an answer it is
+//      sure about refuses the create with 409, everything else never blocks.
 import type { ServiceDeps } from '../context.js';
 import type { GeneralConfig } from '../config/schema.js';
 import { GeneralConfigSchema } from '../config/schema.js';
@@ -102,6 +107,19 @@ export interface ReconcileReport {
 /** What `resolveAgents` needs of a session (a stored config always satisfies it). */
 type SessionAgentRef = Pick<SessionConfig, 'name' | 'hostId' | 'agents'>;
 
+/**
+ * The half of ImageService this service needs: can the tools volume of a host carry a
+ * session at all. Kept as a narrow interface so sessions do not depend on the whole image
+ * service (and so a test can hand in a stub), exactly like TerminalService's
+ * `AgentInstallProbe`. See ImageService.toolsReadiness.
+ */
+export interface ToolsReadinessProbe {
+  toolsReadiness(
+    hostId: string,
+    opts?: { probeImage?: string },
+  ): Promise<'ready' | 'unsynced' | 'unknown'>;
+}
+
 /** A host plus everything a session operation on it needs. */
 interface HostScope {
   host: HostConfig;
@@ -167,7 +185,11 @@ export class SessionService {
    *  config describes the running container even when the spec hash cannot match. */
   private readonly adopted = new Set<string>();
 
-  constructor(private readonly deps: ServiceDeps) {}
+  constructor(
+    private readonly deps: ServiceDeps,
+    /** optional: without it the tools volume is simply never checked (see requireSyncedTools) */
+    private readonly tools?: ToolsReadinessProbe,
+  ) {}
 
   // -------------------------------------------------------------------------
   // hosts
@@ -286,6 +308,23 @@ export class SessionService {
   }
 
   /**
+   * Scan of EVERY host, deduped, plus the subset a `?hostId=` filter asks about (QA B-5).
+   *
+   * The filter must not narrow the SCAN: `dedupeScans` needs at least two scans of the same
+   * engine to decide who owns a container that carries no usable `porterclaude.host` label,
+   * so scanning only the filtered host made every such orphan belong to whoever was filtered
+   * - it showed up under both host filters with a different hostId each time, and a filtered
+   * reconcile adopted it instead of leaving it to the prefix/default owner. The filter is
+   * applied to the RESULT of the deduped scan instead.
+   */
+  private async scanAll(wanted?: string): Promise<{ scans: HostScan[]; active: HostScan[] }> {
+    const scans = this.dedupeScans(
+      await Promise.all(this.deps.hosts.list().map((host) => this.scanHost(host))),
+    );
+    return { scans, active: wanted ? scans.filter((s) => s.host.id === wanted) : scans };
+  }
+
+  /**
    * The host a scanned container belongs to: the `porterclaude.host` label when this install
    * knows that host, else the host whose backend listed it (backend.md §13). A label naming an
    * unknown host must never win — that produced dangling `hostMissing:true` sessions on adopt.
@@ -308,13 +347,13 @@ export class SessionService {
     const wanted = opts?.hostId;
     const configs = this.deps.config.listSessions().filter((c) => !wanted || c.hostId === wanted);
 
-    // `?hostId=` narrows the scan itself: only that host's engine is contacted.
-    const hosts = this.deps.hosts.list().filter((h) => !wanted || h.id === wanted);
-    const scans = this.dedupeScans(await Promise.all(hosts.map((host) => this.scanHost(host))));
+    // `?hostId=` filters the RESULT, not the scan (see scanAll): two hosts on one engine can
+    // only be told apart when both were scanned.
+    const { scans, active } = await this.scanAll(wanted);
     const byHost = new Map(scans.map((scan) => [scan.host.id, scan]));
 
     const views: SessionView[] = [];
-    for (const scan of scans) {
+    for (const scan of active) {
       views.push(...(await this.viewsForHost(scan, configs.filter((c) => c.hostId === scan.host.id))));
     }
     // sessions whose host was deleted (force): still listed, read-only, flagged
@@ -423,6 +462,7 @@ export class SessionService {
    */
   async create(input: SessionInput): Promise<SessionView> {
     const hostId = this.deps.hosts.requireHostId(input.hostId);
+    this.assertKnownAgents(input.agents);
     const scope = this.scope(hostId);
 
     // names are unique ACROSS hosts (api.md v0.2)
@@ -491,6 +531,7 @@ export class SessionService {
         [{ path: ['hostId'], message: `expected '${stored.hostId}'` }],
       );
     }
+    this.assertKnownAgents(input.agents);
     const cfg: SessionConfig = {
       ...input,
       hostId: stored.hostId,
@@ -624,15 +665,16 @@ export class SessionService {
    */
   async reconcile(opts?: { adopt?: boolean; hostId?: string }): Promise<ReconcileReport> {
     const wanted = opts?.hostId;
-    const hosts = this.deps.hosts.list().filter((h) => !wanted || h.id === wanted);
-    const scans = this.dedupeScans(await Promise.all(hosts.map((host) => this.scanHost(host))));
+    // every host is scanned even for a filtered reconcile: only then does dedupeScans know
+    // which host owns a label-less container of a shared engine (QA B-5)
+    const { active } = await this.scanAll(wanted);
 
     const orphans: string[] = [];
     const adopted: string[] = [];
     const missing: string[] = [];
     let running = 0;
 
-    for (const scan of scans) {
+    for (const scan of active) {
       const backend = scan.backend;
       if (scan.warning || !backend) {
         this.deps.log.warn(
@@ -747,6 +789,22 @@ export class SessionService {
         name: agentAuthVolumeFor(scope.general.volumePrefix, agent.id),
         labels: { [CONTAINER_LABELS.managed]: 'true', [VOLUME_AGENT_LABEL]: agent.id },
       });
+    }
+  }
+
+  /**
+   * An explicit `agents` list may only name agents the registry knows: `resolveAgents` drops
+   * unknown ids silently, so without this a typo would be stored, never mounted, and reported
+   * back in `agents` forever. Same rule (and same 422) as PUT /api/hosts/:hostId/agents.
+   */
+  private assertKnownAgents(agents: string[] | null | undefined): void {
+    if (!agents) return;
+    const unknown = [...new Set(agents)].filter((id) => !this.deps.agents.get(id));
+    if (unknown.length > 0) {
+      throw AppError.validation(
+        `unknown agent id(s): ${unknown.join(', ')}`,
+        unknown.map((id) => ({ path: ['agents'], message: `unknown agent '${id}'` })),
+      );
     }
   }
 
@@ -953,6 +1011,12 @@ export class SessionService {
     const agents = this.resolveAgents(cfg);
     const { ref: resolvedImage, imageEnvPath, imageCmd } = await this.resolveImage(scope, cfg);
 
+    // ... and only THEN is the host asked whether it can run a session at all: a tools volume
+    // without the bootstrap produces nothing but a crash-looping container (INT2-2). The
+    // session image is handed to the probe because it is an image that provably exists on
+    // that engine, which is what lets the volume be read on a host that never synced.
+    await this.requireSyncedTools(scope, resolvedImage);
+
     await this.ensureAgentVolumes(scope, agents);
 
     const wanted: string[] = [];
@@ -1118,8 +1182,66 @@ export class SessionService {
     }
   }
 
+  /**
+   * The tools volume of a host is not optional: `buildContainerSpec` gives EVERY v0.2
+   * container `<toolsMount>/entrypoint.sh` as its entrypoint, so a volume that was never
+   * synced makes docker create an empty one and tini crash-loop on
+   * `exec <toolsMount>/entrypoint.sh failed: No such file or directory` — a 201 whose session
+   * never comes up, whose terminals close 4409 and whose cause is only visible in the raw
+   * container logs (INT2-2).
+   *
+   * Refusing the create is the honest answer, and the fix is in the message. Only a probe
+   * that is SURE refuses: an unreachable host, a volume nothing on the engine can read, or a
+   * missing probe altogether answer 'unknown' and the create proceeds as before.
+   */
+  private async requireSyncedTools(scope: HostScope, probeImage?: string): Promise<void> {
+    if ((await this.toolsState(scope, probeImage)) !== 'unsynced') return;
+    throw AppError.conflict(this.toolsNotSyncedMessage(scope), {
+      reason: 'tools_not_synced',
+      hostId: scope.host.id,
+      toolsVolume: scope.general.toolsVolume,
+    });
+  }
+
+  /** `requireSyncedTools` for a container that already exists: a warning, never a refusal. */
+  private async warnUnsyncedTools(scope: HostScope, cfg: SessionConfig): Promise<void> {
+    const probeImage = resolvedImageRefFor(cfg, scope.general);
+    if ((await this.toolsState(scope, probeImage)) !== 'unsynced') return;
+    this.addWarnings(cfg.name, [this.toolsNotSyncedMessage(scope)]);
+  }
+
+  /** 'unknown' whenever there is no probe, or the probe itself broke. */
+  private async toolsState(
+    scope: HostScope,
+    probeImage?: string,
+  ): Promise<'ready' | 'unsynced' | 'unknown'> {
+    if (!this.tools) return 'unknown';
+    try {
+      return await this.tools.toolsReadiness(
+        scope.host.id,
+        probeImage ? { probeImage } : undefined,
+      );
+    } catch (err) {
+      this.deps.log.debug({ err, host: scope.host.id }, 'the tools readiness probe failed');
+      return 'unknown';
+    }
+  }
+
+  private toolsNotSyncedMessage(scope: HostScope): string {
+    return (
+      `the tools volume '${scope.general.toolsVolume}' of host '${scope.host.id}' has not been ` +
+      'synced yet, so a session container on it cannot start (it would crash-loop on the ' +
+      'missing bootstrap); run the tools sync for this host first ' +
+      '(Settings -> Images -> Sync tools volume)'
+    );
+  }
+
   /** Everything that has to happen inside a freshly started session container. */
   private async afterStart(scope: HostScope, cfg: SessionConfig, containerId: string): Promise<void> {
+    // A container that already existed is started without going through createContainerFor
+    // (start/restart), so this is where an unsynced tools volume gets named — the execs below
+    // cannot reach a crash-looping container and would otherwise fail silently.
+    await this.warnUnsyncedTools(scope, cfg);
     const agents = this.tryResolveAgents(cfg);
     await this.ensureHomeWritable(scope, cfg, agents, containerId);
     await this.ensureAgentDirs(scope, cfg, agents, containerId);
@@ -1313,6 +1435,8 @@ export class SessionService {
         for (const link of agentLinks(agent, home)) {
           const target = shQuote(link.target);
           const source = shQuote(link.source);
+          // `{}` is an empty mapping in JSON *and* in YAML; anything else gets a 0-byte file
+          const seed = /\.(json|ya?ml)$/i.test(link.source) ? '{}' : '';
           // An image may SHIP the agent's path (the v0.1 recipes create ~/.claude): that
           // real directory would shadow the auth volume and the login would silently live
           // in the container layer. It is replaced by the symlink - after its content is
@@ -1343,6 +1467,31 @@ export class SessionService {
                 ]
               : []),
             'fi',
+            // A `kind:file` shared path is a symlink into the auth volume, so the SOURCE has
+            // to exist before the link is ever used: aider's configargparse opens
+            // ~/.aider.conf.yml on every start and dies with FileNotFoundError on a dangling
+            // link (INT2-3). The entrypoint seeds it from the inside
+            // (docker/tools/entrypoint.sh link_one), but on a FRESH auth volume it runs
+            // before the chown above and cannot write - so the seed has to happen here, as
+            // root, with exactly the same rules: `{}` (an empty mapping in JSON *and* YAML)
+            // for .json/.yml/.yaml, an empty file otherwise, and a 0-byte structured file an
+            // older build left behind is repaired the same way (QA OPS-2). It runs AFTER the
+            // block above so a real file the image shipped is migrated, never overwritten.
+            ...(link.kind === 'file'
+              ? [
+                  `if [ ! -e ${source} ]; then`,
+                  seed
+                    ? `  printf '%s\\n' ${shQuote(seed)} > ${source} 2>/dev/null || echo "cannot seed ${link.source}" >&2`
+                    : `  : > ${source} 2>/dev/null || echo "cannot seed ${link.source}" >&2`,
+                  ...(seed
+                    ? [
+                        `elif [ -f ${source} ] && [ ! -s ${source} ]; then`,
+                        `  printf '%s\\n' ${shQuote(seed)} > ${source} 2>/dev/null || true`,
+                      ]
+                    : []),
+                  'fi',
+                ]
+              : []),
             `chown -R "$own" ${source} 2>/dev/null || true`,
           );
         }
@@ -1471,7 +1620,10 @@ export class SessionService {
   private addWarnings(name: string, warnings: string[]): void {
     if (!warnings.length) return;
     const current = this.warnings.get(name) ?? [];
-    this.warnings.set(name, [...current, ...warnings].slice(-10));
+    // deduplicated: the same sentence twice carries no more information than once, and the
+    // per-start warnings (an unsynced tools volume, a failed clone) would otherwise fill the
+    // whole buffer with copies of themselves after ten restarts
+    this.warnings.set(name, [...new Set([...current, ...warnings])].slice(-10));
   }
 
   private toView(

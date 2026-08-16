@@ -539,8 +539,8 @@ export class TerminalPane {
       this._renderNote('conn', {
         variant: 'danger',
         text: `the agent "${label}" is not available in this session${detail ? ` (${detail})` : ''}` +
-          ' — enable it on the host under Settings → Agents, run "Install / update on this' +
-          ' host", then recreate the session',
+          ' — enable it on the host under Settings → Agents, run "Sync tools",' +
+          ' then recreate the session',
         actions: [
           { label: 'Open bash instead', onClick: () => this.onOpenBash() },
           { label: 'Close pane', onClick: () => this.onRequestClose() },

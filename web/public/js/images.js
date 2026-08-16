@@ -8,8 +8,10 @@
 // part of the job-tail state as well (`openJob(hostId, jobId)`).
 import { api } from './api.js';
 import { bus, EVENTS } from './bus.js';
-import { byId, toast, toastError, escapeHtml, fmtBytes, fmtDate, storage, LS_PREFIX } from './util.js';
-import { getHosts, resolveHostId, hostOptionsHtml } from './hosts.js';
+import {
+  byId, toast, toastError, escapeHtml, fmtBytes, fmtDate, renderAlert, storage, LS_PREFIX,
+} from './util.js';
+import { getHost, getHosts, hostLabel, resolveHostId, hostOptionsHtml } from './hosts.js';
 
 /** Poll interval for a running job (api.md: builds are polled, not streamed). */
 export const JOB_POLL_MS = 1000;
@@ -24,6 +26,9 @@ let toolsStatus = null;
 /** @type {string} the host this panel is pointed at ('' when there is no host yet) */
 let hostId = '';
 let initialised = false;
+
+/** the last failure of each loader, so #images-alert never flaps between them (FE-QA-07) */
+const loadErrors = { recipes: null, tools: null };
 
 /** job modal state (hostId is part of it: `/api/hosts/:hostId/images/jobs/:id`) */
 const jobState = { hostId: '', id: null, cursor: 0, timer: null, autoScroll: true, status: null };
@@ -60,6 +65,54 @@ export function renderHostSelect() {
   select.innerHTML = hostOptionsHtml(hostId);
   select.value = hostId;
   storage.set(LS_IMAGES_HOST, hostId);
+}
+
+/**
+ * #images-alert: everything below is per host, and an engine that cannot be reached answers
+ * this panel with harmless defaults ("not built", "tools volume is not populated") - which
+ * reads like "nothing installed yet" instead of "nobody could ask". Say it once, at the top.
+ * The banner is driven by the hosts cache (HostView.status/error) and by the last load
+ * failure of this panel, so a 502/409 shows up even before anything probed the host.
+ * FE-QA-07.
+ */
+export function renderHostAlert() {
+  const box = byId('images-alert');
+  if (!box) return;
+  if (!hostId) {
+    renderAlert(box, '');
+    return;
+  }
+  const host = getHost(hostId);
+  const name = escapeHtml(hostLabel(hostId));
+  // the Hosts panel is a SIBLING sub-tab: switching to it through the sub-tab button keeps
+  // images.js free of an import of settings.js (which imports THIS module - see the module
+  // graph in docs/design/frontend.md section 12.2)
+  const link = ' <a href="#" class="alert-link" data-open-hosts>Open Hosts</a> to fix the connection.';
+  if (host && host.status === 'unreachable') {
+    const detail = host.error ? ` - ${escapeHtml(host.error)}` : '';
+    renderAlert(
+      box,
+      `<strong>${name} is unreachable${detail}.</strong> Nothing below could be read from this ` +
+        `engine, so recipes show as "not built" and the tools volume as empty.${link}`,
+      'danger',
+    );
+    return;
+  }
+  if (host && host.status === 'not_configured') {
+    renderAlert(box, `<strong>${name} has no usable connection yet.</strong>${link}`, 'warning');
+    return;
+  }
+  const err = loadErrors.recipes || loadErrors.tools;
+  const code = err && err.code;
+  if (code === 'backend_error' || code === 'backend_not_configured') {
+    renderAlert(
+      box,
+      `<strong>${name} did not answer:</strong> ${escapeHtml(err.message || 'the engine is unreachable')}.${link}`,
+      'danger',
+    );
+    return;
+  }
+  renderAlert(box, '');
 }
 
 function stopJobPoll() {
@@ -109,6 +162,8 @@ export async function reloadRecipes() {
   if (!list) return;
   if (!hostId) {
     recipes = [];
+    loadErrors.recipes = null;
+    renderHostAlert();
     list.innerHTML = `<div class="col-12 text-secondary small">${escapeHtml(NO_HOST_TEXT)}</div>`;
     return;
   }
@@ -118,8 +173,12 @@ export async function reloadRecipes() {
     list.innerHTML = recipes.length
       ? recipes.map(recipeCard).join('')
       : '<div class="col-12 text-secondary small">No recipes reported by the server.</div>';
+    loadErrors.recipes = null;
+    renderHostAlert();
   } catch (err) {
     recipes = [];
+    loadErrors.recipes = err;
+    renderHostAlert();
     // v0.2 copy: it is THIS host that has no usable connection, not "the backend".
     const message = err && err.code === 'backend_not_configured'
       ? 'This host has no usable connection yet - fix it under "Hosts".'
@@ -177,6 +236,8 @@ export async function reloadTools() {
   if (!el) return;
   if (!hostId) {
     toolsStatus = null;
+    loadErrors.tools = null;
+    renderHostAlert();
     el.textContent = NO_HOST_TEXT;
     renderToolsAgents();
     return;
@@ -185,6 +246,8 @@ export async function reloadTools() {
     const res = await api.images.tools(hostId);
     const s = (res && res.status) || {};
     toolsStatus = s;
+    loadErrors.tools = null;
+    renderHostAlert();
     if (s.syncing) {
       el.innerHTML =
         `<span class="spinner-border spinner-border-sm me-1"></span>syncing tools volume <code>${escapeHtml(s.volume || '')}</code>` +
@@ -202,6 +265,8 @@ export async function reloadTools() {
     }
   } catch (err) {
     toolsStatus = null;
+    loadErrors.tools = err;
+    renderHostAlert();
     el.textContent = err && err.code === 'backend_not_configured'
       ? 'tools volume status unavailable (this host has no usable connection)'
       : `tools volume status unavailable: ${(err && err.message) || 'unknown error'}`;
@@ -391,6 +456,9 @@ const imagesPanel = {
       hostSelect.addEventListener('change', () => {
         hostId = hostSelect.value || '';
         storage.set(LS_IMAGES_HOST, hostId);
+        loadErrors.recipes = null;
+        loadErrors.tools = null;
+        renderHostAlert();
         stopJobPoll();
         void reloadRecipes();
         void reloadTools();
@@ -402,11 +470,27 @@ const imagesPanel = {
       const before = hostId;
       renderHostSelect();
       if (before !== hostId) {
+        loadErrors.recipes = null;
+        loadErrors.tools = null;
+      }
+      renderHostAlert(); // a probe may have flipped the status of the selected host
+      if (before !== hostId) {
         void reloadRecipes();
         void reloadTools();
         void reloadJobs();
       }
     });
+
+    const alertBox = byId('images-alert');
+    if (alertBox) {
+      alertBox.addEventListener('click', (e) => {
+        const link = e.target.closest('[data-open-hosts]');
+        if (!link) return;
+        e.preventDefault();
+        const tab = document.querySelector('#settings-subtabs [data-subtab="hosts"]');
+        if (tab) tab.click();
+      });
+    }
 
     const refresh = byId('btn-images-refresh');
     if (refresh) {
@@ -469,6 +553,7 @@ const imagesPanel = {
   },
   show() {
     renderHostSelect();
+    renderHostAlert();
     void reloadRecipes();
     void reloadTools();
     void reloadJobs();

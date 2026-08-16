@@ -230,6 +230,8 @@ describe('TerminalService.open', () => {
       containerAgents?: string[];
       /** ... or only PORTERCLAUDE_AGENT_IDS, for a container whose label was lost */
       containerAgentsEnv?: string[];
+      /** B-9: what the host's TOOLS VOLUME reports for the agent (AGENTS.json) */
+      installState?: 'installed' | 'missing' | 'unknown';
     } = {},
   ) {
     const session = opts.custom
@@ -274,7 +276,8 @@ describe('TerminalService.open', () => {
     const host = hostConfig({ agents: { enabled: opts.hostAgents ?? ['claude'] } });
     const deps = serviceDeps({ config: cfg.store, hosts: stubHostManager(sb.backend, { host }) });
     const sessions = new SessionService(deps);
-    return { terminals: new TerminalService(deps, sessions), sb, deps, cfg };
+    const images = { agentInstallState: async () => opts.installState ?? 'installed' };
+    return { terminals: new TerminalService(deps, sessions, images), sb, deps, cfg };
   }
 
   const execSpec = (sb: ReturnType<typeof stubBackend>) =>
@@ -398,6 +401,34 @@ describe('TerminalService.open', () => {
     await expect(
       terminals.open({ session: 'usr', shell: 'agent', agentId: 'ghost', name: 'main', cols: 80, rows: 24 }),
     ).rejects.toMatchObject({ terminalCode: 'agent_not_available' });
+  });
+
+  // B-9: enabling an agent does not INSTALL it - that needs a tools sync. A session recreated
+  // in between mounts the agent, so the mount gate passes, and the pane used to answer `ready`
+  // and die with `bash: <cmd>: command not found`.
+  it('refuses an agent the container mounts but the tools volume never received', async () => {
+    const { terminals } = makeTerminals({ containerAgents: ['claude'], installState: 'missing' });
+    await expect(
+      terminals.open({ session: 'usr', shell: 'agent', agentId: 'claude', name: 'main', cols: 80, rows: 24 }),
+    ).rejects.toMatchObject({ terminalCode: 'agent_not_available' });
+    await expect(
+      terminals.open({ session: 'usr', shell: 'agent', agentId: 'claude', name: 'main', cols: 80, rows: 24 }),
+    ).rejects.toThrow(/tools sync/);
+  });
+
+  // ...but a manifest that could not be READ (unreachable host, pre-v0.2 tools volume with no
+  // AGENTS.json) must never block a pane that would work.
+  it('opens the pane when the tools manifest says nothing about the agent', async () => {
+    const { terminals } = makeTerminals({ containerAgents: ['claude'], installState: 'unknown' });
+    const opened = await terminals.open({
+      session: 'usr',
+      shell: 'agent',
+      agentId: 'claude',
+      name: 'main',
+      cols: 80,
+      rows: 24,
+    });
+    expect(opened.agentId).toBe('claude');
   });
 
   it('refuses a terminal on a session whose host is gone (host_unavailable / 4411)', async () => {

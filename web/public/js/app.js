@@ -10,7 +10,7 @@ import { byId, toast, toastError, storage, LS_PREFIX } from './util.js';
 import codeView from './code.js';
 import sessionsView from './sessions.js';
 import settingsView from './settings.js';
-import { loadHosts, getHosts, getDefaultHostId, hostLabel } from './hosts.js';
+import { loadHosts, resolveUnknownStatuses, getHosts, getDefaultHostId, hostLabel } from './hosts.js';
 import { loadAgents } from './agents.js';
 
 /**
@@ -303,10 +303,14 @@ export function route() {
  */
 async function loadGlobals() {
   await Promise.all([
-    loadHosts().catch((err) => {
-      if (!(err instanceof ApiError) || err.status !== 401) console.error('[app] failed to load hosts', err);
-      return null;
-    }),
+    loadHosts()
+      // nothing has probed these engines yet - resolve the 'unknown' statuses in the
+      // BACKGROUND (a probe waits for every engine, a dead one included). FE-QA-03.
+      .then(() => { void resolveUnknownStatuses(); })
+      .catch((err) => {
+        if (!(err instanceof ApiError) || err.status !== 401) console.error('[app] failed to load hosts', err);
+        return null;
+      }),
     loadAgents().catch((err) => {
       if (!(err instanceof ApiError) || err.status !== 401) console.error('[app] failed to load agents', err);
       return null;

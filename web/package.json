@@ -1,6 +1,6 @@
 {
   "name": "@porterclaude/web",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "PorterClaude browser UI - plain ES modules, Bootstrap 5 + jQuery 3 + xterm.js 5 + GoldenLayout 2. No bundler.",

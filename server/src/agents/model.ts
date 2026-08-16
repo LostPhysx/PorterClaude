@@ -32,10 +32,36 @@ export const AgentIdSchema = z
   .string()
   .regex(AGENT_ID_RE, 'agent id must be lowercase letters, digits and dashes (max 32 chars)');
 
+/**
+ * `~/…` (relative to the container home) or an absolute POSIX path - and nothing else.
+ *
+ * Every such path becomes a SYMLINK inside the session container (`resolveAgentPath` +
+ * `agentLinks`), so a `..` segment would point the link - and everything the agent writes
+ * through it - at a directory outside the agent's own auth volume (`~/../../etc/passwd`).
+ * `agentPathSlug` also drops `..` silently, so two different traversal paths would collide on
+ * one directory inside the volume. Both are rejected here, where a path enters the system.
+ */
+export const AgentPathSchema = z
+  .string()
+  .min(1)
+  .max(256)
+  .refine((p) => p.startsWith('~/') || p.startsWith('/'), {
+    message: 'path must start with `~/` (the container home) or `/` (absolute)',
+  })
+  .refine((p) => !p.split('/').includes('..'), {
+    message: 'path must not contain `..` segments',
+  })
+  .refine((p) => ![...p].some((c) => c.charCodeAt(0) < 32 || c.charCodeAt(0) === 92), {
+    message: 'path must not contain backslashes or control characters',
+  })
+  .refine((p) => p.replace(/^~/, '').split('/').some((seg) => seg.length > 0), {
+    message: 'path must name something below the container home, not the home itself',
+  });
+
 /** Where an agent keeps state that must be shared between every session on a host. */
 export const AgentSharedPathSchema = z.object({
   /** `~/…` (relative to the container home) or an absolute POSIX path */
-  path: z.string().min(1).max(256),
+  path: AgentPathSchema,
   kind: z.enum(['dir', 'file']),
   /** informational: what lives there ("credentials", "settings", …) */
   note: z.string().max(200).optional(),
@@ -101,10 +127,11 @@ export const AgentDefinitionSchema = z.object({
   install: AgentInstallSchema,
   sharedPaths: z.array(AgentSharedPathSchema).min(1).max(8),
   /**
-   * Conversation history INSIDE one of the sharedPaths (e.g. `~/.claude/projects`).
+   * Conversation history INSIDE one of the sharedPaths (e.g. `~/.claude/projects`); it becomes
+   * a mount target inside the auth volume, so it obeys the same path rules.
    * `session.shareHistory === false` gives the session its own volume for it.
    */
-  historyPath: z.string().max(256).nullable().default(null),
+  historyPath: AgentPathSchema.nullable().default(null),
   /** extra container env this agent needs (merged before the session's own env) */
   env: z.record(z.string(), z.string()).default({}),
   /** one line telling the user how to authenticate ("run `claude` and use /login") */

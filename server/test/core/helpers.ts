@@ -63,14 +63,15 @@ export async function buildContext(env: Record<string, string> = {}): Promise<{ 
     agents,
     backends: hosts.legacyAccess(),
   };
+  const images = new ImageService(deps);
   const ctx: AppContext = {
     ...deps,
     secrets,
     auth: createAuthService({ config, secrets, env: parsed, log }),
     credentials,
     sessions: new SessionService(deps),
-    images: new ImageService(deps),
-    terminals: new TerminalService(deps, new SessionService(deps)),
+    images,
+    terminals: new TerminalService(deps, new SessionService(deps), images),
     version: '0.0.0-test',
     startedAt: Date.now(),
   };

@@ -104,6 +104,16 @@ function makeApp() {
         rec('getJobLines', [id, since, hostId], { lines: ['a'], nextIndex: 1 }),
       cancelJob: (id: string, hostId?: string) => rec('cancelJob', [id, hostId], job),
     },
+    // v0.2: every host-scoped URL resolves its host first - an unknown id is a 404
+    hosts: {
+      require: (hostId: string) => {
+        calls.push({ method: 'requireHost', args: [hostId] });
+        if (hostId !== 'default' && hostId !== 'edge') {
+          throw AppError.notFound(`host '${hostId}' does not exist`);
+        }
+        return { id: hostId };
+      },
+    },
   } as unknown as AppContext;
 
   const app = express();
@@ -322,6 +332,18 @@ describe('/api/hosts/:hostId/images', () => {
   it('422s a host id that is not a slug', async () => {
     const res = await request(makeApp()).get('/api/hosts/NOPE/images/recipes').expect(422);
     expect(res.body.error.code).toBe('validation_error');
+  });
+
+  // B-6: GET ./jobs answers out of an in-memory registry and used to skip the host check,
+  // so an unknown host got 200 {jobs:[]} while every other host-scoped route 404s.
+  it('404s an unknown host on EVERY route, including the in-memory ./jobs list', async () => {
+    const app = makeApp();
+    for (const path of ['', '/recipes', '/jobs', '/jobs/j1', '/tools']) {
+      const res = await request(app).get(`/api/hosts/nope/images${path}`).expect(404);
+      expect(res.body.error.code).toBe('not_found');
+    }
+    // the unknown host never reached the service
+    expect(calls.some((c) => c.method === 'listJobs')).toBe(false);
   });
 
   // the v0.1 flat routes are gone (api.md v0.2 change list #6)

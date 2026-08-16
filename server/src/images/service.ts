@@ -69,6 +69,21 @@ export interface RecipeStatus extends RecipeDef {
   jobId: string | null;
 }
 
+/**
+ * One look INSIDE the tools volume: `error` separates "cannot read" from "there is none".
+ *
+ * `bootstrap` is what makes a session startable at all — every v0.2 container runs
+ * `<toolsMount>/entrypoint.sh` as its entrypoint (sessions/container.ts), so a volume without
+ * it crash-loops the container before anything else can go wrong. `null` means the volume
+ * could not be looked into (no image on the engine to read it with), which callers must treat
+ * as "unknown", never as "not synced".
+ */
+export interface ToolsProbeRead {
+  manifest: ToolsAgentManifest | null;
+  bootstrap: boolean | null;
+  error: string | null;
+}
+
 /** What the tools volume of a host really carries for one agent (from AGENTS.json). */
 export interface AgentToolStatus {
   id: string;
@@ -102,6 +117,13 @@ export interface ToolsStatus {
   outdated: boolean;
   syncing: boolean;
   jobId: string | null;
+  /**
+   * Why this status is incomplete: the host has no usable transport, or reading its volumes /
+   * tools image / AGENTS.json failed. `null` when everything could be read — that is what
+   * separates "nothing was ever synced here" (present:false, error:null) from "the engine did
+   * not answer" (present:false + error).
+   */
+  error: string | null;
 }
 
 export interface CustomImageCheck {
@@ -129,8 +151,20 @@ const TOOLS_SYNC_LABEL = 'porterclaude.tools-sync';
  */
 const TOOLS_FORCE_ENV = 'PORTERCLAUDE_TOOLS_FORCE';
 
-/** how long a read AGENTS.json is served from memory before the volume is read again */
+/** how long a read tools volume (AGENTS.json + entrypoint.sh) is served from memory */
 const MANIFEST_TTL_MS = 30_000;
+
+/** what the volume probe prints when `<toolsMount>/entrypoint.sh` is there and executable */
+const TOOLS_BOOTSTRAP_MARKER = 'PC_TOOLS_BOOTSTRAP_OK';
+
+/**
+ * One `sh -c` that answers both questions the tools volume is asked: is the bootstrap the
+ * session entrypoint needs there, and what does AGENTS.json say. The marker carries no
+ * braces, so `parseAgentManifest` (first `{` .. last `}`) is unaffected by it.
+ */
+const TOOLS_PROBE_CMD =
+  `[ -x /out/entrypoint.sh ] && echo ${TOOLS_BOOTSTRAP_MARKER}; ` +
+  `cat /out/${TOOLS_AGENT_MANIFEST} 2>/dev/null || true`;
 
 /** marker file inside `<prefix>auth-claude` that records the one-time v0.1 login import */
 const LEGACY_IMPORT_MARKER = '.pc-import-v1';
@@ -246,6 +280,11 @@ function versionFromBuildLine(line: BuildLogLine): string | null {
 }
 
 /** `sha256:0123456789ab…` — enough to identify an image in a job log. */
+/** cache key of a tools-volume read: the answer belongs to a (host, volume) pair. */
+function manifestKey(hostId: string, toolsVolume: string): string {
+  return `${hostId}\n${toolsVolume}`;
+}
+
 function shortImageId(id: string): string {
   const hex = id.startsWith('sha256:') ? id.slice(7) : id;
   return `sha256:${hex.slice(0, 12)}`;
@@ -255,8 +294,17 @@ export class ImageService {
   private readonly jobs = new Map<string, JobRecord>();
   /** hostId -> when its tools volume was last populated by THIS process */
   private readonly lastToolsSync = new Map<string, string>();
-  /** hostId -> cached <toolsMount>/AGENTS.json (invalidated after every sync) */
-  private readonly manifests = new Map<string, { at: number; manifest: ToolsAgentManifest | null }>();
+  /**
+   * `manifestKey(hostId, volume)` -> cached look into the tools volume (invalidated after
+   * every sync). Only SUCCESSFUL reads are cached: a manifest that came back null because the
+   * engine was unreachable must not make a recovered host report `installed:false` for
+   * another MANIFEST_TTL_MS. The VOLUME is part of the key because it is a per-host setting a
+   * user can repoint - the answer belongs to the volume that was read, not to the host.
+   */
+  private readonly manifests = new Map<
+    string,
+    { at: number; manifest: ToolsAgentManifest | null; bootstrap: boolean | null }
+  >();
   /** hosts whose legacy claude login was imported in this process (the marker is authoritative) */
   private readonly legacyImported = new Set<string>();
   /** image id -> the Claude Code version that image ships (null = read failed) */
@@ -425,7 +473,7 @@ export class ImageService {
     const general = this.deps.hosts.settingsFor(hostId);
     const imageRef = toolsImageRef(general.imageNamespace);
     const job = this.runningJobFor(hostId, 'tools-sync', general.toolsVolume);
-    const backend = this.tryBackend(hostId);
+    const transport = this.backendOrError(hostId);
 
     let present = false;
     let claudeVersion: string | null = null;
@@ -441,21 +489,27 @@ export class ImageService {
       this.deps.log.debug({ err }, 'hashing the tools context failed');
     }
 
-    if (backend) {
+    // first transport/read failure wins: it is what the panel shows instead of pretending
+    // "not built / not populated" for a host that simply did not answer
+    let error: string | null = transport.error;
+    if (transport.backend) {
+      const engine = transport.backend;
       try {
-        const volumes = await backend.listVolumes();
+        const volumes = await engine.listVolumes();
         present = volumes.some((v) => v.name === general.toolsVolume);
       } catch (err) {
+        error = error ?? errMessage(err);
         this.deps.log.debug({ err }, 'listing volumes for tools status failed');
       }
       try {
-        const inspect = await backend.inspectImage(imageRef);
+        const inspect = await engine.inspectImage(imageRef);
         built = Boolean(inspect);
-        claudeVersion = this.claudeVersionOf(backend, inspect?.id ?? null);
+        claudeVersion = this.claudeVersionOf(engine, inspect?.id ?? null);
         claudeChannel = inspect?.labels[IMAGE_LABELS.claudeVersion] ?? null;
         imageHash = inspect?.labels[IMAGE_LABELS.contextHash] ?? null;
         lastSyncedAt = lastSyncedAt ?? inspect?.createdAt ?? inspect?.labels[IMAGE_LABELS.builtAt] ?? null;
       } catch (err) {
+        error = error ?? errMessage(err);
         this.deps.log.debug({ err, imageRef }, 'inspecting tools image failed');
       }
     }
@@ -464,7 +518,8 @@ export class ImageService {
     // on a fresh install "nothing built yet" is already reported by present:false.
     const outdated = Boolean(contextHash) && (built ? imageHash !== contextHash : present);
 
-    const agents = await this.agentStatuses(hostId);
+    const { statuses: agents, error: manifestError } = await this.agentStatusesWithError(hostId);
+    error = error ?? manifestError;
     // the `claude` entry of the manifest is the authoritative version once a v0.2 sync ran;
     // the image probe above only says what the tools IMAGE ships (kept for compatibility)
     const claudeAgent = agents.find((a) => a.id === 'claude');
@@ -483,6 +538,7 @@ export class ImageService {
       outdated,
       syncing: Boolean(job),
       jobId: job?.id ?? null,
+      error,
     };
   }
 
@@ -621,12 +677,16 @@ export class ImageService {
         throw AppError.internal(`tools sync container exited with code ${exitCode}`);
       }
       this.lastToolsSync.set(hostId, new Date().toISOString());
-      this.manifests.delete(hostId);
+      this.manifests.delete(manifestKey(hostId, general.toolsVolume));
       this.append(job, `tools volume ${general.toolsVolume} populated`);
 
       // a single failed agent is a warning, never a failed sync
-      const manifest = await this.readAgentManifest(backend, general);
-      this.manifests.set(hostId, { at: Date.now(), manifest });
+      const { manifest, bootstrap } = await this.readToolsVolume(backend, general);
+      this.manifests.set(manifestKey(hostId, general.toolsVolume), {
+        at: Date.now(),
+        manifest,
+        bootstrap,
+      });
       for (const agent of manifest?.agents ?? []) {
         this.append(
           job,
@@ -688,11 +748,24 @@ export class ImageService {
     const hasHome = volumes.includes(general.sharedClaudeHomeVolume);
     const script = [
       'set -u',
-      `if [ -f /auth/${LEGACY_IMPORT_MARKER} ]; then echo ${IMPORT_SKIPPED}; exit 0; fi`,
+      // The marker alone is not proof of a complete import: an earlier (all-or-nothing) run
+      // could stamp it while .credentials.json never made it across. Skip only when the
+      // marker is present AND the login is actually there (or the legacy volume has none).
+      `if [ -f /auth/${LEGACY_IMPORT_MARKER} ] && { [ -f /auth/claude/.credentials.json ] || [ ! -f /legacy/.credentials.json ]; }; then echo ${IMPORT_SKIPPED}; exit 0; fi`,
+      `[ -f /auth/${LEGACY_IMPORT_MARKER} ] && echo "marker present but the v0.1 login is missing - importing again"`,
       'mkdir -p /auth/claude',
-      'if [ -n "$(ls -A /legacy 2>/dev/null)" ] && [ -z "$(ls -A /auth/claude 2>/dev/null)" ]; then',
-      '  cp -a /legacy/. /auth/claude/ || { echo "copying the v0.1 login failed" >&2; exit 1; }',
-      'fi',
+      // Copy ENTRY BY ENTRY and never clobber, instead of "only into an empty directory":
+      // the target volume is regularly non-empty by the time the first tools sync runs
+      // (v0.2 creates <prefix>auth-claude on the first session create, and an agent terminal
+      // opened before the sync already writes cache/ and projects/ into it). An
+      // all-or-nothing guard skips the WHOLE import then — .credentials.json included — and
+      // the marker below makes that permanent, so the operator silently loses the v0.1 login.
+      'for p in /legacy/.[!.]* /legacy/..?* /legacy/*; do',
+      '  [ -e "$p" ] || continue',
+      '  b=${p##*/}',
+      '  [ -e "/auth/claude/$b" ] && continue',
+      '  cp -a "$p" "/auth/claude/$b" || { echo "copying the v0.1 login failed" >&2; exit 1; }',
+      'done',
       hasHome
         ? 'if [ -f /legacy-home/.claude.json ] && [ ! -e /auth/claude.json ]; then cp -a /legacy-home/.claude.json /auth/claude.json; fi'
         : ':',
@@ -1037,55 +1110,164 @@ export class ImageService {
    * instead of throwing — the Images/agents panel must render for a dead host too.
    */
   async agentStatuses(hostId: string): Promise<AgentToolStatus[]> {
+    return (await this.agentStatusesWithError(hostId)).statuses;
+  }
+
+  /**
+   * `agentStatuses` plus WHY the manifest is missing: an unreachable host answers
+   * `installed:false` for every agent, and without this error string the panel cannot tell
+   * that apart from "enabled but never synced" (api.md: an unreachable host answers
+   * installed:false plus an error instead of a 502).
+   */
+  async agentStatusesWithError(
+    hostId: string,
+  ): Promise<{ statuses: AgentToolStatus[]; error: string | null }> {
     const host = this.deps.hosts.get(hostId);
-    if (!host) return [];
+    if (!host) return { statuses: [], error: null };
     const enabled = this.enabledAgents(host);
     const general = this.deps.hosts.settingsForHost(host);
 
-    const manifest = await this.agentManifest(hostId, general);
+    const { manifest, error } = await this.agentManifest(hostId, general);
     const known = new Map((manifest?.agents ?? []).map((a) => [a.id, a]));
     const ids = [...new Set([...enabled.map((a) => a.id), ...known.keys()])];
-    return ids.map((id): AgentToolStatus => {
+    const statuses = ids.map((id): AgentToolStatus => {
       const entry = known.get(id);
       return {
         id,
         installed: Boolean(entry?.installed),
         version: entry?.version ?? null,
         installedAt: entry ? manifest?.syncedAt ?? null : null,
-        error: entry?.error ?? null,
+        error: entry?.error ?? error,
       };
     });
+    return { statuses, error };
   }
 
-  /** cached `<toolsMount>/AGENTS.json` of a host (null when it cannot be read). */
-  private async agentManifest(
+  /**
+   * What the tools volume of `hostId` says about ONE agent:
+   *   'installed' - the manifest lists it as installed
+   *   'missing'   - the manifest was read and does NOT list it (or lists it as failed)
+   *   'unknown'   - the manifest could not be read at all (unreachable host, tools image
+   *                 never built, or a pre-v0.2 volume that carries no AGENTS.json)
+   * Callers must treat 'unknown' as "do not block": a v0.1 tools volume works fine and has
+   * no manifest to prove it.
+   */
+  async agentInstallState(
+    hostId: string,
+    agentId: string,
+  ): Promise<'installed' | 'missing' | 'unknown'> {
+    const host = this.deps.hosts.get(hostId);
+    if (!host) return 'unknown';
+    const { manifest } = await this.agentManifest(hostId, this.deps.hosts.settingsForHost(host));
+    if (!manifest) return 'unknown';
+    const entry = manifest.agents.find((a) => a.id === agentId);
+    return entry?.installed ? 'installed' : 'missing';
+  }
+
+  /**
+   * Is the tools volume of `hostId` usable by a SESSION (INT2-2)?
+   *
+   *   'ready'    - the volume carries `<toolsMount>/entrypoint.sh`, so a container created
+   *                against it can actually start;
+   *   'unsynced' - the volume does not exist, or exists without the bootstrap: EVERY session
+   *                on this host would crash-loop with
+   *                `exec <toolsMount>/entrypoint.sh failed: No such file or directory`
+   *                (docker creates the empty volume on the way, so the second attempt is no
+   *                better than the first). The fix is always a tools sync;
+   *   'unknown'  - nothing could be established (no transport, listing failed, or no image on
+   *                the engine to read the volume with). Like every other probe in this
+   *                codebase, 'unknown' must never block something that would work.
+   *
+   * `opts.probeImage` is an image known to exist ON THAT ENGINE (the session's own image): it
+   * lets the volume be read even when the tools image was never built or has been pruned,
+   * which is exactly the "never synced" case this gate is for.
+   */
+  async toolsReadiness(
+    hostId: string,
+    opts?: { probeImage?: string },
+  ): Promise<'ready' | 'unsynced' | 'unknown'> {
+    const host = this.deps.hosts.get(hostId);
+    if (!host) return 'unknown';
+    const general = this.deps.hosts.settingsForHost(host);
+    const { backend } = this.backendOrError(hostId);
+    if (!backend) return 'unknown';
+
+    try {
+      const volumes = await backend.listVolumes();
+      // the volume does not exist yet: nothing was ever synced here, and docker would create
+      // it empty on the way into the session
+      if (!volumes.some((v) => v.name === general.toolsVolume)) return 'unsynced';
+    } catch (err) {
+      this.deps.log.debug({ err, hostId }, 'listing volumes for the tools readiness failed');
+      return 'unknown';
+    }
+
+    const { bootstrap, error } = await this.toolsVolumeRead(hostId, general, opts?.probeImage);
+    if (error || bootstrap === null) return 'unknown';
+    return bootstrap ? 'ready' : 'unsynced';
+  }
+
+  /**
+   * cached look into the tools volume of a host (`AGENTS.json` + the bootstrap). `error` is
+   * set when the read FAILED (as opposed to "there is nothing there"); such a result is
+   * deliberately not cached, so a host that comes back reports the truth on the next poll
+   * instead of MANIFEST_TTL_MS later.
+   */
+  private async toolsVolumeRead(
     hostId: string,
     general: GeneralConfig,
-  ): Promise<ToolsAgentManifest | null> {
-    const cached = this.manifests.get(hostId);
-    if (cached && Date.now() - cached.at < MANIFEST_TTL_MS) return cached.manifest;
-    const backend = this.tryBackend(hostId);
-    const manifest = backend ? await this.readAgentManifest(backend, general) : null;
-    this.manifests.set(hostId, { at: Date.now(), manifest });
-    return manifest;
+    probeImage?: string,
+  ): Promise<ToolsProbeRead> {
+    const key = manifestKey(hostId, general.toolsVolume);
+    const cached = this.manifests.get(key);
+    // an entry that could not look INTO the volume is no answer for a caller that brings an
+    // image to read it with
+    const usable = cached && (cached.bootstrap !== null || !probeImage);
+    if (cached && usable && Date.now() - cached.at < MANIFEST_TTL_MS) {
+      return { manifest: cached.manifest, bootstrap: cached.bootstrap, error: null };
+    }
+    const { backend, error } = this.backendOrError(hostId);
+    const result = backend
+      ? await this.readToolsVolume(backend, general, probeImage)
+      : { manifest: null, bootstrap: null, error };
+    if (!result.error) {
+      this.manifests.set(key, {
+        at: Date.now(),
+        manifest: result.manifest,
+        bootstrap: result.bootstrap,
+      });
+    }
+    return result;
   }
 
-  /** `cat <volume>/AGENTS.json` in a one-shot container built from the tools image. */
-  private async readAgentManifest(
+  /** cached `<toolsMount>/AGENTS.json` of a host (see `toolsVolumeRead`). */
+  private async agentManifest(hostId: string, general: GeneralConfig): Promise<ToolsProbeRead> {
+    return this.toolsVolumeRead(hostId, general);
+  }
+
+  /**
+   * `cat <volume>/AGENTS.json` plus `test -x <volume>/entrypoint.sh` in a one-shot container.
+   * It runs from the tools image; when that image is not on the engine (nothing was ever
+   * synced, or it was pruned) `probeImage` is used instead - any image with a `/bin/sh` can
+   * read a mounted volume, and without that fallback the answer would stay 'unknown' in
+   * precisely the case a caller needs it most.
+   */
+  private async readToolsVolume(
     backend: DockerBackend,
     general: GeneralConfig,
-  ): Promise<ToolsAgentManifest | null> {
-    const imageRef = toolsImageRef(general.imageNamespace);
+    probeImage?: string,
+  ): Promise<ToolsProbeRead> {
     const name = `porterclaude-agents-${shortId(4)}`;
     let containerId: string | null = null;
     try {
-      const image = await backend.inspectImage(imageRef);
-      if (!image) return null; // nothing was ever synced on this host
+      const imageRef = await this.probeImageRef(backend, general, probeImage);
+      // nothing on this engine can read the volume: a real "unknown", not a failure
+      if (!imageRef) return { manifest: null, bootstrap: null, error: null };
       const created = await backend.createContainer({
         name,
         image: imageRef,
         entrypoint: ['/bin/sh', '-c'],
-        cmd: [`cat /out/${TOOLS_AGENT_MANIFEST} 2>/dev/null || true`],
+        cmd: [TOOLS_PROBE_CMD],
         labels: { 'porterclaude.probe': 'true' },
         mounts: [{ type: 'volume', source: general.toolsVolume, target: '/out', readOnly: true }],
         restartPolicy: 'no',
@@ -1093,10 +1275,15 @@ export class ImageService {
       containerId = created.id;
       await backend.startContainer(containerId);
       await backend.waitContainer(containerId);
-      return parseAgentManifest(await backend.containerLogs(containerId, { tail: 200 }));
+      const raw = await backend.containerLogs(containerId, { tail: 200 });
+      return {
+        manifest: parseAgentManifest(raw),
+        bootstrap: raw.includes(TOOLS_BOOTSTRAP_MARKER),
+        error: null,
+      };
     } catch (err) {
-      this.deps.log.debug({ err }, 'reading AGENTS.json from the tools volume failed');
-      return null;
+      this.deps.log.debug({ err }, 'reading the tools volume failed');
+      return { manifest: null, bootstrap: null, error: errMessage(err) };
     } finally {
       if (containerId) {
         try {
@@ -1106,6 +1293,18 @@ export class ImageService {
         }
       }
     }
+  }
+
+  /** the tools image when it is on the engine, else the caller's fallback, else null. */
+  private async probeImageRef(
+    backend: DockerBackend,
+    general: GeneralConfig,
+    probeImage?: string,
+  ): Promise<string | null> {
+    const imageRef = toolsImageRef(general.imageNamespace);
+    if (await backend.inspectImage(imageRef)) return imageRef;
+    if (!probeImage) return null;
+    return (await backend.inspectImage(probeImage)) ? probeImage : null;
   }
 
   /** definitions of the agents a host enables (unknown ids are dropped by the registry). */
@@ -1120,11 +1319,16 @@ export class ImageService {
 
   /** `hosts.tryBackendFor` that also survives a manager that throws instead of answering null. */
   private tryBackend(hostId: string): DockerBackend | null {
+    return this.backendOrError(hostId).backend;
+  }
+
+  /** `tryBackend` that keeps WHY there is no transport (missing credential, tcp/ssh, ...). */
+  private backendOrError(hostId: string): { backend: DockerBackend | null; error: string | null } {
     try {
-      return this.deps.hosts.tryBackendFor(hostId);
+      return { backend: this.deps.hosts.backendFor(hostId), error: null };
     } catch (err) {
       this.deps.log.debug({ err, hostId }, 'the host has no usable transport');
-      return null;
+      return { backend: null, error: errMessage(err) };
     }
   }
 

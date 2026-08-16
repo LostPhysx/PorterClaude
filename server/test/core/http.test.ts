@@ -466,6 +466,32 @@ describe('/api/agents', () => {
     expect((await request(h.app).get('/api/agents/nope').set('Cookie', cookie)).status).toBe(404);
   });
 
+  // B-8: a sharedPath becomes a SYMLINK inside the session container, so `..` would point it
+  // outside the agent's auth volume (`~/../../etc/passwd` was accepted and stored).
+  it('422s a sharedPath / historyPath that escapes the container home', async () => {
+    const cookie = await login();
+    for (const bad of ['~/../../etc/passwd', '~/.mycoder/../../root', 'relative/path', '~']) {
+      const res = await request(h.app)
+        .post('/api/agents')
+        .set('Cookie', cookie)
+        .send({ ...custom, id: 'bad', sharedPaths: [{ path: bad, kind: 'dir' }] });
+      expect(res.status, bad).toBe(422);
+      expect(res.body.error.code).toBe('validation_error');
+    }
+    const badHistory = await request(h.app)
+      .post('/api/agents')
+      .set('Cookie', cookie)
+      .send({ ...custom, id: 'bad2', historyPath: '~/.mycoder/../../etc' });
+    expect(badHistory.status).toBe(422);
+
+    // ...while an absolute path outside the home is still fine (it is inside the container)
+    const ok = await request(h.app)
+      .post('/api/agents')
+      .set('Cookie', cookie)
+      .send({ ...custom, id: 'absolute', sharedPaths: [{ path: '/etc/mycoder', kind: 'dir' }] });
+    expect(ok.status).toBe(201);
+  });
+
   it('409s a DELETE while a host enables the agent and strips it with force=1', async () => {
     const cookie = await login();
     await request(h.app).post('/api/agents').set('Cookie', cookie).send(custom);

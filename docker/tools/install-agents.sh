@@ -333,7 +333,7 @@ write_manifest() {
   if [ -n "$claude_version" ]; then
     printf '%s\n' "$claude_version" > "$MOUNT/VERSION"
   else
-    : > "$MOUNT/VERSION"
+    printf '' > "$MOUNT/VERSION"
   fi
   chmod 0644 "$MOUNT/VERSION"
 }

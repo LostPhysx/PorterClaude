@@ -43,6 +43,15 @@ export interface OpenTerminalResult {
   reattached: boolean;
 }
 
+/**
+ * The half of ImageService this service needs: what the host's TOOLS VOLUME says about an
+ * agent. Kept as a narrow interface so terminals do not depend on the whole image service
+ * (and so a test can hand in a stub). See ImageService.agentInstallState.
+ */
+export interface AgentInstallProbe {
+  agentInstallState(hostId: string, agentId: string): Promise<'installed' | 'missing' | 'unknown'>;
+}
+
 /** capability probes are cheap but not free: cache them per container for a minute. */
 const PROBE_TTL_MS = 60_000;
 
@@ -61,7 +70,12 @@ export class TerminalService {
   private readonly paths = new Map<string, PathEntry>();
   private readonly streams = new Map<string, ExecStream>();
 
-  constructor(private readonly deps: ServiceDeps, private readonly sessions: SessionService) {}
+  constructor(
+    private readonly deps: ServiceDeps,
+    private readonly sessions: SessionService,
+    /** optional: without it the tools-volume gate below is simply not applied */
+    private readonly images?: AgentInstallProbe,
+  ) {}
 
   /**
    * 1. sessions.requireRunningContainer(session)
@@ -86,6 +100,7 @@ export class TerminalService {
     let agentId: string | null = null;
     if (input.shell === 'agent') {
       const def = this.requireMountedAgent(input, config, containerAgents);
+      await this.requireSyncedAgent(hostId, def.id, input.session);
       agentId = def.id;
       agentCommand = agentCommandLine(def);
     }
@@ -217,6 +232,35 @@ export class TerminalService {
       );
     }
     return def;
+  }
+
+  /**
+   * Second half of the `agent:<id>` gate: the container may MOUNT the agent (it was enabled
+   * when the session was created) while the host's tools volume never received it, because
+   * enabling an agent does not install it - that needs a tools sync. There is no shim on the
+   * PATH in that case, so answering `ready` hands the user a pane that dies with
+   * `bash: <cmd>: command not found`. `agent_not_available` (4410) with the fix in the message
+   * is the honest answer.
+   *
+   * Only a manifest that was actually READ can refuse: 'unknown' (unreachable host, tools
+   * image not built, or a pre-v0.2 volume that carries no AGENTS.json) must never block a
+   * pane that would work.
+   */
+  private async requireSyncedAgent(hostId: string, agentId: string, session: string): Promise<void> {
+    if (!this.images) return;
+    let state: 'installed' | 'missing' | 'unknown';
+    try {
+      state = await this.images.agentInstallState(hostId, agentId);
+    } catch (err) {
+      this.deps.log.debug({ err, hostId, agentId }, 'reading the tools manifest for a pane failed');
+      return; // never refuse because the probe itself broke
+    }
+    if (state !== 'missing') return;
+    throw TerminalRefusal.agentNotAvailable(
+      `agent '${agentId}' is enabled for session '${session}' but not installed in the tools ` +
+        `volume of host '${hostId}'; run the tools sync (Settings -> Images -> Sync tools volume) ` +
+        'and open the pane again',
+    );
   }
 
   /** the agents a session is CONFIGURED for; a dangling host is a 4411, never a crash. */

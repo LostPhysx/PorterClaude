@@ -16,7 +16,7 @@ import { api } from './api.js';
 import { bus, EVENTS } from './bus.js';
 import { byId, toast, toastError, confirmDialog, escapeHtml, fmtDate, storage, LS_PREFIX } from './util.js';
 import { openJob } from './images.js';
-import { getHosts, hostLabel, hostOptionsHtml, resolveHostId } from './hosts.js';
+import { getHost, getHosts, hostLabel, hostOptionsHtml, resolveHostId } from './hosts.js';
 
 /** localStorage key remembering which host the Agents panel is pointed at. */
 export const LS_AGENTS_HOST = `${LS_PREFIX}agents.host`;
@@ -131,9 +131,19 @@ export function renderHostSelect(hosts) {
   select.value = panelHostId;
   storage.set(LS_AGENTS_HOST, panelHostId);
   if (note) {
+    // an unreachable engine answers with installed:false everywhere - say why, or the cards
+    // read as "nothing installed yet" (FE-QA-07)
+    const host = getHost(panelHostId);
+    const unreachable = host && host.status === 'unreachable'
+      ? `${hostLabel(panelHostId)} is unreachable${host.error ? ` (${host.error})` : ''} - the install `
+        + 'state below could not be read. '
+      : '';
     note.textContent =
+      unreachable +
       `Agents are installed into the tools volume of ${hostLabel(panelHostId)}. ` +
       'Nothing is synced between hosts: every host installs and logs in on its own.';
+    note.classList.toggle('text-danger', !!unreachable);
+    note.classList.toggle('text-secondary', !unreachable);
   }
 }
 
@@ -195,7 +205,8 @@ function agentCard(agent, state) {
     : '';
 
   return (
-    '<div class="col-12 col-lg-6"><div class="card pc-agent-card h-100"><div class="card-body">' +
+    // the card wrapper carries data-agent-id (DOM contract, frontend.md section 12.4)
+    `<div class="col-12 col-lg-6"><div class="card pc-agent-card h-100" data-agent-id="${escapeHtml(id)}"><div class="card-body">` +
     '<div class="d-flex align-items-start gap-2 mb-1">' +
     `<i class="bi ${escapeHtml(agentIcon(id))}"></i>` +
     `<h6 class="card-title mb-0 me-auto">${escapeHtml(agent.name || id)}` +
@@ -299,7 +310,7 @@ export async function setAgentEnabled(agentId, enabled) {
     renderAgentCards();
     toast(
       enabled
-        ? `Enabled on ${hostLabel(panelHostId)}. Run "Install / update on this host", then recreate the sessions that should mount it.`
+        ? `Enabled on ${hostLabel(panelHostId)}. Run "Sync tools", then recreate the sessions that should mount it.`
         : `Disabled on ${hostLabel(panelHostId)}. Sessions keep the mount until they are recreated.`,
       { variant: enabled ? 'success' : 'info', title: agentLabel(agentId) },
     );

@@ -438,7 +438,9 @@ ws.binaryType = 'arraybuffer'
    never round-trips).
 7. Sessions: create a session with recipe `node` and a volume workspace → row appears with
    status; Start/Stop/Logs work; Edit → recreate keeps the workspace; Destroy without
-   `removeVolumes` leaves `porterclaude-ws-<name>`.
+   `removeVolumes` leaves `<volumePrefix>ws-<name>` (the prefix comes from the host's
+   effective settings — `HostView.settings.volumePrefix` — never hard-coded, and the destroy
+   confirm names exactly that volume).
 8. Code: open `bash` in a running session → prompt within a second; type `echo hi`; drag the
    tab to the right half → split pane, both terminals still live and resized correctly
    (`stty size` inside matches the pane).
@@ -514,7 +516,7 @@ app.js ─▶ api.js ─▶ bus.js
    ├─▶ agents.js  ─▶ api/util/bus, hosts.js, images.js (openJob)
    ├─▶ sessions.js ─▶ api/util/bus, hosts.js, agents.js
    ├─▶ settings.js ─▶ hosts.js, agents.js, images.js
-   └─▶ code.js    ─▶ terminal.js, sessions.js, settings.js, agents.js
+   └─▶ code.js    ─▶ terminal.js, sessions.js, settings.js, agents.js, hosts.js
                        images.js ─▶ api/util, hosts.js
 ```
 
@@ -622,15 +624,25 @@ are `input[data-agent-toggle]`, `[data-agent-edit]`, `[data-agent-delete]`); mod
 `#agent-modal` (`#agent-form`, `#agent-modal-title`, `#af-preset`, `#af-json`,
 `#agent-form-error`, `#btn-agent-save`).
 
-**Settings → Images (F1)** — `#images-host-select`, `#tools-agents` (new); the rest unchanged.
+**Settings → Images (F1)** — `#images-host-select`, `#images-alert` (the "this host is
+unreachable" banner: everything else in the panel degrades to harmless defaults, which reads
+like "nothing built yet" instead of "nobody could ask"), `#tools-agents` (new); the rest
+unchanged.
 
 ## 12.5 Flows
 
 ### Hosts (F1)
 
 * `GET /api/hosts` is called **without** `probe` on every panel entry (it answers from the
-  server's ≤15 s cache and never blocks on a dead engine). `probe=1` only on the explicit
-  refresh button and right after a save.
+  server's ≤15 s cache and never blocks on a dead engine). `probe=1` on the explicit refresh
+  button, right after a save or an endpoint import, and **once** after a plain load that still
+  reports `status: "unknown"` for a host — nothing has probed that engine yet, and a panel
+  that shows every host as "unknown" until the user presses Refresh is not a status.
+* `#credential-modal` opens **on top of** `#host-modal` ("+ Add credential…"). Bootstrap 5
+  does not stack modals, so the panel lifts the upper dialog (and its backdrop) above the one
+  below it and re-applies `body.modal-open` + the scrollbar compensation when the upper dialog
+  closes over an open one; `saveCredential()` reads the "opened from the host form" flag
+  **before** `hide()`/`await`, because the `hidden.bs.modal` handler clears it.
 * Add host: name → id (auto-slug, editable on create only) → connection. A **second socket
   host is impossible**: when another host already uses `socket`, the radio is disabled with
   "the app runs on exactly one machine" (the server answers `409` regardless).
@@ -658,9 +670,10 @@ are `input[data-agent-toggle]`, `[data-agent-edit]`, `[data-agent-delete]`); mod
   `GET /api/hosts/:hostId/agents`: enabled switch, `installed`/`version`/`installedAt`, and
   the install `error` when the last sync failed for that agent.
 * Enabling installs **nothing**. The toast after a successful `PUT …/agents` must say:
-  *"Enabled on `<host>`. Run 'Install / update on this host', then recreate the sessions that
+  *"Enabled on `<host>`. Run 'Sync tools', then recreate the sessions that
   should mount it."* — that is the whole mental model of v0.2 in one sentence.
-* "Install / update on this host" = `POST /api/hosts/:hostId/images/tools/sync`, whose job log
+* "Sync tools" (`#btn-agents-sync`; the Images panel button `#btn-tools-sync` carries the SAME
+  label, and so do the docs) = `POST /api/hosts/:hostId/images/tools/sync`, whose job log
   opens in the shared `#job-modal` (`openJob(hostId, id)`); a `409` opens the running job.
 * Custom agents are edited as **JSON** (`#af-json`), prefilled from `AGENT_TEMPLATE` or from a
   built-in via `#af-preset`. A parse error is inline, never a toast; a `422` renders the zod
@@ -691,8 +704,15 @@ are `input[data-agent-toggle]`, `[data-agent-edit]`, `[data-agent-delete]`); mod
   default host first, hosts sorted by name); a single host renders exactly the v0.1 flat list.
   Quick actions: bash and the session's **first** `resolvedAgent`
   (`data-open="agent:<id>"`, `agentIcon(id)`, title "Open `<agentLabel(id)>`").
+* Host **names** (rail group heads, `#code-host-filter` labels, the `<host>/` tab prefix)
+  come from the hosts cache — `hostLabel(session.hostId)`, with `SessionView.hostName` as the
+  fallback for a host the cache no longer knows. `hostName` rides on the row that carried it
+  and an adopted/orphan row can name the host that *scanned* it, which labelled every group
+  and tab identically (FE-QA-06). `code.js` therefore imports `hosts.js`; that closes no cycle
+  (`hosts.js` imports `api`/`bus`/`util`/`settings.js` only) and titles are repainted on
+  `hosts:changed`.
 * Toolbar: `#code-host-filter` (hidden with ≤1 host), `#code-session-select` (labels become
-  `<session> — <hostName>` with more than one host), `bash`, `sh`, and the **Agent** dropdown
+  `<session> — <host name>` with more than one host), `bash`, `sh`, and the **Agent** dropdown
   filled from the selected session's `resolvedAgents` via `agentLabel`/`agentIcon`.
   A session without agents shows a disabled item plus a link to Settings → Agents.
   The menu is rebuilt on `sessions:changed`, `agents:changed` and on every select change.

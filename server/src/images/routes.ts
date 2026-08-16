@@ -42,8 +42,13 @@ const ImageBody = z.object({ image: z.string().min(1).max(400) });
 export function createImagesRouter(ctx: AppContext): Router {
   const router = Router({ mergeParams: true });
 
-  /** the host of this request (404 when unknown) */
-  const host = (req: Request): string => parseParams(HostIdParamsSchema, req).hostId;
+  /**
+   * The host of this request. `hosts.require` is what makes an UNKNOWN host id a 404 on every
+   * route of this router (api.md: "host-scoped URLs: an unknown id is 404 not_found") - the
+   * service layer only enforces it where it needs settings or a transport, so a pure
+   * in-memory route like GET ./jobs would otherwise answer 200 with an empty list.
+   */
+  const host = (req: Request): string => ctx.hosts.require(parseParams(HostIdParamsSchema, req).hostId).id;
 
   // --- literal segments first ---------------------------------------------
   router.get(

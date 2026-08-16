@@ -133,11 +133,48 @@ function imageLabel(session) {
   return image.ref || '-';
 }
 
+/** Last-resort volume prefix when no host (and therefore no settings) is known yet. */
+const FALLBACK_VOLUME_PREFIX = 'porterclaude-';
+
+/**
+ * The effective `general.volumePrefix` of a host - HostView.settings already carries the
+ * general settings merged with the per-host overrides, so a host with its own prefix names
+ * its volumes correctly here too (FE-QA-02).
+ * @param {string} hostId
+ * @returns {string}
+ */
+function volumePrefixOf(hostId) {
+  const host = getHost(hostId);
+  const prefix = host && host.settings && host.settings.volumePrefix;
+  return typeof prefix === 'string' && prefix ? prefix : FALLBACK_VOLUME_PREFIX;
+}
+
+/**
+ * The workspace volume of a session: the name the server filled in, else the default
+ * `<volumePrefix>ws-<name>` of ITS host.
+ * @param {any} session
+ * @returns {string}
+ */
+function workspaceVolumeName(session) {
+  const ws = (session && session.workspace) || {};
+  return ws.volume || `${volumePrefixOf(session && session.hostId)}ws-${(session && session.name) || ''}`;
+}
+
+/**
+ * Placeholder of #sf-ws-volume-name: the name the server would pick for the host the form
+ * currently points at.
+ * @param {string} hostId
+ * @returns {string}
+ */
+function volumeNamePlaceholder(hostId) {
+  return `volume name (blank = ${volumePrefixOf(hostId)}ws-<name>)`;
+}
+
 function workspaceLabel(session) {
   const ws = session.workspace || { type: 'volume' };
   if (ws.type === 'bind') return `bind ${ws.hostPath}`;
   if (ws.type === 'git') return `git ${ws.url}${ws.branch ? `#${ws.branch}` : ''}`;
-  return `volume ${ws.volume || `porterclaude-ws-${session.name}`}`;
+  return `volume ${workspaceVolumeName(session)}`;
 }
 
 /**
@@ -611,7 +648,7 @@ function agentsFieldHtml(session) {
         const checked = inherit || pinned.has(id);
         const hint = agent.installed
           ? ''
-          : '<div class="form-text text-warning">not installed yet - run "Install / update on this host" under Settings &rarr; Agents</div>';
+          : '<div class="form-text text-warning">not installed yet - run "Sync tools" under Settings &rarr; Agents</div>';
         return (
           '<div class="col-md-4"><div class="form-check">' +
           `<input class="form-check-input" type="checkbox" data-agent="${escapeHtml(id)}" id="sf-agent-${escapeHtml(id)}"` +
@@ -692,7 +729,7 @@ function sessionFormHtml(session) {
       .join('') +
     '</div>' +
     `<div class="col-12${ws.type === 'volume' ? '' : ' d-none'}" id="sf-ws-volume-fields">
-       <input class="form-control" id="sf-ws-volume-name" placeholder="volume name (blank = porterclaude-ws-&lt;name&gt;)" value="${escapeHtml(ws.type === 'volume' ? ws.volume || '' : '')}"></div>` +
+       <input class="form-control" id="sf-ws-volume-name" placeholder="${escapeHtml(volumeNamePlaceholder(isEdit ? s.hostId : formHostId))}" value="${escapeHtml(ws.type === 'volume' ? ws.volume || '' : '')}"></div>` +
     `<div class="col-12${ws.type === 'bind' ? '' : ' d-none'}" id="sf-ws-bind-fields">
        <input class="form-control" id="sf-ws-hostpath" placeholder="/srv/projects/web" value="${escapeHtml(ws.type === 'bind' ? ws.hostPath || '' : '')}">
        <div class="form-text">path on the Docker host</div></div>` +
@@ -1020,6 +1057,9 @@ function repaintLookups(session) {
   if (imageList) imageList.innerHTML = imageRefs.map((ref) => `<option value="${escapeHtml(ref)}"></option>`).join('');
   const networkList = byId('sf-network-list');
   if (networkList) networkList.innerHTML = networks.map((n) => `<option value="${escapeHtml(n)}"></option>`).join('');
+  // the default workspace volume name follows the host's volumePrefix (FE-QA-02)
+  const volumeName = byId('sf-ws-volume-name');
+  if (volumeName) volumeName.placeholder = volumeNamePlaceholder(formHostId);
 
   // the agent picker belongs to the host, so it is rebuilt from scratch - the inherit flag
   // the user set is preserved
@@ -1039,7 +1079,7 @@ function repaintLookups(session) {
             const checked = wasInherit || checkedIds.has(id);
             const hint = agent.installed
               ? ''
-              : '<div class="form-text text-warning">not installed yet - run "Install / update on this host" under Settings &rarr; Agents</div>';
+              : '<div class="form-text text-warning">not installed yet - run "Sync tools" under Settings &rarr; Agents</div>';
             return (
               '<div class="col-md-4"><div class="form-check">' +
               `<input class="form-check-input" type="checkbox" data-agent="${escapeHtml(id)}" id="sf-agent-${escapeHtml(id)}"` +
@@ -1180,7 +1220,7 @@ async function destroySession(session) {
   if (removeVolumes) {
     const second = await confirmDialog({
       title: 'Delete the volumes too?',
-      body: `<strong>porterclaude-ws-${escapeHtml(name)}</strong> and its per-agent history volumes will be deleted permanently. The shared agent login volumes of the host are never touched.`,
+      body: `<strong>${escapeHtml(workspaceVolumeName(session))}</strong> and its per-agent history volumes will be deleted permanently. The shared agent login volumes of the host are never touched.`,
       confirmLabel: 'Delete everything',
     });
     if (!second) return;
