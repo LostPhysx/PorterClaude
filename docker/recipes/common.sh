@@ -217,8 +217,7 @@ export HOME
 TERM="${TERM:-xterm-256color}"
 export TERM
 
-pc_log() { printf '[porterclaude] %s
-' "$*"; }
+pc_log() { printf '[porterclaude] %s\n' "$*"; }
 
 # Portable idle loop: some images ship a `sleep` that rejects "infinity", and a bare
 # `sleep` as pid 1 ignores SIGTERM. Backgrounding it and waiting lets the trap run.

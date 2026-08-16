@@ -23,6 +23,11 @@ let cookie: string;
 
 beforeAll(async () => {
   h = await makeHarness();
+  // the v0.2 route table is host-scoped: one host has to exist for those paths to resolve
+  await h.ctx.hosts.create({
+    name: 'Local docker',
+    connection: { type: 'socket', socketPath: '/definitely/not/here.sock' },
+  });
   const res = await request(h.app).post('/api/auth/login').send({ password: TEST_PASSWORD });
   cookie = (((res.headers['set-cookie'] as unknown as string[])[0] as string).split(';')[0]) as string;
 });
@@ -31,23 +36,31 @@ afterAll(async () => {
   await h.cleanup();
 });
 
-describe('route table (api.md)', () => {
+describe('route table (api.md v0.2)', () => {
   const core: Array<[string, string]> = [
     ['GET', '/api/health'],
     ['GET', '/api/auth/session'],
     ['POST', '/api/auth/logout'],
     ['GET', '/api/settings'],
     ['GET', '/api/settings/vendor'],
-    ['PUT', '/api/settings/backend'],
-    ['POST', '/api/settings/backend/test'],
-    ['POST', '/api/settings/backend/endpoints'],
     ['PUT', '/api/settings/general'],
     ['PUT', '/api/settings/ui'],
     ['POST', '/api/settings/password'],
-    ['GET', '/api/docker/info'],
-    ['GET', '/api/docker/containers'],
-    ['GET', '/api/docker/volumes'],
-    ['GET', '/api/docker/networks'],
+    ['GET', '/api/hosts'],
+    ['POST', '/api/hosts/test'],
+    ['GET', '/api/hosts/local-docker'],
+    ['PUT', '/api/hosts/local-docker'],
+    ['POST', '/api/hosts/local-docker/default'],
+    ['POST', '/api/hosts/local-docker/test'],
+    ['GET', '/api/credentials/portainer'],
+    ['POST', '/api/credentials/portainer/test'],
+    ['GET', '/api/agents'],
+    ['GET', '/api/hosts/local-docker/agents'],
+    ['PUT', '/api/hosts/local-docker/agents'],
+    ['GET', '/api/hosts/local-docker/docker/info'],
+    ['GET', '/api/hosts/local-docker/docker/containers'],
+    ['GET', '/api/hosts/local-docker/docker/volumes'],
+    ['GET', '/api/hosts/local-docker/docker/networks'],
   ];
 
   it.each(core)('%s %s exists (never 404)', async (method, path) => {
@@ -57,6 +70,35 @@ describe('route table (api.md)', () => {
       .send({});
     expect(res.status).not.toBe(404);
     expect(res.status).not.toBe(501);
+  });
+
+  // v0.2 change list #4/#5/#6: the global backend routes are gone for good
+  const removed: Array<[string, string]> = [
+    ['PUT', '/api/settings/backend'],
+    ['POST', '/api/settings/backend/test'],
+    ['POST', '/api/settings/backend/endpoints'],
+    ['GET', '/api/docker/info'],
+    ['GET', '/api/docker/containers'],
+    ['GET', '/api/docker/volumes'],
+    ['GET', '/api/docker/networks'],
+    ['GET', '/api/images'],
+    ['GET', '/api/images/recipes'],
+  ];
+
+  it.each(removed)('%s %s is gone (404)', async (method, path) => {
+    const agent = request(h.app) as unknown as Record<string, (p: string) => request.Test>;
+    const res = await (agent[method.toLowerCase()] as (p: string) => request.Test)(path)
+      .set('Cookie', cookie)
+      .send({});
+    expect(res.status).toBe(404);
+  });
+
+  it('404s a host-scoped route with an unknown host id', async () => {
+    for (const path of ['/api/hosts/nope', '/api/hosts/nope/agents', '/api/hosts/nope/docker/info']) {
+      const res = await request(h.app).get(path).set('Cookie', cookie);
+      expect(res.status, path).toBe(404);
+      expect(res.body.error.code).toBe('not_found');
+    }
   });
 
   it('rejects an unknown /api path with the canonical envelope', async () => {

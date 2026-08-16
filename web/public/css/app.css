@@ -71,8 +71,10 @@ html, body { height: 100%; }
 #settings-subtabs .nav-link { cursor: pointer; }
 .pc-subview { max-width: 78rem; }
 #general-form .form-text { font-size: .75rem; }
-#backend-test-result table { font-size: .8rem; }
-#portainer-key-hint { font-weight: 400; }
+#host-test-result table,
+#credential-test-result table,
+#host-info-body table { font-size: .8rem; }
+#cf-key-hint { font-weight: 400; }
 
 /* -------------------------------------------------------- images panel */
 .pc-recipe-card .card-title { font-size: .95rem; }
@@ -146,3 +148,13 @@ html, body { height: 100%; }
 #hf-overrides .form-control { font-family: var(--pc-mono); font-size: .8rem; }
 #af-json { font-size: .78rem; line-height: 1.35; }
 #sessions-host-filter, #images-host-select, #agents-host-select { max-width: 16rem; }
+
+/* host modal: connection radios, per-host overrides, endpoint import list */
+#host-form-body .form-check-inline { margin-right: 1rem; }
+#hf-agents .form-check-label { font-size: .85rem; }
+#import-endpoints .form-check { padding-block: .1rem; }
+#import-endpoints .form-check-label { font-size: .85rem; }
+#host-test-result:empty, #credential-test-result:empty, #import-result:empty { display: none; }
+#hosts-tbody .badge, #credentials-list .badge { font-weight: 500; }
+/* the agent picker of the session dialog greys out while it inherits the host's set */
+#sf-agents.opacity-50 { pointer-events: none; }

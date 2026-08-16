@@ -199,17 +199,20 @@ function rowActions(session) {
   const absent = session.status === 'absent';
   const orphan = !!session.orphan;
   const busy = busyRows.has(name);
+  // a session whose host was force-deleted is READ ONLY: only Destroy stays enabled
+  // (api.md "Sessions": hostMissing)
+  const locked = busy || !!session.hostMissing;
   const parts = [];
-  parts.push(actionButton(name, 'terminal', 'bi-terminal', 'Open terminal', { disabled: busy || !running, variant: 'outline-primary' }));
+  parts.push(actionButton(name, 'terminal', 'bi-terminal', 'Open terminal', { disabled: locked || !running, variant: 'outline-primary' }));
   if (running) {
-    parts.push(actionButton(name, 'stop', 'bi-stop-circle', 'Stop', { disabled: busy }));
-    parts.push(actionButton(name, 'restart', 'bi-arrow-clockwise', 'Restart', { disabled: busy }));
+    parts.push(actionButton(name, 'stop', 'bi-stop-circle', 'Stop', { disabled: locked }));
+    parts.push(actionButton(name, 'restart', 'bi-arrow-clockwise', 'Restart', { disabled: locked }));
   } else {
-    parts.push(actionButton(name, 'start', 'bi-play-circle', 'Start', { disabled: busy || orphan }));
+    parts.push(actionButton(name, 'start', 'bi-play-circle', 'Start', { disabled: locked || orphan }));
   }
-  parts.push(actionButton(name, 'recreate', 'bi-arrow-repeat', 'Recreate container', { disabled: busy || orphan }));
-  parts.push(actionButton(name, 'edit', 'bi-pencil', 'Edit (recreates the container)', { disabled: busy || orphan }));
-  parts.push(actionButton(name, 'logs', 'bi-file-text', 'Logs', { disabled: busy || absent }));
+  parts.push(actionButton(name, 'recreate', 'bi-arrow-repeat', 'Recreate container', { disabled: locked || orphan }));
+  parts.push(actionButton(name, 'edit', 'bi-pencil', 'Edit (recreates the container)', { disabled: locked || orphan }));
+  parts.push(actionButton(name, 'logs', 'bi-file-text', 'Logs', { disabled: locked || absent }));
   parts.push(actionButton(name, 'destroy', 'bi-trash', 'Destroy', { disabled: busy, variant: 'outline-danger' }));
   const spinner = busy ? '<span class="spinner-border spinner-border-sm text-secondary ms-2" role="status" aria-hidden="true"></span>' : '';
   return `<div class="btn-group btn-group-sm pc-row-actions" role="group">${parts.join('')}</div>${spinner}`;
@@ -223,39 +226,69 @@ function pills(session) {
   if (session.orphan) {
     out.push('<span class="badge text-bg-info ms-1" title="container carries porterclaude labels but has no stored config">orphan</span>');
   }
-  // TODO(F1): push a danger "host gone" pill when session.hostMissing is true, and disable
-  // every row action except Destroy for such a session (it is read-only, api.md "Sessions").
+  if (session.hostMissing) {
+    out.push(
+      '<span class="badge text-bg-danger ms-1" title="' +
+      escapeHtml(
+        `the host of this session was deleted - it is read-only until a host with id '${session.hostId || ''}' exists again`,
+      ) +
+      '">host gone</span>',
+    );
+  }
   return out.join('');
 }
 
+/** True while more than one host exists: the Host column and the filter only show then. */
+function multiHost() {
+  return getHosts().length > 1;
+}
+
 /**
- * The Host cell of a row.
- * TODO(F1): render `hostName` (falling back to hostLabel(hostId)) plus, when
- * `hostMissing === true`, a danger badge "host gone" with the title
- * "the host of this session was deleted - it is read-only until a host with id
- *  '<hostId>' exists again". Below it the host id in small monospace.
+ * The Host cell of a row: the host name (with the id underneath) plus the "host gone" badge
+ * of a session whose host was force-deleted. Hidden while a single host exists.
  * @param {any} session SessionView
  * @returns {string} table-cell HTML (everything escaped)
  */
 export function hostCell(session) {
-  void hostLabel;
-  void getHost;
-  return `<td class="small">${escapeHtml((session && session.hostName) || (session && session.hostId) || '')}</td>`;
+  const id = (session && session.hostId) || '';
+  const known = getHost(id);
+  const name = (session && session.hostName) || (known ? hostLabel(id) : '') || id || '-';
+  const missing = !!(session && session.hostMissing);
+  const badge = missing
+    ? '<span class="badge text-bg-danger" title="' +
+      escapeHtml(
+        `the host of this session was deleted - it is read-only until a host with id '${id}' exists again`,
+      ) +
+      '">host gone</span>'
+    : '';
+  return (
+    `<td class="small${multiHost() ? '' : ' d-none'}">` +
+    `<div>${escapeHtml(name)}${badge}</div>` +
+    (id ? `<div class="pc-host-id text-secondary">${escapeHtml(id)}</div>` : '') +
+    '</td>'
+  );
 }
 
 /**
- * The agent chips shown under the session name.
- * TODO(F1): one `<span class="badge text-bg-secondary">` per `resolvedAgents` entry,
- * labelled with agentLabel(id) and `title`-d with the id; `agents === null` additionally
- * gets a muted "(host default)" marker, an explicit list gets "(pinned)". No chips at all
- * when `resolvedAgents` is empty - instead a muted "no agents" hint.
+ * The agent chips shown under the session name: one per `resolvedAgents` entry (labelled
+ * through agentLabel(), the raw id in the tooltip). `agents === null` is the host default,
+ * an explicit list is pinned.
  * @param {any} session SessionView
  * @returns {string}
  */
 export function agentChips(session) {
-  void session;
-  void agentLabel;
-  return '';
+  const resolved = Array.isArray(session && session.resolvedAgents) ? session.resolvedAgents : [];
+  if (!resolved.length) {
+    return '<div class="small text-secondary">no agents</div>';
+  }
+  const pinned = !!(session && Array.isArray(session.agents));
+  const chips = resolved
+    .map(
+      (id) =>
+        `<span class="badge text-bg-secondary pc-agent-chip" title="${escapeHtml(id)}">${escapeHtml(agentLabel(id))}</span>`,
+    )
+    .join('');
+  return `<div class="mt-1">${chips}<span class="small text-secondary">${pinned ? '(pinned)' : '(host default)'}</span></div>`;
 }
 
 /**
@@ -269,32 +302,68 @@ export function visibleSessions() {
 }
 
 /**
- * TODO(F1): fill #sessions-host-filter with
- * `hostOptionsHtml(hostFilter, { includeAll: true, allLabel: 'All hosts' })`, keep
- * `hostFilter` + storage in sync on change, re-render, and hide the whole select while
- * there is at most ONE host (a single-host install must look exactly like v0.1).
+ * Fill #sessions-host-filter. The select is hidden while at most ONE host exists - a
+ * single-host install must look exactly like v0.1. A remembered host that disappeared falls
+ * back to "all hosts".
  */
 export function renderHostFilter() {
-  void hostOptionsHtml;
-  void getHosts;
-  // TODO(F1)
+  const select = byId('sessions-host-filter');
+  const th = byId('sessions-th-host');
+  const multi = multiHost();
+  if (th) th.classList.toggle('d-none', !multi);
+  if (!select) return;
+  select.classList.toggle('d-none', !multi);
+  if (!multi) {
+    if (hostFilter) {
+      hostFilter = '';
+      storage.set(LS_SESSIONS_HOST, '');
+    }
+    select.innerHTML = '';
+    return;
+  }
+  if (hostFilter && !getHost(hostFilter)) {
+    hostFilter = '';
+    storage.set(LS_SESSIONS_HOST, '');
+  }
+  select.innerHTML = hostOptionsHtml(hostFilter, { includeAll: true, allLabel: 'All hosts' });
+  select.value = hostFilter;
+}
+
+/**
+ * A fresh install has no host at all: say so instead of leaving an empty table (and instead
+ * of the error toast a v0.1 build would have produced).
+ */
+function renderNoHostNotice() {
+  const alertBox = byId('sessions-alert');
+  if (!alertBox || getHosts().length) return;
+  renderAlert(
+    alertBox,
+    'No Docker host is configured yet. <a href="#/settings" class="alert-link">Open Settings and add a host</a> - the local socket, or imported Portainer endpoints.',
+    'warning',
+  );
 }
 
 /** Render one <tr> per session into #sessions-tbody. */
 function render() {
+  renderNoHostNotice();
   const tbody = byId('sessions-tbody');
   const empty = byId('sessions-empty');
   if (!tbody) return;
-  // TODO(F1): render visibleSessions() instead of `sessions`, and show a
-  // "no sessions on <host>" hint (not the generic empty state) when the filter hides all.
-  if (!sessions.length) {
+  const rows = visibleSessions();
+  if (!rows.length) {
     tbody.innerHTML = '';
-    if (empty) empty.classList.remove('d-none');
+    if (empty) {
+      empty.classList.remove('d-none');
+      // the filter hiding everything is a different situation from "nothing exists yet"
+      empty.textContent = sessions.length
+        ? `No sessions on ${hostLabel(hostFilter)}.`
+        : 'No sessions yet.';
+    }
     return;
   }
   if (empty) empty.classList.add('d-none');
 
-  tbody.innerHTML = sessions
+  tbody.innerHTML = rows
     .map((s) => {
       const warnings = Array.isArray(s.warnings) ? s.warnings : [];
       const warnTitle = warnings.length ? ` title="${escapeHtml(warnings.join(' | '))}"` : '';
@@ -489,43 +558,79 @@ function mountRow(mount = {}) {
 }
 
 /**
- * The host row of the session form.
- * TODO(F1): CREATE -> `<select id="sf-host">` filled with hostOptionsHtml(formHostId) and a
- * form-text "the engine this session runs on - it cannot be changed later".
- * EDIT -> the same select but DISABLED (plus a hidden input keeping the value) and the note
- * "the host of a session is immutable; create a new session to move it" in #sf-host-note.
- * With exactly one host the row still renders (it is the only place that says where the
- * session lives) but carries no warning.
+ * The host row of the session form: a picker on create, disabled (plus a hidden input that
+ * keeps the value) with the immutability note on edit.
  * @param {any|null} session
  * @returns {string}
  */
 function hostFieldHtml(session) {
-  void session;
-  void hostOptionsHtml;
-  // TODO(F1)
-  return '<div class="col-md-6" id="sf-host-fields"><div id="sf-host-note" class="form-text"></div></div>';
+  const isEdit = !!session;
+  const selected = isEdit ? String(session.hostId || '') : formHostId;
+  let options = hostOptionsHtml(selected);
+  if (!options) options = '<option value="">no host yet - add one under Settings &rarr; Hosts</option>';
+  if (selected && !getHost(selected)) {
+    // the host was deleted with force: keep the id visible instead of silently retargeting
+    options =
+      `<option value="${escapeHtml(selected)}" selected>${escapeHtml(selected)} (deleted)</option>` + options;
+  }
+  const note = isEdit
+    ? 'the host of a session is immutable - create a new session to move it'
+    : 'the engine this session runs on - it cannot be changed later';
+  return (
+    '<div class="col-md-6" id="sf-host-fields">' +
+    '<label class="form-label" for="sf-host">Host</label>' +
+    `<select class="form-select" id="sf-host"${isEdit ? ' disabled' : ''}>${options}</select>` +
+    (isEdit ? `<input type="hidden" id="sf-host-stored" value="${escapeHtml(selected)}">` : '') +
+    `<div id="sf-host-note" class="form-text">${escapeHtml(note)}</div>` +
+    '</div>'
+  );
 }
 
 /**
- * The agent picker.
- * TODO(F1): a checkbox `#sf-agents-inherit` ("Use the agents enabled on this host") which,
- * when checked (the default, and what `session.agents === null` means), disables and greys
- * the list below it; the list is one checkbox per HostAgentView of `formAgents`
- * (`<input class="form-check-input" data-agent="<id>">`) inside `#sf-agents`, labelled
- * `name` + a muted `id`, with a "not installed yet" hint for `installed === false` and a
- * "run the tools sync on this host first" link to Settings. When the host has no enabled
- * agent at all: "no agents enabled on this host - Settings, Agents".
+ * The agent picker: "use the agents enabled on this host" (which is what `agents === null`
+ * means) or an explicit list. An empty explicit list is legal - it gives a plain shell.
  * @param {any|null} session
  * @returns {string}
  */
 function agentsFieldHtml(session) {
-  void session;
-  void formAgents;
-  // TODO(F1)
-  return '<div class="col-12"><label class="form-label d-block">Coding agents</label>' +
-    '<div class="form-check"><input class="form-check-input" type="checkbox" id="sf-agents-inherit" checked>' +
+  const pinnedList = Array.isArray(session && session.agents) ? session.agents : null;
+  const inherit = !pinnedList;
+  const pinned = new Set(pinnedList || []);
+  const enabled = formAgents.filter((a) => a && a.enabled);
+  let body;
+  if (!formAgents.length) {
+    body = '<div class="col-12 small text-secondary">loading the agents of this host...</div>';
+  } else if (!enabled.length) {
+    body =
+      '<div class="col-12 small text-secondary">No agent is enabled on this host - enable one under ' +
+      'Settings &rarr; Agents, install it on the host, then recreate this session.</div>';
+  } else {
+    body = enabled
+      .map((agent) => {
+        const id = String(agent.id);
+        const checked = inherit || pinned.has(id);
+        const hint = agent.installed
+          ? ''
+          : '<div class="form-text text-warning">not installed yet - run "Install / update on this host" under Settings &rarr; Agents</div>';
+        return (
+          '<div class="col-md-4"><div class="form-check">' +
+          `<input class="form-check-input" type="checkbox" data-agent="${escapeHtml(id)}" id="sf-agent-${escapeHtml(id)}"` +
+          `${checked ? ' checked' : ''}${inherit ? ' disabled' : ''}>` +
+          `<label class="form-check-label" for="sf-agent-${escapeHtml(id)}">${escapeHtml(agent.name || id)}` +
+          ` <span class="text-secondary font-monospace small">${escapeHtml(id)}</span></label>` +
+          hint +
+          '</div></div>'
+        );
+      })
+      .join('');
+  }
+  return (
+    '<div class="col-12"><label class="form-label d-block">Coding agents</label>' +
+    '<div class="form-check"><input class="form-check-input" type="checkbox" id="sf-agents-inherit"' +
+    `${inherit ? ' checked' : ''}>` +
     '<label class="form-check-label" for="sf-agents-inherit">Use the agents enabled on this host</label></div>' +
-    '<div id="sf-agents" class="row g-2 mt-1"></div></div>';
+    `<div id="sf-agents" class="row g-2 mt-1">${body}</div></div>`
+  );
 }
 
 function sessionFormHtml(session) {
@@ -769,13 +874,25 @@ export function readSessionForm() {
   if (memoryMb) limits.memoryMb = Number(memoryMb);
   input.limits = limits;
 
-  // TODO(F1): v0.2 fields.
-  //   * CREATE: `input.hostId = <#sf-host value>` (omit it only when there is no host at
-  //     all - then the save cannot succeed anyway). EDIT: never send `hostId`; the server
-  //     answers 422 when it differs, and sending the SAME value is pointless noise.
-  //   * `input.agents = null` when #sf-agents-inherit is checked, otherwise the array of
-  //     checked `#sf-agents [data-agent]` ids (an empty array means "no agent at all",
-  //     which is allowed and gives a plain shell container).
+  // v0.2: the host is sent on CREATE only - it is immutable afterwards (the server answers
+  // 422 for a different one, and re-sending the same value is pointless noise).
+  if (!editing) {
+    const hostId = value('sf-host');
+    if (hostId) input.hostId = hostId;
+  }
+  // `agents: null` = every agent enabled on the host; an explicit (possibly empty) array
+  // pins the session to those ids.
+  if (checked('sf-agents-inherit')) {
+    input.agents = null;
+  } else {
+    /** @type {string[]} */
+    const agentIds = [];
+    document.querySelectorAll('#sf-agents [data-agent]').forEach((el) => {
+      if (el.checked) agentIds.push(el.getAttribute('data-agent'));
+    });
+    input.agents = agentIds;
+  }
+
   input.shareHistory = checked('sf-share-history');
   input.autoStart = checked('sf-autostart');
   input.network = value('sf-network') || null;
@@ -857,10 +974,87 @@ function wireSessionForm() {
   const validate = byId('btn-validate-image');
   if (validate) validate.addEventListener('click', () => { void validateCustomImage(); });
 
-  // TODO(F1): on #sf-host change -> formHostId = value, then `await loadLookups(formHostId)`
-  // and repaint the recipe select, the image datalist, the network datalist and the agent
-  // checkboxes WITHOUT losing what the user already typed (same pattern as the refresh in
-  // openSessionModal). Also toggle #sf-agents-inherit -> enable/disable the checkbox list.
+  const hostSelect = byId('sf-host');
+  if (hostSelect && !hostSelect.disabled) {
+    hostSelect.addEventListener('change', () => {
+      formHostId = hostSelect.value || '';
+      void loadLookups(formHostId).then(() => repaintLookups(editing));
+    });
+  }
+
+  const inherit = byId('sf-agents-inherit');
+  if (inherit) inherit.addEventListener('change', () => syncAgentsPicker());
+  syncAgentsPicker();
+}
+
+/** #sf-agents-inherit drives the checkbox list below it (checked = greyed out). */
+function syncAgentsPicker() {
+  const inherit = byId('sf-agents-inherit');
+  const on = !!(inherit && inherit.checked);
+  const box = byId('sf-agents');
+  if (box) box.classList.toggle('opacity-50', on);
+  document.querySelectorAll('#sf-agents [data-agent]').forEach((el) => {
+    el.disabled = on;
+    if (on) el.checked = true; // inheriting mounts every agent the host enables
+  });
+}
+
+/**
+ * Repaint the host-scoped pickers of the open dialog from the freshly loaded lookups,
+ * keeping whatever the user already typed.
+ * @param {any|null} session the session the dialog was opened for
+ */
+function repaintLookups(session) {
+  const recipeSelect = byId('sf-recipe');
+  if (recipeSelect && recipes.length) {
+    const current = recipeSelect.value;
+    recipeSelect.innerHTML = recipes
+      .map(
+        (r) =>
+          `<option value="${escapeHtml(r.name)}"${r.name === current ? ' selected' : ''}>` +
+          `${escapeHtml(r.title || r.name)}${r.built === false ? ' (not built)' : ''}</option>`,
+      )
+      .join('');
+  }
+  const imageList = byId('sf-image-list');
+  if (imageList) imageList.innerHTML = imageRefs.map((ref) => `<option value="${escapeHtml(ref)}"></option>`).join('');
+  const networkList = byId('sf-network-list');
+  if (networkList) networkList.innerHTML = networks.map((n) => `<option value="${escapeHtml(n)}"></option>`).join('');
+
+  // the agent picker belongs to the host, so it is rebuilt from scratch - the inherit flag
+  // the user set is preserved
+  const inherit = byId('sf-agents-inherit');
+  const wasInherit = inherit ? !!inherit.checked : !session || !Array.isArray(session.agents);
+  const checkedIds = new Set();
+  document.querySelectorAll('#sf-agents [data-agent]').forEach((el) => {
+    if (el.checked) checkedIds.add(el.getAttribute('data-agent'));
+  });
+  const box = byId('sf-agents');
+  if (box) {
+    const enabled = formAgents.filter((a) => a && a.enabled);
+    box.innerHTML = enabled.length
+      ? enabled
+          .map((agent) => {
+            const id = String(agent.id);
+            const checked = wasInherit || checkedIds.has(id);
+            const hint = agent.installed
+              ? ''
+              : '<div class="form-text text-warning">not installed yet - run "Install / update on this host" under Settings &rarr; Agents</div>';
+            return (
+              '<div class="col-md-4"><div class="form-check">' +
+              `<input class="form-check-input" type="checkbox" data-agent="${escapeHtml(id)}" id="sf-agent-${escapeHtml(id)}"` +
+              `${checked ? ' checked' : ''}>` +
+              `<label class="form-check-label" for="sf-agent-${escapeHtml(id)}">${escapeHtml(agent.name || id)}` +
+              ` <span class="text-secondary font-monospace small">${escapeHtml(id)}</span></label>` +
+              hint +
+              '</div></div>'
+            );
+          })
+          .join('')
+      : '<div class="col-12 small text-secondary">No agent is enabled on this host - enable one under ' +
+        'Settings &rarr; Agents, install it on the host, then recreate this session.</div>';
+  }
+  syncAgentsPicker();
 }
 
 /**
@@ -869,8 +1063,8 @@ function wireSessionForm() {
  */
 export function openSessionModal(session = null) {
   editing = session;
-  // TODO(F1): formHostId = session ? session.hostId : resolveHostId(hostFilter || null);
-  // the lookups below must run against THAT host.
+  // every lookup the dialog makes is scoped to THIS host
+  formHostId = session ? String(session.hostId || '') : resolveHostId(hostFilter || null);
   const body = byId('session-form-body');
   const title = byId('session-modal-title');
   const modalEl = byId('session-modal');
@@ -883,19 +1077,7 @@ export function openSessionModal(session = null) {
   void loadLookups(formHostId).then(() => {
     // refresh the pickers once the lookups arrive, keeping what the user typed
     if (editing !== session) return;
-    const recipeSelect = byId('sf-recipe');
-    if (recipeSelect && recipes.length) {
-      const current = recipeSelect.value;
-      recipeSelect.innerHTML = recipes
-        .map((r) => `<option value="${escapeHtml(r.name)}"${r.name === current ? ' selected' : ''}>${escapeHtml(r.title || r.name)}${r.built === false ? ' (not built)' : ''}</option>`)
-        .join('');
-    }
-    const imageList = byId('sf-image-list');
-    if (imageList) imageList.innerHTML = imageRefs.map((ref) => `<option value="${escapeHtml(ref)}"></option>`).join('');
-    const networkList = byId('sf-network-list');
-    if (networkList) networkList.innerHTML = networks.map((n) => `<option value="${escapeHtml(n)}"></option>`).join('');
-    // TODO(F1): repaint #sf-agents from `formAgents` here as well (it is empty until the
-    // per-host lookup lands).
+    repaintLookups(session);
   });
 }
 
@@ -1136,9 +1318,21 @@ const sessionsView = {
       void reload().catch(() => {});
     });
 
-    // TODO(F1): wire #sessions-host-filter (change -> hostFilter = value,
-    // storage.set(LS_SESSIONS_HOST, value), render()) and subscribe to EVENTS.HOSTS_CHANGED
-    // -> renderHostFilter(); a host that disappears falls back to '' (all hosts).
+    const hostFilterEl = byId('sessions-host-filter');
+    if (hostFilterEl) {
+      hostFilterEl.addEventListener('change', () => {
+        // CLIENT-SIDE only: the bus payload stays unfiltered (F2's rail needs every host)
+        hostFilter = hostFilterEl.value || '';
+        storage.set(LS_SESSIONS_HOST, hostFilter);
+        render();
+      });
+    }
+    bus.on(EVENTS.HOSTS_CHANGED, () => {
+      renderHostFilter();
+      render();
+    });
+    bus.on(EVENTS.AGENTS_CHANGED, () => render());
+
     renderHostFilter();
     await reload().catch(() => {});
     void loadRecipes(resolveHostId(hostFilter || null));

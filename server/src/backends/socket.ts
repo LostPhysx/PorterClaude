@@ -243,6 +243,7 @@ export const dockerMap = {
       ),
       ports: dockerMap.toPortBindings(raw.NetworkSettings?.Ports),
       user: config.User || undefined,
+      cmd: Array.isArray(config.Cmd) ? [...config.Cmd] : undefined,
       raw,
     };
   },

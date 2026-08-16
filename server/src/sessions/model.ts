@@ -3,7 +3,7 @@
 // Only add fields; never rename or retype an existing one.
 import { z } from 'zod';
 import { SLUG_RE } from '../util/slug.js';
-import { AgentIdSchema } from '../agents/model.js';
+import { AgentIdSchema, SESSION_AGENTS_ENV } from '../agents/model.js';
 import { HostIdSchema, LEGACY_HOST_ID } from '../hosts/model.js';
 import type { ContainerState, PortBinding } from '../backends/types.js';
 
@@ -201,6 +201,34 @@ export const IMAGE_LABELS = {
   contextHash: 'porterclaude.context-hash',
   builtAt: 'porterclaude.built-at',
 } as const;
+
+/**
+ * The agent ids a CONTAINER really mounts — the only truthful source for "can this pane
+ * start agent X?".
+ *
+ * `agents ?? host.agents.enabled` describes what a session SHOULD mount, which drifts the
+ * moment an agent is enabled on the host after the container was created (SessionView then
+ * reports needsRecreate). Starting an agent the container has no auth volume for would hand
+ * the user a fresh, unauthenticated instance, so terminals gate on this instead.
+ *
+ * Reads the `porterclaude.agents` label (set by buildContainerSpec) and falls back to the
+ * `PORTERCLAUDE_AGENT_IDS` env of the container inspect. Returns `null` when the container
+ * carries neither — a v0.1 container, where the caller has to fall back to the config.
+ * An empty label ("no agents at all") is a real answer and comes back as `[]`.
+ */
+export function containerAgentIds(
+  labels?: Record<string, string> | null,
+  env?: readonly string[] | null,
+): string[] | null {
+  const raw =
+    labels?.[CONTAINER_LABELS.agents] ??
+    env?.find((e) => e.startsWith(`${SESSION_AGENTS_ENV}=`))?.slice(SESSION_AGENTS_ENV.length + 1);
+  if (raw === undefined) return null;
+  return raw
+    .split(',')
+    .map((id) => id.trim())
+    .filter((id) => id.length > 0);
+}
 
 export function containerNameFor(prefix: string, session: string): string {
   return `${prefix}${session}`;

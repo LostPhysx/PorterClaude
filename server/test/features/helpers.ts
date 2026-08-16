@@ -1,6 +1,7 @@
 // OWNER: B2. Test doubles shared by the feature tests. No docker host, no B1 runtime code.
 import pino from 'pino';
 import type { ServiceDeps } from '../../src/context.js';
+import { AppError } from '../../src/http/errors.js';
 import type { ConfigStore } from '../../src/config/store.js';
 import type { GeneralConfig } from '../../src/config/schema.js';
 import { GeneralConfigSchema } from '../../src/config/schema.js';
@@ -107,6 +108,11 @@ export function stubConfigStore(
     deleteSession: async (name: string) => map.delete(name),
   } as unknown as ConfigStore;
   return { store, sessions: map, general };
+}
+
+/** `hostConfig()` with another id/name (the second host of the multi-host tests). */
+export function otherHostConfig(overrides: Partial<HostConfig> = {}): HostConfig {
+  return hostConfig({ id: 'edge', name: 'Edge box', ...overrides });
 }
 
 // ---------------------------------------------------------------------------
@@ -280,43 +286,71 @@ export function stubExecStream(execId = 'exec-1'): ExecStream {
   return stream as unknown as ExecStream;
 }
 
+/** A host entry of the multi-host stub: its config, its transport and its settings. */
+export interface StubHostEntry {
+  host: HostConfig;
+  /** null = the host has no usable transport (missing credential, dead engine, tcp/ssh) */
+  backend: DockerBackend | null;
+  general?: GeneralConfig;
+}
+
 /**
- * A HostManager stub with ONE host (`TEST_HOST_ID`) whose transport is `backend`.
- * TODO(B2): extend with a multi-host variant once SessionService lists every host.
+ * A HostManager stub over N hosts. `backendFor` throws for a host without a transport (like
+ * the real manager does for an incomplete connection), `tryBackendFor` answers null, and
+ * `hostForSession` throws for a session whose host was deleted — which is exactly what the
+ * multi-host paths of SessionService and TerminalService have to survive.
  */
-export function stubHostManager(
-  backend: DockerBackend | null,
-  opts: { host?: HostConfig; general?: GeneralConfig } = {},
-): HostManager {
-  const host = opts.host ?? hostConfig();
-  const general = opts.general ?? generalConfig();
-  const need = () => {
-    if (!backend) throw new Error('no docker backend configured');
-    return backend;
+export function stubHosts(entries: StubHostEntry[], defaultHostId?: string): HostManager {
+  const byId = new Map(entries.map((e) => [e.host.id, e]));
+  const entryFor = (id: string): StubHostEntry => {
+    const entry = byId.get(id);
+    if (!entry) throw AppError.notFound(`host '${id}' does not exist`);
+    return entry;
   };
+  const backendOf = (id: string): DockerBackend => {
+    const entry = entryFor(id);
+    if (!entry.backend) throw AppError.backendNotConfigured(`host '${id}' has no docker backend configured`);
+    return entry.backend;
+  };
+  const settingsOf = (id: string): GeneralConfig => entryFor(id).general ?? generalConfig();
+  const fallbackId = defaultHostId ?? entries[0]?.host.id ?? null;
+
   return {
-    list: () => [host],
-    get: (id: string) => (id === host.id ? host : null),
-    require: (id: string) => {
-      if (id !== host.id) throw new Error(`host '${id}' does not exist`);
-      return host;
+    list: () => entries.map((e) => e.host),
+    get: (id: string) => byId.get(id)?.host ?? null,
+    require: (id: string) => entryFor(id).host,
+    defaultHostId: () => fallbackId,
+    requireHostId: (id?: string | null) => {
+      if (id) return entryFor(id).host.id;
+      if (!fallbackId) throw AppError.backendNotConfigured('no docker host configured');
+      return fallbackId;
     },
-    defaultHostId: () => host.id,
-    requireHostId: (id?: string | null) => id ?? host.id,
-    hostForSession: () => host,
-    settingsFor: () => general,
-    settingsForHost: () => general,
-    backendFor: () => need(),
-    tryBackendFor: () => backend,
-    legacyAccess: () => ({ get: need, tryGet: () => backend }),
-    isConfigured: () => Boolean(backend),
+    hostForSession: (session: { name: string; hostId: string }) => entryFor(session.hostId).host,
+    settingsFor: (id: string) => settingsOf(id),
+    settingsForHost: (host: HostConfig) => byId.get(host.id)?.general ?? generalConfig(),
+    backendFor: (id: string) => backendOf(id),
+    tryBackendFor: (id: string) => byId.get(id)?.backend ?? null,
+    legacyAccess: () => ({
+      get: () => backendOf(fallbackId ?? ''),
+      tryGet: () => (fallbackId ? byId.get(fallbackId)?.backend ?? null : null),
+    }),
+    isConfigured: () => entries.some((e) => Boolean(e.backend)),
     invalidate: () => undefined,
     invalidateChanged: () => [],
     close: async () => undefined,
   } as unknown as HostManager;
 }
 
-/** @deprecated v0.1 name kept so the existing feature tests keep compiling. */
+/** A HostManager stub with ONE host (`TEST_HOST_ID`) whose transport is `backend`. */
+export function stubHostManager(
+  backend: DockerBackend | null,
+  opts: { host?: HostConfig; general?: GeneralConfig } = {},
+): HostManager {
+  const host = opts.host ?? hostConfig();
+  return stubHosts([{ host, backend, ...(opts.general ? { general: opts.general } : {}) }]);
+}
+
+/** @deprecated v0.1 name kept so older feature tests keep compiling. */
 export const stubBackendManager = stubHostManager;
 
 /** Registry stub over the built-in agents (no config access). */

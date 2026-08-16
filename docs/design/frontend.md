@@ -510,20 +510,30 @@ web/public/js/
 ```
 app.js ─▶ api.js ─▶ bus.js
    ├─▶ util.js
-   ├─▶ hosts.js   ─▶ api/util/bus
-   ├─▶ agents.js  ─▶ api/util/bus, images.js (openJob)
+   ├─▶ hosts.js   ─▶ api/util/bus, settings.js (GENERAL_FIELDS only — see below)
+   ├─▶ agents.js  ─▶ api/util/bus, hosts.js, images.js (openJob)
    ├─▶ sessions.js ─▶ api/util/bus, hosts.js, agents.js
    ├─▶ settings.js ─▶ hosts.js, agents.js, images.js
    └─▶ code.js    ─▶ terminal.js, sessions.js, settings.js, agents.js
                        images.js ─▶ api/util, hosts.js
 ```
 
-**Acyclic, and it must stay that way.** Two rules make it so:
+**One deliberate back edge, no accidental ones.** The rules that keep it that way:
 
 * `images.js` does **not** import `agents.js` (that would close a cycle with `openJob`); the
   tools-status agent table therefore shows agent **ids**, which are the API identity anyway.
 * `hosts.js` does **not** import `sessions.js`; `HostView.sessionCount` carries the number it
   needs.
+* `hosts.js` does **not** import `agents.js` either, although the host table shows agent
+  **chips**: the chain `agents.js ─▶ images.js ─▶ hosts.js` means importing `agentLabel()`
+  back would close exactly the cycle this section forbids. `hosts.js` keeps its own small
+  registry copy instead — filled from `GET /api/agents` when the panel opens and refreshed on
+  the `agents:changed` bus event — which renders identically. (An earlier skeleton comment
+  asked for the direct import; it is wrong, see docs/design/requests/v2-F1.md 2.)
+* The one edge that does point back is `hosts.js ─▶ settings.js`, for the shared
+  `GENERAL_FIELDS` table that both the general panel and the per-host overrides form render.
+  It is safe because nothing is dereferenced while the modules evaluate: `settings.js` builds
+  its panel list lazily inside `panels()`, so module evaluation order does not matter.
 
 ## 12.3 Frozen cross-module surface
 

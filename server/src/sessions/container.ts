@@ -39,6 +39,16 @@ export interface BuildSpecInput {
    * otherwise its hash would differ from the one it was created with.
    */
   imageEnvPath?: string | null;
+  /**
+   * The Cmd the resolved image declares (`ImageInspect.cmd`). It MUST be passed through
+   * explicitly: the engine only inherits the image Cmd when the create request leaves the
+   * Entrypoint unset (moby `merge()`), and v0.2 sets an Entrypoint on every session — so
+   * without this a recipe container comes up with Cmd=null and the php recipe never starts
+   * supervisord (measured by O1, docs/design/requests/v2-O1.md 1).
+   * When recomputing the spec of an EXISTING container pass its own `ContainerInspect.cmd`
+   * (what it was created with), otherwise its hash would differ — same rule as imageEnvPath.
+   */
+  imageCmd?: string[] | null;
 }
 
 /** pidsLimit applied to every managed container. */
@@ -140,8 +150,9 @@ export function imagePathFromEnv(env: string[] | undefined, general: GeneralConf
  *               PORTERCLAUDE_AGENT_IDS=<id,id>, PORTERCLAUDE_AGENT_LINKS=<target|source|kind;...>,
  *               <agent.env>..., ...session.env
  *   entrypoint  ["<toolsMount>/entrypoint.sh"]        for EVERY session (v0.2)
- *   cmd         ["sleep","infinity"] for custom images; recipes keep the image CMD, so the
- *               php recipe still starts supervisord behind the bootstrap
+ *   cmd         ["sleep","infinity"] for custom images; recipes get the image's OWN CMD
+ *               passed back explicitly, so the php recipe still starts supervisord behind
+ *               the bootstrap (and ["sleep","infinity"] when the image declares none)
  *   workingDir  <workspaceMount>;  init true;  tty false;  pidsLimit 4096
  *   restart     autoStart ? 'unless-stopped' : 'no'
  *   resources   cpus -> NanoCpus, memoryMb -> Memory
@@ -149,16 +160,18 @@ export function imagePathFromEnv(env: string[] | undefined, general: GeneralConf
  * WHY the uniform bootstrap: v0.1 baked claude into the recipe images and mounted the tools
  * volume only into custom ones. With N agents that would mean rebuilding every recipe for
  * every agent, so v0.2 delivers ALL agents through the tools volume and wires PATH/HOME the
- * same way everywhere. Recipes keep their CMD because overriding only the entrypoint leaves
- * the image's Cmd in place (docker only replaces what the create request sets).
+ * same way everywhere. Recipes still run their CMD because the create request repeats it
+ * verbatim: the engine DROPS the image Cmd as soon as the request sets an Entrypoint (moby
+ * `merge()` only inherits Cmd when the user config has no Entrypoint), so a recipe created
+ * without it would reach entrypoint.sh with no argv and idle instead of serving.
  *
  * WHY symlinks instead of direct mounts of ~/.claude & co: see agents/model.ts. The
  * private-history volume therefore mounts at `agentHistoryTarget(...)` (a path inside the
  * agent volume), never at `~/.claude/projects` (a symlink) — docker resolves mount targets
  * before the bootstrap runs.
  *
- * PLANNER DRAFT (v0.2): the shape below is the contract; B2 owns it from here (tests,
- * ownership repairs in service.ts, and the `TODO(B2)` items inside).
+ * The ownership/symlink repairs that make this layout work inside a running container live
+ * in sessions/service.ts (`ensureAgentDirs`, run as uid 0 after every start).
  */
 export function buildContainerSpec(input: BuildSpecInput): CreateContainerSpec {
   const { session, general, resolvedImage, imageType, agents } = input;
@@ -262,8 +275,11 @@ export function buildContainerSpec(input: BuildSpecInput): CreateContainerSpec {
     ...(network ? { networks: [network] } : {}),
   };
 
-  // Recipes keep the image CMD (php runs supervisord); custom images idle.
-  if (imageType === 'custom') spec.cmd = ['sleep', 'infinity'];
+  // Custom images idle; recipes repeat their own CMD (php runs supervisord). The image Cmd
+  // must be restated because the entrypoint override above makes the engine drop it.
+  const imageCmd = input.imageCmd ?? null;
+  spec.cmd =
+    imageType === 'custom' || !imageCmd?.length ? ['sleep', 'infinity'] : [...imageCmd];
 
   // The hash covers everything above; adding it as a label must not change it (labels are
   // excluded from the hash on purpose).

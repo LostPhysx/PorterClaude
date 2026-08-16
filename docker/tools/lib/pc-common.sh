@@ -1,8 +1,5 @@
 #!/bin/sh
-# TODO(O1): remove this line once the bodies below are implemented — it only silences the
-# "assigned but never used / arguments never passed" warnings a skeleton necessarily has.
-# shellcheck disable=SC2034,SC2119,SC2120,SC2317
-# PorterClaude — sh helpers shared by the RUNTIME payload. OWNER: O1.
+# PorterClaude — sh helpers shared by the RUNTIME payload. OWNER: O1. v0.2.
 # Spec: docs/design/orchestration.md §13.1 / §13.7.
 #
 # This file SHIPS INSIDE THE TOOLS VOLUME (<toolsMount>/lib/pc-common.sh) and is sourced by
@@ -64,8 +61,25 @@ pc_tools_root() {
     printf '%s' "${PORTERCLAUDE_TOOLS%/}"
     return 0
   fi
-  # TODO(O1): resolve `dirname "$1"`/.. with `CDPATH= cd -- … && pwd` (no readlink -f: not
-  # portable to busybox in every image) and print it without a trailing slash.
+  # No `readlink -f`: it is not portable to every busybox. Walk up from the caller's own
+  # directory instead and stop at the first level that looks like the payload root, so the
+  # same helper works for a shim (<root>/bin/x) and for a launcher (<root>/agents/<id>/x).
+  _pc_d="$(CDPATH='' cd -- "$(dirname -- "${1:-$0}")" 2>/dev/null && pwd)"
+  if [ -z "$_pc_d" ]; then
+    printf '%s' '/opt/porterclaude'
+    return 0
+  fi
+  _pc_n=0
+  while [ "$_pc_n" -lt 4 ]; do
+    _pc_d="$(CDPATH='' cd -- "$_pc_d/.." 2>/dev/null && pwd)"
+    [ -n "$_pc_d" ] || break
+    if [ -f "$_pc_d/entrypoint.sh" ] || [ -f "$_pc_d/AGENTS.json" ]; then
+      printf '%s' "${_pc_d%/}"
+      return 0
+    fi
+    [ "$_pc_d" != '/' ] || break
+    _pc_n=$((_pc_n + 1))
+  done
   printf '%s' '/opt/porterclaude'
 }
 

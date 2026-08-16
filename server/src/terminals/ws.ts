@@ -10,6 +10,7 @@ import { AppError, toAppError } from '../http/errors.js';
 import { SLUG_RE } from '../util/slug.js';
 import {
   parseTerminalShell,
+  TerminalRefusal,
   TERMINAL_CLOSE,
   TERMINAL_HEARTBEAT_MS,
   TERMINAL_HEARTBEAT_TIMEOUT_MS,
@@ -172,10 +173,22 @@ function delay(ms: number): Promise<void> {
   });
 }
 
-/** AppError -> (terminal error code, websocket close code). */
+/**
+ * Error -> (terminal error code, websocket close code).
+ *
+ * A `TerminalRefusal` (v0.2) carries both itself: it is how `agent_not_available` (4410) and
+ * `host_unavailable` (4411) reach the client. Everything else is mapped from the AppError
+ * code, with `not_implemented` (a host whose connection type this version cannot talk to)
+ * folded into `host_unavailable` as well.
+ */
 export function mapError(err: unknown): { code: TerminalErrorCode; close: TerminalCloseCode; message: string } {
+  if (err instanceof TerminalRefusal) {
+    return { code: err.terminalCode, close: err.closeCode, message: err.message };
+  }
   const appErr: AppError = toAppError(err);
   switch (appErr.code) {
+    case 'not_implemented':
+      return { code: 'host_unavailable', close: TERMINAL_CLOSE.hostUnavailable, message: appErr.message };
     case 'not_found':
       return { code: 'session_not_found', close: TERMINAL_CLOSE.sessionNotFound, message: appErr.message };
     case 'conflict':
@@ -373,7 +386,8 @@ async function handleConnection(ws: WebSocket, req: IncomingMessage, ctx: AppCon
     // the real process status first: it decides how hard we look at the container state
     let code: number | null = null;
     try {
-      code = (await ctx.backends.get().execInspect(execId)).exitCode;
+      // the exec lives on the SESSION'S host (v0.2), which the ready frame already named
+      code = (await ctx.hosts.backendFor(opened.hostId).execInspect(execId)).exitCode;
     } catch (err) {
       log.debug({ err, terminalId }, 'inspecting the finished exec failed');
     }

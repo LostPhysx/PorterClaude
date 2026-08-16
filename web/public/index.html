@@ -120,7 +120,7 @@
         <div class="table-responsive">
           <table class="table table-sm table-hover align-middle" id="sessions-table">
             <thead>
-              <tr><th>Name</th><th>Host</th><th>Image</th><th>Workspace</th><th>Status</th><th>Ports</th><th>Uptime</th><th class="text-end">Actions</th></tr>
+              <tr><th>Name</th><th id="sessions-th-host">Host</th><th>Image</th><th>Workspace</th><th>Status</th><th>Ports</th><th>Uptime</th><th class="text-end">Actions</th></tr>
             </thead>
             <!-- rows are rendered by js/sessions.js (one <tr> per SessionView) -->
             <tbody id="sessions-tbody"></tbody>
@@ -180,7 +180,15 @@
             <h6 class="mb-0 me-auto">Coding agents</h6>
             <select id="agents-host-select" class="form-select form-select-sm w-auto" aria-label="Host"></select>
             <button id="btn-agents-refresh" class="btn btn-sm btn-outline-secondary" type="button" title="Refresh"><i class="bi bi-arrow-clockwise"></i></button>
-            <button id="btn-agents-sync" class="btn btn-sm btn-outline-secondary" type="button"><i class="bi bi-download me-1"></i>Install / update on this host</button>
+            <div class="btn-group">
+              <button id="btn-agents-sync" class="btn btn-sm btn-outline-secondary" type="button"><i class="bi bi-download me-1"></i>Install / update on this host</button>
+              <button id="btn-agents-sync-more" class="btn btn-sm btn-outline-secondary dropdown-toggle dropdown-toggle-split" type="button" data-bs-toggle="dropdown" aria-expanded="false"><span class="visually-hidden">More install options</span></button>
+              <ul class="dropdown-menu dropdown-menu-end">
+                <li><h6 class="dropdown-header">Install / update installs what is missing</h6></li>
+                <li><button id="btn-agents-sync-force" class="dropdown-item" type="button"><i class="bi bi-arrow-up-circle me-1"></i>Upgrade all agents (reinstall)</button></li>
+                <li><div class="dropdown-item-text small text-secondary" style="max-width:24rem">An installed agent is kept as it is while its definition is unchanged, so a new upstream release is only picked up by an upgrade. This rebuilds the tools image and reinstalls every enabled agent and runtime &mdash; minutes, and it re-downloads a few hundred MB.</div></li>
+              </ul>
+            </div>
             <button id="btn-agent-new" class="btn btn-sm btn-primary" type="button"><i class="bi bi-plus-lg me-1"></i>Custom agent</button>
           </div>
           <div id="agents-host-note" class="small text-secondary mb-2"></div>
@@ -378,7 +386,7 @@
             <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
           <div class="modal-body">
             <div class="row g-3">
-              <div class="col-md-6">
+              <div class="col-md-6" id="af-preset-wrap">
                 <label class="form-label" for="af-preset">Start from</label>
                 <select class="form-select form-select-sm" id="af-preset"></select>
                 <div class="form-text">Copies a built-in definition into the editor as a starting point.</div>

@@ -7,6 +7,7 @@
 // Job ids stay globally unique, but a job of another host answers 404 - so the host id is
 // part of the job-tail state as well (`openJob(hostId, jobId)`).
 import { api } from './api.js';
+import { bus, EVENTS } from './bus.js';
 import { byId, toast, toastError, escapeHtml, fmtBytes, fmtDate, storage, LS_PREFIX } from './util.js';
 import { getHosts, resolveHostId, hostOptionsHtml } from './hosts.js';
 
@@ -32,18 +33,33 @@ export function currentHostId() {
   return hostId;
 }
 
+/** Shown wherever a host is required and none exists yet (fresh install). */
+const NO_HOST_TEXT = 'No Docker host yet - add one under Settings > Hosts.';
+
 /**
- * TODO(F1): fill #images-host-select with hostOptionsHtml(hostId) (no "All hosts" entry -
- * builds always target exactly one engine), preselect resolveHostId(storage.get(...)),
- * persist the choice under LS_IMAGES_HOST and reload the panel on change. With no host at
- * all: disable the select and render "No Docker host yet - add one under Settings -> Hosts"
- * into #tools-status, #tools-agents and #recipes-list instead of firing requests.
+ * Fill #images-host-select (no "All hosts" entry - a build always targets exactly one
+ * engine), preselect the remembered host and persist the choice. With no host at all the
+ * select is disabled and the panel renders the "add a host" empty state instead of firing
+ * requests that could only fail.
  */
 export function renderHostSelect() {
-  void getHosts;
-  void resolveHostId;
-  void hostOptionsHtml;
-  // TODO(F1)
+  const select = byId('images-host-select');
+  const list = getHosts();
+  if (!select) {
+    hostId = resolveHostId(hostId || storage.get(LS_IMAGES_HOST, ''));
+    return;
+  }
+  if (!list.length) {
+    hostId = '';
+    select.innerHTML = '<option value="">no host</option>';
+    select.disabled = true;
+    return;
+  }
+  select.disabled = false;
+  hostId = resolveHostId(hostId || storage.get(LS_IMAGES_HOST, ''));
+  select.innerHTML = hostOptionsHtml(hostId);
+  select.value = hostId;
+  storage.set(LS_IMAGES_HOST, hostId);
 }
 
 function stopJobPoll() {
@@ -93,7 +109,7 @@ export async function reloadRecipes() {
   if (!list) return;
   if (!hostId) {
     recipes = [];
-    list.innerHTML = '<div class="col-12 text-secondary small">Pick a host first.</div>';
+    list.innerHTML = `<div class="col-12 text-secondary small">${escapeHtml(NO_HOST_TEXT)}</div>`;
     return;
   }
   try {
@@ -113,17 +129,46 @@ export async function reloadRecipes() {
 }
 
 /**
- * TODO(F1): render #tools-agents from `ToolsStatus.agents` (AgentToolStatus[]): a small
- * table with one row per agent - the agent id in monospace (ids are the API identity; this
- * module deliberately does NOT import agents.js, see the module graph in frontend.md 12.2),
- * an "installed <version>" success badge / "not installed" secondary badge / the `error`
- * string in danger, and fmtDate(installedAt). Below it a one-liner:
- *   "Agents are installed into the tools volume of THIS host. There is no sync between
- *    hosts: every host needs its own login."
- * When `agents` is empty: "no agents installed yet - enable them under Agents, then sync".
+ * Render #tools-agents from `ToolsStatus.agents` (AgentToolStatus[]). The agent ids are
+ * rendered in monospace and NOT resolved to labels: ids are the API identity, and this
+ * module deliberately does not import agents.js (it would close a cycle - see the module
+ * graph in docs/design/frontend.md section 12.2).
  */
 export function renderToolsAgents() {
-  // TODO(F1)
+  const el = byId('tools-agents');
+  if (!el) return;
+  if (!hostId) {
+    el.innerHTML = `<div class="small text-secondary">${escapeHtml(NO_HOST_TEXT)}</div>`;
+    return;
+  }
+  const list = toolsStatus && Array.isArray(toolsStatus.agents) ? toolsStatus.agents : [];
+  const note =
+    '<div class="small text-secondary mt-1">Agents are installed into the tools volume of ' +
+    'THIS host. There is no sync between hosts: every host needs its own login.</div>';
+  if (!list.length) {
+    el.innerHTML =
+      '<div class="small text-secondary">No agent installed yet - enable them under Agents, then sync.</div>' + note;
+    return;
+  }
+  const rows = list
+    .map((agent) => {
+      const badge = agent && agent.error
+        ? `<span class="badge text-bg-danger" title="${escapeHtml(agent.error)}">install failed</span>`
+        : agent && agent.installed
+          ? `<span class="badge text-bg-success">installed ${escapeHtml(agent.version || '?')}</span>`
+          : '<span class="badge text-bg-secondary">not installed</span>';
+      return (
+        '<tr>' +
+        `<td class="font-monospace small">${escapeHtml((agent && agent.id) || '')}</td>` +
+        `<td>${badge}</td>` +
+        `<td class="small text-secondary">${escapeHtml(agent && agent.installedAt ? fmtDate(agent.installedAt) : '')}</td>` +
+        `<td class="small text-danger">${escapeHtml((agent && agent.error) || '')}</td>` +
+        '</tr>'
+      );
+    })
+    .join('');
+  el.innerHTML =
+    '<div class="table-responsive"><table class="table table-sm mb-0"><tbody>' + rows + '</tbody></table></div>' + note;
 }
 
 /** GET /api/hosts/:hostId/images/tools -> #tools-status (+ renderToolsAgents). */
@@ -132,7 +177,8 @@ export async function reloadTools() {
   if (!el) return;
   if (!hostId) {
     toolsStatus = null;
-    el.textContent = 'Pick a host first.';
+    el.textContent = NO_HOST_TEXT;
+    renderToolsAgents();
     return;
   }
   try {
@@ -340,11 +386,27 @@ const imagesPanel = {
     if (initialised) return;
     initialised = true;
 
-    // TODO(F1): wire #images-host-select (change -> hostId = value, storage.set(
-    //   LS_IMAGES_HOST, value), reload everything) and subscribe to EVENTS.HOSTS_CHANGED so
-    //   the select follows host CRUD. `hostId` must never stay '' while a host exists.
-    void storage;
-    void LS_IMAGES_HOST;
+    const hostSelect = byId('images-host-select');
+    if (hostSelect) {
+      hostSelect.addEventListener('change', () => {
+        hostId = hostSelect.value || '';
+        storage.set(LS_IMAGES_HOST, hostId);
+        stopJobPoll();
+        void reloadRecipes();
+        void reloadTools();
+        void reloadJobs();
+      });
+    }
+    // follow host CRUD: `hostId` must never stay '' while a host exists
+    bus.on(EVENTS.HOSTS_CHANGED, () => {
+      const before = hostId;
+      renderHostSelect();
+      if (before !== hostId) {
+        void reloadRecipes();
+        void reloadTools();
+        void reloadJobs();
+      }
+    });
 
     const refresh = byId('btn-images-refresh');
     if (refresh) {

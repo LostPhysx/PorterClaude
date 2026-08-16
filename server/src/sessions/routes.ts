@@ -44,7 +44,8 @@ const LogsQuery = z.object({
  * POST   /api/sessions/:name/restart   -> { session: SessionView }
  * POST   /api/sessions/:name/recreate  -> { session: SessionView }
  * GET    /api/sessions/:name/logs?tail=200&timestamps=0 -> { logs: string }
- * POST   /api/sessions/reconcile       -> { report: ReconcileReport }
+ * POST   /api/sessions/reconcile?hostId=<id> -> { report: ReconcileReport }
+ *                                       (every host, or just one)
  */
 export function createSessionsRouter(ctx: AppContext): Router {
   const router = Router();
@@ -70,10 +71,11 @@ export function createSessionsRouter(ctx: AppContext): Router {
   // literal route: MUST be registered before '/:name'
   router.post(
     '/reconcile',
-    asyncHandler(async (_req, res) => {
+    asyncHandler(async (req, res) => {
       // explicit user action: adopt orphans (the startup reconcile does not, so an
       // orphan stays visible instead of being silently rewritten)
-      const report = await ctx.sessions.reconcile({ adopt: true });
+      const { hostId } = parseQuery(ListQuery, req);
+      const report = await ctx.sessions.reconcile({ adopt: true, ...(hostId ? { hostId } : {}) });
       res.json({ report });
     }),
   );

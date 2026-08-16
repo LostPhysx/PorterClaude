@@ -7,6 +7,13 @@ needs a local Docker CLI.
 Secrets live in `deploy/.env` (gitignored); [`.env.example`](.env.example) documents every
 key with placeholders. **Never commit a real Portainer API key.**
 
+**Scope.** Everything in this directory is about *shipping the app container*. The docker
+hosts PorterClaude manages, the coding agents installed on each of them and the session
+images are configured **inside the app** — see [../docs/DEPLOYMENT.md](../docs/DEPLOYMENT.md)
+and [../docs/AGENTS.md](../docs/AGENTS.md). The rendered stack sets
+`PORTERCLAUDE_BACKEND=socket`, which seeds the *first* host as the engine the app runs on and
+is ignored once `/data` holds a host; further hosts are added in Settings → Hosts.
+
 ```
 deploy/
   deploy.sh              build + stack create/update + health poll
@@ -96,8 +103,9 @@ Portainer on this host sits **behind the same nginx-proxy**, with its defaults. 
 there: the `POST …/docker/build` response is buffered until the build finishes, and a build
 that runs longer than 60 s gets an HTML `504 Gateway Time-out` — docker then cancels
 ("aborts") the build. That kills `deploy.sh`'s remote build of the app image (`npm ci` +
-`tsc`, several minutes) and every recipe build over a minute (`php`, `python`, `go`,
-`dotnet`) started from Settings → Images.
+`tsc`, several minutes), every recipe build over a minute (`php`, `python`, `go`, `dotnet`)
+started from Settings → Images, and every **tools sync** (which downloads the host's coding
+agents and their runtimes and runs for minutes on the first go).
 
 Fix it once on the proxy, in `vhost.d/<portainer-host>`:
 
@@ -129,9 +137,9 @@ action flag, and `--dry-run` prints exactly what each one would do.
 
 | Flag | Effect |
 |---|---|
-| `--clean` | remove containers labelled `porterclaude.managed=true` **and** named `pc-qa-*` / `pc-o1-*` (override with `HOST_PREP_PREFIXES`), together with their `porterclaude-ws-*` / `porterclaude-hist-*` volumes — the named volumes are read off the container *before* it is deleted, because `?v=1` only drops anonymous ones |
+| `--clean` | remove containers labelled `porterclaude.managed=true` **and** named `pc-qa-*` / `pc-o1-*` (override with `HOST_PREP_PREFIXES`), together with their `porterclaude-ws-*` / `porterclaude-hist-*` volumes — the named volumes are read off the container *before* it is deleted, because `?v=1` only drops anonymous ones. The per-agent `porterclaude-auth-*` volumes (the logins) are never touched |
 | `--prune` | remove **dangling** images that carry a `porterclaude.*` label (a rebuild leaves 0.6–1.4 GB behind each time); `409 Conflict` = still referenced, kept |
-| `--vhost` | write `vhost.d/<portainer-host>` (long build streams) and `vhost.d/<app-host>` (idle terminal WebSockets). The host directory is read from the nginx-proxy container's own mount of `/etc/nginx/vhost.d`, falling back to `NGINX_VHOST_DIR` / `/srv/nginx/vhost.d`; the files are written by a throwaway `alpine` container with that directory bind-mounted |
+| `--vhost` | write `vhost.d/<portainer-host>` (long build + tools-sync streams) and `vhost.d/<app-host>` (idle terminal WebSockets). The host directory is read from the nginx-proxy container's own mount of `/etc/nginx/vhost.d`, falling back to `NGINX_VHOST_DIR` / `/srv/nginx/vhost.d`; the files are written by a throwaway `alpine` container with that directory bind-mounted |
 | `--reload` | `SIGHUP` the nginx-proxy container so it reloads |
 | `--all` | all four, in that order |
 | `--dry-run` | change nothing; print every action, the vhost file contents, and a final count |
@@ -155,7 +163,9 @@ stat -c %g /var/run/docker.sock     # on the docker host -> put it in DOCKER_GID
 ```
 
 `porterclaude-data` must persist: it holds `secret.key`, which encrypts the stored Portainer
-key and signs session cookies.
+keys and signs session cookies. The **agent logins** are not in it — they live on each
+managed docker host in the per-agent volumes `porterclaude-auth-<agentId>`
+([../docs/DEPLOYMENT.md](../docs/DEPLOYMENT.md#volumes-created-on-a-managed-host)).
 
 ## Troubleshooting
 

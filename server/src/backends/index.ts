@@ -57,32 +57,68 @@ export function createBackend(conn: ResolvedConnection): DockerBackend {
  * for connection problems: a failure is reported as `{ ok:false, error }` so the Settings /
  * Hosts screens can show it inline. Always closes the backend it built.
  *
- * TODO(B1): move the body of the old `BackendManager.test()` here (it already had the
- * portainer-endpoint fallback and the "log the message, never the api key" rule).
+ * The api key is never part of the result and never logged - only the error message is.
  */
 export async function testConnection(
   conn: ResolvedConnection,
   deps: { log: Logger },
 ): Promise<BackendTestResult> {
-  void conn;
-  void deps;
-  throw new Error('TODO(B1): testConnection');
+  let backend: DockerBackend | null = null;
+  try {
+    backend = createBackend(conn);
+    const info = await backend.info();
+    const result: BackendTestResult = { ok: true, info };
+    if (conn.type === 'portainer' && backend instanceof PortainerBackend) {
+      try {
+        result.endpoints = await backend.listEndpoints();
+      } catch (err) {
+        deps.log.warn(
+          { err: (err as Error).message },
+          'portainer endpoint listing failed during test',
+        );
+        result.endpoints = [];
+      }
+    }
+    return result;
+  } catch (err) {
+    if (err instanceof AppError && err.code === 'not_implemented') throw err;
+    const e = err as { code?: string; message?: string };
+    deps.log.warn({ type: conn.type, err: e.message }, 'host connection test failed');
+    return {
+      ok: false,
+      error: {
+        code: typeof e.code === 'string' ? e.code : 'backend_error',
+        message: e.message ?? String(err),
+      },
+    };
+  } finally {
+    await backend?.close().catch(() => undefined);
+  }
 }
 
 /**
  * Portainer endpoint picker used by the credentials screen and by
  * `POST /api/credentials/portainer/:id/import`.
- *
- * TODO(B1): build a PortainerBackend (endpointId 0 is fine, the call does not use it),
- * `listEndpoints()`, close it in a finally.
  */
 export async function listPortainerEndpoints(cred: {
   url: string;
   apiKey: string;
   insecureTls?: boolean;
 }): Promise<PortainerEndpoint[]> {
-  void cred;
-  throw new Error('TODO(B1): listPortainerEndpoints');
+  if (!cred.url) throw AppError.badRequest('a portainer url is required');
+  if (!cred.apiKey) throw AppError.badRequest('a portainer api key is required');
+  // endpointId is irrelevant for /api/endpoints, but the transport wants one
+  const backend = new PortainerBackend({
+    url: cred.url,
+    apiKey: cred.apiKey,
+    endpointId: 0,
+    insecureTls: cred.insecureTls ?? false,
+  });
+  try {
+    return await backend.listEndpoints();
+  } finally {
+    await backend.close().catch(() => undefined);
+  }
 }
 
 /** `SocketBackend.isAvailable`, re-exported so routes do not import the transport directly. */

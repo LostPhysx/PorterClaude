@@ -122,20 +122,24 @@ function jitter(ms) {
  */
 export class TerminalPane {
   /**
-   * @param {{session:string, shell:Shell, agentId?:string|null, name:string,
-   *          theme?:'dark'|'light',
+   * @param {{session:string, shell:Shell, agentId?:string|null, agentName?:string|null,
+   *          name:string, theme?:'dark'|'light',
    *          onStatus?:(status:PaneStatus, info?:object)=>void,
    *          onTitle?:(title:string)=>void,
    *          onRequestClose?:()=>void,
    *          onOpenBash?:()=>void}} opts
-   *        v0.2: `agentId` is REQUIRED when `shell === 'agent'`; `onOpenBash` is the action
-   *        the pane offers after close 4410 (agent_not_available).
+   *        v0.2: `agentId` is REQUIRED when `shell === 'agent'`; `agentName` is its display
+   *        name (agents.js `agentLabel`, passed in by code.js so this module keeps its tiny
+   *        dependency set) and `onOpenBash` is the action the pane offers after close 4410
+   *        (agent_not_available).
    */
   constructor(opts) {
     this.session = opts.session;
     this.shell = opts.shell;
     /** @type {string|null} set exactly when shell === 'agent' (v0.2) */
     this.agentId = opts.agentId ?? null;
+    /** @type {string|null} display name of that agent, for the notes this pane renders */
+    this.agentName = opts.agentName || null;
     /** @type {string|null} the host the server resolved this session to (from `ready`) */
     this.hostId = null;
     this.name = opts.name;
@@ -527,15 +531,16 @@ export class TerminalPane {
       return;
     }
 
-    // v0.2 TERMINAL conditions - never auto-reconnect (api.md "WebSocket: terminals").
+    // v0.2 TERMINAL conditions - never auto-reconnect, never call the API again
+    // (api.md "WebSocket: terminals"): the pane states the reason and offers a way out.
     if (code === CLOSE.agentNotAvailable) {
       this._setStatus('fatal');
-      // TODO(F2): wording - `the agent "<label>" is not available in this session` plus
-      // "enable it on the host (Settings, Agents), sync the tools volume and recreate the
-      // session". Keep the two actions below.
+      const label = this.agentName || this.agentId || 'this coding agent';
       this._renderNote('conn', {
         variant: 'danger',
-        text: detail || `agent "${this.agentId || '?'}" is not available in this session`,
+        text: `the agent "${label}" is not available in this session${detail ? ` (${detail})` : ''}` +
+          ' — enable it on the host under Settings → Agents, run "Install / update on this' +
+          ' host", then recreate the session',
         actions: [
           { label: 'Open bash instead', onClick: () => this.onOpenBash() },
           { label: 'Close pane', onClick: () => this.onRequestClose() },
@@ -546,11 +551,12 @@ export class TerminalPane {
 
     if (code === CLOSE.hostUnavailable) {
       this._setStatus('fatal');
-      // TODO(F2): wording - "the host of this session is unavailable" + the host id when the
-      // `ready` frame had already delivered one. No retry, no api call.
+      // `ready` may already have told us which host this session runs on; name it when so.
+      const where = this.hostId ? `host "${this.hostId}"` : 'the host of this session';
       this._renderNote('conn', {
         variant: 'danger',
-        text: detail || 'the host of this session is unavailable',
+        text: `${where} is unavailable${detail ? ` (${detail})` : ''}` +
+          ' — check it under Settings → Hosts',
         actions: [{ label: 'Close pane', onClick: () => this.onRequestClose() }],
       });
       return;

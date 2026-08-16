@@ -559,9 +559,15 @@ mechanism v0.1 used for `~/.claude/projects` inside the shared claude volume).
 
 **Delivery is uniform** (product owner's call): recipes stop baking claude in; **every**
 session mounts the tools volume read-only at `<toolsMount>` and gets
-`entrypoint ["<toolsMount>/entrypoint.sh"]`. Recipes keep their image `CMD` (the php recipe
-must still start supervisord) — docker only replaces what the create request sets, so
-overriding the entrypoint alone preserves `Cmd`. Custom images keep `cmd ["sleep","infinity"]`.
+`entrypoint ["<toolsMount>/entrypoint.sh"]`. Recipes still run their image `CMD` (the php
+recipe must still start supervisord), but the server has to **repeat it explicitly**: the
+engine only inherits the image `Cmd` when the create request leaves `Entrypoint` unset (moby
+`merge()`), so setting the bootstrap entrypoint DROPS it — measured on the reference host,
+docs/design/requests/v2-O1.md 1. `resolveImage()` therefore reads `ImageInspect.cmd` and
+passes it to `buildContainerSpec` as `imageCmd`; an image without a `CMD` and every custom
+image get `cmd ["sleep","infinity"]`. When the spec of an existing container is recomputed
+(`needsRecreate`), `imageCmd` comes from that container's own `ContainerInspect.cmd` — the
+argv it was created with — for the same reason `imageEnvPath` is recovered from its env.
 
 **Contract with the ORCHESTRATION topic** (docker/tools):
 

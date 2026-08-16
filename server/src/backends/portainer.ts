@@ -330,9 +330,69 @@ export class PortainerBackend implements DockerBackend {
     });
   }
 
+  /**
+   * Block until the container stopped.
+   *
+   * QA B-1: this MUST NOT inherit send()'s 20 s default timeout. A v0.2 tools sync runs the
+   * agent installers inside the populate container (curl/npm/uv, minutes), so the 20 s cut
+   * turned every `POST /images/tools/sync` on a Portainer host into
+   * "POST /containers/<id>/wait: request timed out after 20000ms" and the caller's `finally`
+   * force-removed the container mid-install. The request therefore runs with `timeoutMs:
+   * null` like the build/pull streams.
+   *
+   * A proxy in front of Portainer may still cut an idle connection (or answer with an empty
+   * body); in that case ask the engine whether the container already exited, and otherwise
+   * re-issue the wait. Bounded so a permanently broken transport still fails.
+   */
   async waitContainer(id: string): Promise<{ statusCode: number }> {
-    const res = await this.request<Raw>('POST', `/containers/${id}/wait`);
-    return { statusCode: res?.StatusCode ?? 0 };
+    const what = `POST /containers/${id}/wait`;
+    const maxAttempts = 5;
+    let lastError: Error | null = null;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      let res: RawResponse;
+      try {
+        res = await this.send('POST', this.dockerUrl(`/containers/${id}/wait`, { condition: 'not-running' }), {
+          timeoutMs: null,
+        });
+      } catch (err) {
+        lastError = err instanceof Error ? err : new Error(String(err));
+        const settled = await this.exitStatusIfStopped(id);
+        if (settled) return settled;
+        continue;
+      }
+
+      const buf = await PortainerBackend.readAll(res.stream);
+      if (res.status >= 400) {
+        throw new DockerApiError(`${what}: ${PortainerBackend.errorMessage(buf, res.status)}`, res.status);
+      }
+      const text = buf.toString('utf8').trim();
+      if (text) {
+        try {
+          const raw = JSON.parse(text) as Raw;
+          if (typeof raw?.StatusCode === 'number') return { statusCode: raw.StatusCode };
+        } catch {
+          // fall through to the inspect probe below
+        }
+      }
+      // empty/garbled body: the connection was cut before the engine answered
+      lastError = new Error('the wait stream ended without an exit status');
+      const settled = await this.exitStatusIfStopped(id);
+      if (settled) return settled;
+    }
+
+    throw toDockerApiError(lastError ?? new Error('wait failed'), what);
+  }
+
+  /** `{statusCode}` when the container exists and is no longer running, else null. */
+  private async exitStatusIfStopped(id: string): Promise<{ statusCode: number } | null> {
+    try {
+      const inspect = await this.inspectContainer(id);
+      if (inspect.running) return null;
+      return { statusCode: inspect.exitCode ?? 0 };
+    } catch {
+      return null;
+    }
   }
 
   async containerLogs(id: string, opts?: LogsOptions): Promise<string> {

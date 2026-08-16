@@ -16,6 +16,9 @@
 //
 //   The browser MUST set ws.binaryType = 'arraybuffer'.
 
+import { AppError } from '../http/errors.js';
+import type { ErrorCode } from '../http/errors.js';
+
 /**
  * What a pane runs. v0.2 replaced the hard-wired `claude` row with `agent`, which carries
  * the agent id separately (`TerminalQuery.agentId`) — the wire value is `agent:<agentId>`.
@@ -136,3 +139,36 @@ export const TERMINAL_HEARTBEAT_TIMEOUT_MS = 70_000;
 
 /** Max buffered stdin bytes before the server drops the connection (backpressure guard). */
 export const TERMINAL_MAX_BUFFER_BYTES = 4 * 1024 * 1024;
+
+/**
+ * A refusal that carries its own wire code + close code (v0.2). `mapError` in ws.ts uses it
+ * verbatim, which is how `agent_not_available` (4410) and `host_unavailable` (4411) reach the
+ * client: both are conditions no AppError code can express (an unknown agent is not a 404 of
+ * the session, and a dead host is not a broken backend — the client must not reconnect).
+ */
+export class TerminalRefusal extends AppError {
+  readonly terminalCode: TerminalErrorCode;
+  readonly closeCode: TerminalCloseCode;
+
+  constructor(
+    terminalCode: TerminalErrorCode,
+    closeCode: TerminalCloseCode,
+    message: string,
+    appCode: ErrorCode = 'conflict',
+  ) {
+    super(appCode, message);
+    this.name = 'TerminalRefusal';
+    this.terminalCode = terminalCode;
+    this.closeCode = closeCode;
+  }
+
+  /** the requested agent is unknown or not mounted into this session */
+  static agentNotAvailable(message: string): TerminalRefusal {
+    return new TerminalRefusal('agent_not_available', TERMINAL_CLOSE.agentNotAvailable, message, 'conflict');
+  }
+
+  /** the session's host is gone, or its connection type is not supported by this version */
+  static hostUnavailable(message: string): TerminalRefusal {
+    return new TerminalRefusal('host_unavailable', TERMINAL_CLOSE.hostUnavailable, message, 'conflict');
+  }
+}

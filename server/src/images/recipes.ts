@@ -1,6 +1,9 @@
-// FROZEN (planner-authored). The recipe registry. `name` MUST match the directory
-// docker/recipes/<name>/ owned by the orchestration topic. Tags: <ns>/<name>:latest
-// (plus <ns>/<name>:<claudeVersion> when the build reports one).
+// OWNER: B2 (registry data). `name` MUST match the directory docker/recipes/<name>/ owned
+// by the orchestration topic. Tags: <ns>/<name>:latest.
+//
+// v0.2: a recipe image is a TOOLCHAIN only - it no longer bakes a coding agent in. Every
+// session (recipe and custom alike) mounts the host's tools volume read-only and gets the
+// agents from there, so adding an agent never means rebuilding six images.
 export interface RecipeDef {
   name: string;
   title: string;
@@ -14,7 +17,7 @@ export interface RecipeDef {
 }
 
 export const RECIPES: RecipeDef[] = [
-  { name: 'node', title: 'Node.js 22', description: 'node:22-bookworm with npm, pnpm and the Claude Code CLI', baseImage: 'node:22-bookworm' },
+  { name: 'node', title: 'Node.js 22', description: 'node:22-bookworm with npm and pnpm', baseImage: 'node:22-bookworm' },
   { name: 'dotnet', title: '.NET SDK 9', description: 'mcr.microsoft.com/dotnet/sdk:9.0', baseImage: 'mcr.microsoft.com/dotnet/sdk:9.0' },
   { name: 'php', title: 'PHP 8.3 + nginx', description: 'php:8.3-fpm with nginx, composer and supervisord', baseImage: 'php:8.3-fpm-bookworm', defaultPorts: [80], notes: 'serves /workspace/public on port 80; set the session env var PC_HTTP_PORT (and publish the same port) when the host does not allow uid 1000 to bind port 80' },
   { name: 'python', title: 'Python 3.13', description: 'python:3.13-bookworm with pip and uv', baseImage: 'python:3.13-bookworm' },

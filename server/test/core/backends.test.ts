@@ -1,6 +1,9 @@
-// OWNER: B1. The mapping layer shared by both docker transports + BackendManager wiring.
-import { describe, it, expect, afterEach } from 'vitest';
+// OWNER: B1. The mapping layer shared by both docker transports + the per-host transport
+// cache of HostManager (v0.2 replacement of the single global BackendManager).
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { rm } from 'node:fs/promises';
+import { buildContext } from './helpers.js';
+import { AppError } from '../../src/http/errors.js';
 import {
   createDemuxer,
   decodeDockerStream,
@@ -228,15 +231,179 @@ describe('both backends implement the DockerBackend surface', () => {
   });
 });
 
-// TODO(B1): the v0.1 `BackendManager` suite lived here. Rewrite it against HostManager:
-//   * no host configured           -> backendFor() throws backend_not_configured (409),
-//                                     tryBackendFor() is null, isConfigured() is false;
-//   * one socket host + one portainer host  -> two DIFFERENT cached instances, and
-//     backendFor() returns the same instance on a second call;
-//   * changing host A's connection invalidates ONLY A (invalidateChanged() returns ['a']),
-//     a PUT /api/settings/ui write invalidates nothing;
-//   * an unimplemented connection type (tcp/ssh) -> not_implemented (501);
-//   * testConnection() never throws and never echoes the api key (grep the JSON).
+describe('HostManager transports', () => {
+  const API_KEY = 'ptr_supersecret_0abc';
+
+  async function harness(): Promise<Awaited<ReturnType<typeof buildContext>>> {
+    const built = await buildContext();
+    dirs.push(built.dataDir);
+    return built;
+  }
+
+  it('has nothing to hand out while no host is configured', async () => {
+    const { ctx } = await harness();
+    expect(ctx.hosts.isConfigured()).toBe(false);
+    expect(ctx.hosts.list()).toEqual([]);
+    expect(ctx.hosts.defaultHostId()).toBeNull();
+
+    try {
+      ctx.hosts.requireHostId();
+      expect.unreachable('requireHostId() must throw without a host');
+    } catch (err) {
+      expect((err as AppError).code).toBe('backend_not_configured');
+      expect((err as AppError).status).toBe(409);
+    }
+    expect(() => ctx.hosts.backendFor('default')).toThrow(/does not exist/);
+    expect(ctx.hosts.tryBackendFor('default')).toBeNull();
+    expect(ctx.backends.tryGet()).toBeNull();
+    expect(() => ctx.backends.get()).toThrow();
+  });
+
+  it('caches ONE transport per host and hands out the same instance twice', async () => {
+    const { ctx } = await harness();
+    await ctx.credentials.create({ name: 'P', url: 'https://portainer.example.com', apiKey: API_KEY });
+    await ctx.hosts.create({ name: 'Local', connection: { type: 'socket', socketPath: '/x.sock' } });
+    await ctx.hosts.create({
+      name: 'Prod',
+      connection: { type: 'portainer', credentialId: 'portainer-1', endpointId: 2 },
+    });
+
+    const local = ctx.hosts.backendFor('local');
+    const prod = ctx.hosts.backendFor('prod');
+    expect(local).toBe(ctx.hosts.backendFor('local'));
+    expect(prod).toBe(ctx.hosts.backendFor('prod'));
+    expect(local).not.toBe(prod);
+    expect(local.id).toBe('socket:/x.sock');
+    expect(prod.id).toBe('portainer:https://portainer.example.com#2');
+    expect(ctx.hosts.isConfigured()).toBe(true);
+    // the default host is what the v0.1 compatibility shim resolves to
+    expect(ctx.backends.get()).toBe(local);
+    await ctx.hosts.close();
+  });
+
+  it('drops only the host that really changed', async () => {
+    const { ctx } = await harness();
+    await ctx.credentials.create({ name: 'P', url: 'https://portainer.example.com', apiKey: API_KEY });
+    await ctx.hosts.create({ name: 'Local', connection: { type: 'socket', socketPath: '/x.sock' } });
+    await ctx.hosts.create({
+      name: 'Prod',
+      connection: { type: 'portainer', credentialId: 'portainer-1', endpointId: 2 },
+    });
+
+    const local = ctx.hosts.backendFor('local');
+    const prod = ctx.hosts.backendFor('prod');
+
+    // a UI layout autosave must not tear down a transport that carries running builds
+    const spy = vi.spyOn(ctx.hosts, 'invalidateChanged');
+    await ctx.config.update((draft) => {
+      draft.ui.layout = { savedAt: 1 };
+    });
+    expect(spy).toHaveBeenCalled();
+    expect(spy.mock.results.map((r) => r.value)).toEqual([[]]);
+    expect(ctx.hosts.backendFor('local')).toBe(local);
+    expect(ctx.hosts.backendFor('prod')).toBe(prod);
+    spy.mockRestore();
+
+    // changing the connection of one host rebuilds exactly that one
+    await ctx.hosts.update('local', { connection: { type: 'socket', socketPath: '/y.sock' } });
+    const local2 = ctx.hosts.backendFor('local');
+    expect(local2).not.toBe(local);
+    expect(local2.id).toBe('socket:/y.sock');
+    expect(ctx.hosts.backendFor('prod')).toBe(prod);
+
+    // ... and so does rotating the credential a host uses
+    await ctx.credentials.update('portainer-1', { apiKey: 'ptr_rotated_1def' });
+    const prod2 = ctx.hosts.backendFor('prod');
+    expect(prod2).not.toBe(prod);
+    expect(ctx.hosts.backendFor('local')).toBe(local2);
+    await ctx.hosts.close();
+  });
+
+  it('refuses a reserved connection type with not_implemented (501)', async () => {
+    const { ctx } = await harness();
+    await ctx.hosts.create({
+      name: 'Future',
+      connection: { type: 'tcp', url: 'tcp://10.0.0.5:2376', credentialId: null, insecureTls: false },
+    });
+    await ctx.hosts.create({
+      name: 'Remote',
+      connection: { type: 'ssh', url: 'ssh://root@10.0.0.5', credentialId: null, socketPath: '/var/run/docker.sock' },
+    });
+    for (const id of ['future', 'remote']) {
+      try {
+        ctx.hosts.backendFor(id);
+        expect.unreachable(`backendFor('${id}') must throw`);
+      } catch (err) {
+        expect((err as AppError).code).toBe('not_implemented');
+        expect((err as AppError).status).toBe(501);
+      }
+      const view = await ctx.hosts.view(id, { probe: true });
+      expect(view.supported).toBe(false);
+      expect(view.status).toBe('not_configured');
+    }
+    expect(ctx.hosts.isConfigured()).toBe(false);
+  });
+
+  it('reports an incomplete portainer connection as backend_not_configured', async () => {
+    const { ctx } = await harness();
+    const now = new Date().toISOString();
+    await ctx.config.putHost({
+      id: 'broken',
+      name: 'Broken',
+      connection: { type: 'portainer', credentialId: 'gone', endpointId: 1 },
+      overrides: {},
+      agents: { enabled: ['claude'] },
+      notes: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    try {
+      ctx.hosts.backendFor('broken');
+      expect.unreachable('an unresolvable credential must throw');
+    } catch (err) {
+      expect((err as AppError).code).toBe('backend_not_configured');
+    }
+    const view = await ctx.hosts.view('broken', { probe: true });
+    expect(view.status).toBe('not_configured');
+    expect(view.error).toContain('gone');
+  });
+
+  it('never throws (and never echoes the api key) from a failing test()', async () => {
+    const { ctx } = await harness();
+    await ctx.credentials.create({ name: 'P', url: 'http://127.0.0.1:1', apiKey: API_KEY });
+    await ctx.hosts.create({
+      name: 'Prod',
+      connection: { type: 'portainer', credentialId: 'portainer-1', endpointId: 2 },
+    });
+    await ctx.hosts.create({ name: 'Local', connection: { type: 'socket', socketPath: '/nope.sock' } });
+
+    for (const id of ['prod', 'local']) {
+      const result = await ctx.hosts.test(id);
+      expect(result.ok).toBe(false);
+      expect(typeof result.error?.message).toBe('string');
+      expect(JSON.stringify(result)).not.toContain(API_KEY);
+    }
+
+    const unsaved = await ctx.hosts.testConnection({ type: 'socket', socketPath: '/nope.sock' });
+    expect(unsaved.ok).toBe(false);
+    expect(JSON.stringify(await ctx.hosts.views({ probe: true }))).not.toContain(API_KEY);
+    await ctx.hosts.close();
+  });
+
+  it('merges the general settings with the host overrides', async () => {
+    const { ctx } = await harness();
+    await ctx.hosts.create({
+      name: 'Local',
+      connection: { type: 'socket', socketPath: '/x.sock' },
+      overrides: { workspacesRoot: '/srv/other', volumePrefix: 'pc2-' },
+    });
+    const settings = ctx.hosts.settingsFor('local');
+    expect(settings.workspacesRoot).toBe('/srv/other');
+    expect(settings.volumePrefix).toBe('pc2-');
+    expect(settings.toolsMount).toBe(ctx.config.general().toolsMount);
+    expect(ctx.config.general().workspacesRoot).toBe('/srv/porterclaude/workspaces');
+  });
+});
 
 /**
  * PortainerBackend.startContainer falls back to /restart.
@@ -399,5 +566,108 @@ describe('PortainerBackend.close() and in-flight streams', () => {
       await backend.close();
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
+  }, 20_000);
+});
+
+/**
+ * Regression (QA B-1): PortainerBackend.waitContainer() must NOT inherit the 20 s default
+ * request timeout of send(). The v0.2 tools sync runs the agent installers inside the
+ * populate container, which takes minutes; with the default timeout every
+ * `POST /api/hosts/:id/images/tools/sync` died with "request timed out after 20000ms" and
+ * the caller's finally block force-removed the container mid-install.
+ */
+describe('PortainerBackend.waitContainer', () => {
+  async function withServer(
+    handler: (req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => void,
+    run: (backend: PortainerBackend) => Promise<void>,
+  ): Promise<void> {
+    const http = await import('node:http');
+    const server = http.createServer(handler);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = (server.address() as { port: number }).port;
+    // a deliberately tiny default: anything that honours it fails in well under a second
+    const backend = new PortainerBackend({
+      url: `http://127.0.0.1:${port}`, apiKey: 'k', endpointId: 2, timeoutMs: 250,
+    });
+    try {
+      await run(backend);
+    } finally {
+      await backend.close();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  }
+
+  it('waits past the default request timeout (long install) and returns the exit status', async () => {
+    let waitCalls = 0;
+    await withServer(
+      (req, res) => {
+        const url = req.url ?? '';
+        if (url.includes('/wait')) {
+          waitCalls += 1;
+          // ~4x the configured default timeout
+          setTimeout(() => {
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ StatusCode: 0 }));
+          }, 1000);
+          return;
+        }
+        if (url.includes('/info')) return; // never answers: the default timeout must bite
+        res.writeHead(404).end();
+      },
+      async (backend) => {
+        await expect(backend.waitContainer('pc-tools')).resolves.toEqual({ statusCode: 0 });
+        // the default timeout still applies to the ordinary calls
+        await expect(backend.info()).rejects.toThrow(/timed out after 250ms/);
+      },
+    );
+    expect(waitCalls).toBe(1);
+  }, 20_000);
+
+  it('falls back to inspect when the wait connection is cut, and reports the exit code', async () => {
+    let waitCalls = 0;
+    await withServer(
+      (req, res) => {
+        const url = req.url ?? '';
+        if (url.includes('/wait')) {
+          waitCalls += 1;
+          res.socket?.destroy(); // proxy dropped the idle connection
+          return;
+        }
+        if (url.includes('/json')) {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ Id: 'pc-tools', Name: '/pc-tools', State: { Status: 'exited', Running: false, ExitCode: 3 } }));
+          return;
+        }
+        res.writeHead(404).end();
+      },
+      async (backend) => {
+        await expect(backend.waitContainer('pc-tools')).resolves.toEqual({ statusCode: 3 });
+      },
+    );
+    expect(waitCalls).toBe(1);
+  }, 20_000);
+
+  it('re-issues the wait while the container is still running, then gives up', async () => {
+    let waitCalls = 0;
+    await withServer(
+      (req, res) => {
+        const url = req.url ?? '';
+        if (url.includes('/wait')) {
+          waitCalls += 1;
+          res.socket?.destroy();
+          return;
+        }
+        if (url.includes('/json')) {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ Id: 'pc-tools', Name: '/pc-tools', State: { Status: 'running', Running: true } }));
+          return;
+        }
+        res.writeHead(404).end();
+      },
+      async (backend) => {
+        await expect(backend.waitContainer('pc-tools')).rejects.toThrow(/wait/i);
+      },
+    );
+    expect(waitCalls).toBe(5);
   }, 20_000);
 });

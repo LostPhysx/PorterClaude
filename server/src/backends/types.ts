@@ -51,6 +51,13 @@ export interface ContainerInspect {
   mounts: MountInfo[];
   ports: PortBinding[];
   user?: string;
+  /**
+   * The container's own `Config.Cmd`, i.e. exactly the argv it was CREATED with (never the
+   * image default — the engine does not inherit the image Cmd once the create request sets
+   * an Entrypoint). Read back when recomputing a session spec hash, see
+   * sessions/container.ts `imageCmd`.
+   */
+  cmd?: string[];
   raw: unknown;            // full docker inspect JSON, for anything not modelled here
 }
 

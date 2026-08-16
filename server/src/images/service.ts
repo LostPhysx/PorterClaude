@@ -1,22 +1,26 @@
 // OWNER: B2. Recipe builds, the shared tools volume, custom-image validation, job registry.
 //
-// v0.2 SKELETON STATE (planner). Every public method now takes the HOST it works on as its
-// first argument; the bodies still use the deprecated default-host shims so the repo
-// compiles. B2 owns:
-//   1. replacing `this.deps.config.general()` with `this.deps.hosts.settingsFor(hostId)` and
-//      `this.deps.backends.get()/tryGet()` with `this.deps.hosts.backendFor(hostId)` /
-//      `tryBackendFor(hostId)` — including in the private helpers (they need a hostId param);
-//   2. keying the job registry per host: `JobSummary.hostId`, the "already running" checks
-//      (`runningJobFor`) and `listJobs(hostId)` must all be host-scoped, so a build on host A
-//      never blocks the same recipe on host B;
-//   3. the AGENT half of the tools sync (see syncTools / agentStatuses below).
+// v0.2: every public method takes the HOST it works on as its first argument.
+//   * settings come from `hosts.settingsFor(hostId)`, transports from
+//     `hosts.backendFor(hostId)` / `tryBackendFor(hostId)`; the private helpers take the
+//     resolved backend so nothing below re-resolves a host;
+//   * the job registry is keyed per host: `JobSummary.hostId`, the "already running" checks
+//     and `listJobs(hostId)` are host-scoped, so a build on host A never blocks host B, and
+//     a job of another host is invisible (the routes answer 404);
+//   * the tools sync INSTALLS THE AGENTS of the host (PORTERCLAUDE_AGENTS) and performs the
+//     one-time legacy claude import; `<toolsMount>/AGENTS.json` is what `ToolsStatus.agents`
+//     and `agentStatuses()` report.
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import type { Readable } from 'node:stream';
 import type { ServiceDeps } from '../context.js';
+import type { GeneralConfig } from '../config/schema.js';
 import type { BuildLogLine, DockerBackend, ImageSummary } from '../backends/types.js';
 import { AppError } from '../http/errors.js';
 import { IMAGE_LABELS } from '../sessions/model.js';
+import type { HostConfig } from '../hosts/model.js';
+import type { AgentDefinition, ToolsAgentManifest } from '../agents/model.js';
+import { TOOLS_AGENTS_ENV, TOOLS_AGENT_MANIFEST, agentAuthVolumeFor } from '../agents/model.js';
 import { shortId } from '../util/ids.js';
 import type { RecipeDef } from './recipes.js';
 import { RECIPES, getRecipe, recipeImageRef, toolsImageRef } from './recipes.js';
@@ -117,6 +121,25 @@ const MAX_JOB_LINES = 2000;
 const TOOLS_SYNC_LABEL = 'porterclaude.tools-sync';
 
 /**
+ * env var of the populate container that turns off the carry-over of an unchanged agent
+ * (docker/tools/install-agents.sh). Without it an installed agent is NEVER reinstalled —
+ * its SPEC.json does not change when a new upstream version is released, so `claude`,
+ * `opencode`, … would stay at the version of the first sync forever. `force: true` sets it:
+ * that is the (only) upgrade path for the agents themselves.
+ */
+const TOOLS_FORCE_ENV = 'PORTERCLAUDE_TOOLS_FORCE';
+
+/** how long a read AGENTS.json is served from memory before the volume is read again */
+const MANIFEST_TTL_MS = 30_000;
+
+/** marker file inside `<prefix>auth-claude` that records the one-time v0.1 login import */
+const LEGACY_IMPORT_MARKER = '.pc-import-v1';
+
+/** what the legacy-import container prints so the job log (and this process) can tell */
+const IMPORT_DONE = 'PC_IMPORT_DONE';
+const IMPORT_SKIPPED = 'PC_IMPORT_SKIPPED';
+
+/**
  * Where an image records the exact Claude Code version it ships: recipes write
  * /etc/porterclaude/claude-version (docker/recipes/common.sh), the tools image writes
  * /payload/VERSION (docker/tools/fetch-claude.sh). Neither can be labelled at build time -
@@ -156,9 +179,47 @@ export function parseClaudeVersion(raw: string): string | null {
   return null;
 }
 
+/**
+ * `<toolsMount>/AGENTS.json` as printed by a one-shot `cat`. Defensive on purpose: the log
+ * may carry a docker error line, a shell message or nothing at all, and a tools volume
+ * written by an older PorterClaude has no manifest — all of that must read as "unknown"
+ * rather than throw inside a status call.
+ */
+export function parseAgentManifest(raw: string): ToolsAgentManifest | null {
+  const start = raw.indexOf('{');
+  const end = raw.lastIndexOf('}');
+  if (start < 0 || end <= start) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw.slice(start, end + 1));
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object') return null;
+  const record = parsed as { syncedAt?: unknown; agents?: unknown };
+  if (!Array.isArray(record.agents)) return null;
+  const agents: ToolsAgentManifest['agents'] = [];
+  for (const entry of record.agents) {
+    if (!entry || typeof entry !== 'object') continue;
+    const a = entry as Record<string, unknown>;
+    if (typeof a.id !== 'string' || !a.id) continue;
+    agents.push({
+      id: a.id,
+      command: typeof a.command === 'string' ? a.command : a.id,
+      installed: a.installed === true,
+      version: typeof a.version === 'string' && a.version ? a.version : null,
+      error: typeof a.error === 'string' && a.error ? a.error : null,
+    });
+  }
+  return {
+    syncedAt: typeof record.syncedAt === 'string' ? record.syncedAt : new Date(0).toISOString(),
+    agents,
+  };
+}
+
 interface JobRecord {
   id: string;
-  /** TODO(B2): set by startJob() from the hostId the operation runs against */
+  /** the host this job runs against; set by startJob() */
   hostId: string;
   kind: JobKind;
   target: string;
@@ -192,7 +253,12 @@ function shortImageId(id: string): string {
 
 export class ImageService {
   private readonly jobs = new Map<string, JobRecord>();
-  private lastToolsSyncAt: string | null = null;
+  /** hostId -> when its tools volume was last populated by THIS process */
+  private readonly lastToolsSync = new Map<string, string>();
+  /** hostId -> cached <toolsMount>/AGENTS.json (invalidated after every sync) */
+  private readonly manifests = new Map<string, { at: number; manifest: ToolsAgentManifest | null }>();
+  /** hosts whose legacy claude login was imported in this process (the marker is authoritative) */
+  private readonly legacyImported = new Set<string>();
   /** image id -> the Claude Code version that image ships (null = read failed) */
   private readonly claudeVersions = new Map<string, VersionEntry>();
   /** in-flight version reads, so a polling UI cannot start one container per poll */
@@ -206,21 +272,18 @@ export class ImageService {
 
   /** Plain docker image list for the picker. */
   async listImages(hostId: string): Promise<ImageSummary[]> {
-    void hostId; // TODO(B2): this.deps.hosts.backendFor(hostId)
-    const backend = this.deps.backends.get();
-    return backend.listImages();
+    return this.deps.hosts.backendFor(hostId).listImages();
   }
 
   /** RECIPES joined with inspectImage() + the current context hash. */
   async recipeStatuses(hostId: string): Promise<RecipeStatus[]> {
-    void hostId; // TODO(B2): hosts.settingsFor(hostId) / hosts.tryBackendFor(hostId)
-    const general = this.deps.config.general();
-    const backend = this.deps.backends.tryGet();
+    const general = this.deps.hosts.settingsFor(hostId);
+    const backend = this.tryBackend(hostId);
 
     return Promise.all(
       RECIPES.map(async (recipe): Promise<RecipeStatus> => {
         const imageRef = recipeImageRef(general.imageNamespace, recipe.name);
-        const job = this.runningJobFor('build', recipe.name);
+        const job = this.runningJobFor(hostId, 'build', recipe.name);
 
         let inspect = null;
         if (backend) {
@@ -248,7 +311,7 @@ export class ImageService {
           // porterclaude.built-at label (build start) only serves images built before.
           builtAt: inspect?.createdAt ?? labels[IMAGE_LABELS.builtAt] ?? null,
           sizeBytes: inspect?.sizeBytes ?? null,
-          claudeVersion: this.claudeVersionOf(inspect?.id ?? null),
+          claudeVersion: this.claudeVersionOf(backend, inspect?.id ?? null),
           claudeChannel: labels[IMAGE_LABELS.claudeVersion] ?? null,
           outdated: Boolean(inspect && contextHash && labels[IMAGE_LABELS.contextHash] !== contextHash),
           building: Boolean(job),
@@ -274,18 +337,21 @@ export class ImageService {
     name: string,
     opts?: { noCache?: boolean; pull?: boolean; force?: boolean },
   ): Promise<JobSummary> {
-    void hostId; // TODO(B2): host-scoped settings, backend AND job key
     const recipe = getRecipe(name);
     if (!recipe) throw AppError.notFound(`unknown recipe '${name}'`);
-    const running = this.runningJobFor('build', name);
-    if (running) throw AppError.conflict(`a build for recipe '${name}' is already running`, { jobId: running.id });
+    const running = this.runningJobFor(hostId, 'build', name);
+    if (running) {
+      throw AppError.conflict(`a build for recipe '${name}' is already running on this host`, {
+        jobId: running.id,
+      });
+    }
 
-    const general = this.deps.config.general();
-    const backend = this.deps.backends.get();
+    const general = this.deps.hosts.settingsFor(hostId);
+    const backend = this.deps.hosts.backendFor(hostId);
     const tag = recipeImageRef(general.imageNamespace, recipe.name);
     const forced = Boolean(opts?.force || opts?.noCache || opts?.pull);
 
-    return this.startJob('build', recipe.name, async (job) => {
+    return this.startJob(hostId, 'build', recipe.name, async (job) => {
       const context = this.recipeContext(recipe.name);
       await this.requireDir(context.dir, `recipe context '${context.dir}'`);
 
@@ -301,7 +367,7 @@ export class ImageService {
           `${tag} is up to date (context hash ${contextHash.slice(0, 12)}); nothing to build. ` +
             'Use force to rebuild anyway.',
         );
-        await this.recordClaudeVersion(job, existing.id, null);
+        await this.recordClaudeVersion(backend, job, existing.id, null);
         return;
       }
 
@@ -331,18 +397,17 @@ export class ImageService {
       stream.destroy();
       this.append(job, `built ${tag}`);
       const built = await backend.inspectImage(tag).catch(() => null);
-      await this.recordClaudeVersion(job, built?.id ?? null, logged);
-      await this.removeReplacedImage(job, previousId, tag);
+      await this.recordClaudeVersion(backend, job, built?.id ?? null, logged);
+      await this.removeReplacedImage(backend, job, previousId, tag);
     });
   }
 
   async pull(hostId: string, image: string): Promise<JobSummary> {
-    void hostId; // TODO(B2)
-    const backend = this.deps.backends.get();
-    const running = this.runningJobFor('pull', image);
+    const backend = this.deps.hosts.backendFor(hostId);
+    const running = this.runningJobFor(hostId, 'pull', image);
     if (running) throw AppError.conflict(`a pull for '${image}' is already running`, { jobId: running.id });
 
-    return this.startJob('pull', image, async (job) => {
+    return this.startJob(hostId, 'pull', image, async (job) => {
       this.append(job, `pulling ${image}`);
       await backend.pullImage(image, {
         onLog: (line) => this.appendBuildLine(job, line),
@@ -357,16 +422,15 @@ export class ImageService {
   // -------------------------------------------------------------------------
 
   async toolsStatus(hostId: string): Promise<ToolsStatus> {
-    void hostId; // TODO(B2)
-    const general = this.deps.config.general();
+    const general = this.deps.hosts.settingsFor(hostId);
     const imageRef = toolsImageRef(general.imageNamespace);
-    const job = this.runningJobFor('tools-sync', general.toolsVolume);
-    const backend = this.deps.backends.tryGet();
+    const job = this.runningJobFor(hostId, 'tools-sync', general.toolsVolume);
+    const backend = this.tryBackend(hostId);
 
     let present = false;
     let claudeVersion: string | null = null;
     let claudeChannel: string | null = null;
-    let lastSyncedAt = this.lastToolsSyncAt;
+    let lastSyncedAt = this.lastToolsSync.get(hostId) ?? null;
     let imageHash: string | null = null;
     let built = false;
 
@@ -387,7 +451,7 @@ export class ImageService {
       try {
         const inspect = await backend.inspectImage(imageRef);
         built = Boolean(inspect);
-        claudeVersion = this.claudeVersionOf(inspect?.id ?? null);
+        claudeVersion = this.claudeVersionOf(backend, inspect?.id ?? null);
         claudeChannel = inspect?.labels[IMAGE_LABELS.claudeVersion] ?? null;
         imageHash = inspect?.labels[IMAGE_LABELS.contextHash] ?? null;
         lastSyncedAt = lastSyncedAt ?? inspect?.createdAt ?? inspect?.labels[IMAGE_LABELS.builtAt] ?? null;
@@ -400,10 +464,15 @@ export class ImageService {
     // on a fresh install "nothing built yet" is already reported by present:false.
     const outdated = Boolean(contextHash) && (built ? imageHash !== contextHash : present);
 
+    const agents = await this.agentStatuses(hostId);
+    // the `claude` entry of the manifest is the authoritative version once a v0.2 sync ran;
+    // the image probe above only says what the tools IMAGE ships (kept for compatibility)
+    const claudeAgent = agents.find((a) => a.id === 'claude');
+    if (claudeAgent?.version) claudeVersion = claudeAgent.version;
+
     return {
-      // TODO(B2): hostId + agents (agentStatuses(hostId))
-      hostId: '',
-      agents: [],
+      hostId,
+      agents,
       volume: general.toolsVolume,
       imageRef,
       present,
@@ -429,30 +498,34 @@ export class ImageService {
    *   3. run a one-shot container from that image with the volume mounted rw at /out
    *   4. waitContainer -> non-zero exit fails the job; then removeContainer
    *
-   * v0.2 TODO(B2) — the sync is what INSTALLS THE AGENTS of this host:
-   *   * pass `PORTERCLAUDE_AGENTS=<json>` (agents/model.ts TOOLS_AGENTS_ENV,
-   *     `agents.installSpecsForHost(host)`) into the populate container; it installs every
-   *     enabled agent into the volume and writes `<toolsMount>/AGENTS.json`;
+   * v0.2 — the sync is what INSTALLS THE AGENTS of this host:
+   *   * `PORTERCLAUDE_AGENTS=<json>` (agents/model.ts TOOLS_AGENTS_ENV,
+   *     `agents.installSpecsForHost(host)`) goes into the populate container; it installs
+   *     every enabled agent into the volume and writes `<toolsMount>/AGENTS.json`;
    *   * a single agent that fails to install is a WARNING in the job log, not a failed job
    *     (the manifest records `installed:false` + the error, and the panel shows it);
-   *   * afterwards, ONE-TIME LEGACY IMPORT for the claude agent (only when the host has a
-   *     `general.sharedClaudeVolume` and the target auth volume has no marker yet):
-   *     run a one-shot root container mounting the old `sharedClaudeVolume` at /legacy,
-   *     `sharedClaudeHomeVolume` at /legacy-home and `<volumePrefix>auth-claude` at /auth,
-   *     then `cp -a /legacy/. /auth/claude/` and `cp -a /legacy-home/.claude.json
-   *     /auth/claude.json`, chown to the volume owner and touch `/auth/.pc-import-v1`.
-   *     Never delete the old volumes — the import must be repeatable and reversible.
+   *   * `force` is ALSO the agent upgrade switch: it passes `PORTERCLAUDE_TOOLS_FORCE=1`, so
+   *     the installer stops carrying installed agents over unchanged and reinstalls every one
+   *     of them (plus the bundled runtimes) from source. A plain sync only installs what is
+   *     new, because an agent's spec does not change when upstream releases a version;
+   *   * afterwards, ONE-TIME LEGACY IMPORT for the claude agent (only while the v0.1 shared
+   *     volume exists on this host and the target auth volume has no marker yet): a one-shot
+   *     root container mounts the old `sharedClaudeVolume` at /legacy, `sharedClaudeHomeVolume`
+   *     at /legacy-home and `<volumePrefix>auth-claude` at /auth, copies them into
+   *     `/auth/claude/` + `/auth/claude.json`, chowns to the volume owner and touches
+   *     `/auth/.pc-import-v1`. The old volumes are NEVER deleted — the import must stay
+   *     repeatable (delete the marker) and a rollback to v0.1 must keep working.
    */
   async syncTools(hostId: string, opts?: { force?: boolean }): Promise<JobSummary> {
-    void hostId; // TODO(B2)
-    const general = this.deps.config.general();
-    const backend = this.deps.backends.get();
-    const running = this.runningJobFor('tools-sync', general.toolsVolume);
-    if (running) throw AppError.conflict('a tools sync is already running', { jobId: running.id });
+    const host = this.deps.hosts.require(hostId);
+    const general = this.deps.hosts.settingsForHost(host);
+    const backend = this.deps.hosts.backendFor(hostId);
+    const running = this.runningJobFor(hostId, 'tools-sync', general.toolsVolume);
+    if (running) throw AppError.conflict('a tools sync is already running on this host', { jobId: running.id });
 
     const imageRef = toolsImageRef(general.imageNamespace);
 
-    return this.startJob('tools-sync', general.toolsVolume, async (job) => {
+    return this.startJob(hostId, 'tools-sync', general.toolsVolume, async (job) => {
       const context = this.toolsContext();
       await this.requireDir(context.dir, `tools context '${context.dir}'`);
 
@@ -487,8 +560,8 @@ export class ImageService {
         });
         stream.destroy();
         const built = await backend.inspectImage(imageRef).catch(() => null);
-        await this.recordClaudeVersion(job, built?.id ?? null, logged);
-        await this.removeReplacedImage(job, previousId, imageRef);
+        await this.recordClaudeVersion(backend, job, built?.id ?? null, logged);
+        await this.removeReplacedImage(backend, job, previousId, imageRef);
       } else {
         this.append(job, `reusing existing image ${imageRef} (context hash ${contextHash.slice(0, 12)})`);
       }
@@ -499,12 +572,30 @@ export class ImageService {
         labels: { [TOOLS_SYNC_LABEL]: 'true' },
       });
 
+      // what the populate container installs into the volume (agents/model.ts contract)
+      const specs = this.deps.agents.installSpecsForHost(host);
+      this.append(
+        job,
+        specs.length
+          ? `installing ${specs.length} agent(s): ${specs.map((a) => a.id).join(', ')}`
+          : 'no agents enabled on this host: the volume gets the runtimes only',
+      );
+      // force = "upgrade": no carry-over, every agent and runtime is fetched again
+      const forceAgents = Boolean(opts?.force);
+      if (forceAgents && specs.length) {
+        this.append(job, 'forced: every agent is reinstalled from source (no carry-over)');
+      }
+
       const containerName = `porterclaude-tools-sync-${shortId(4)}`;
       this.append(job, `running ${containerName}`);
       const created = await backend.createContainer({
         name: containerName,
         image: imageRef,
         labels: { [TOOLS_SYNC_LABEL]: 'true' },
+        env: {
+          [TOOLS_AGENTS_ENV]: JSON.stringify(specs),
+          ...(forceAgents ? { [TOOLS_FORCE_ENV]: '1' } : {}),
+        },
         mounts: [{ type: 'volume', source: general.toolsVolume, target: '/out', readOnly: false }],
         tty: false,
         openStdin: false,
@@ -529,9 +620,147 @@ export class ImageService {
       if (exitCode !== 0) {
         throw AppError.internal(`tools sync container exited with code ${exitCode}`);
       }
-      this.lastToolsSyncAt = new Date().toISOString();
+      this.lastToolsSync.set(hostId, new Date().toISOString());
+      this.manifests.delete(hostId);
       this.append(job, `tools volume ${general.toolsVolume} populated`);
+
+      // a single failed agent is a warning, never a failed sync
+      const manifest = await this.readAgentManifest(backend, general);
+      this.manifests.set(hostId, { at: Date.now(), manifest });
+      for (const agent of manifest?.agents ?? []) {
+        this.append(
+          job,
+          agent.installed
+            ? `agent ${agent.id}: installed${agent.version ? ` (${agent.version})` : ''}`
+            : `WARNING: agent ${agent.id} was not installed${agent.error ? `: ${agent.error}` : ''}`,
+        );
+      }
+      const missing = specs.filter((spec) => !(manifest?.agents ?? []).some((a) => a.id === spec.id));
+      for (const spec of missing) {
+        this.append(job, `WARNING: the tools volume reports nothing about agent ${spec.id}`);
+      }
+
+      await this.importLegacyClaudeLogin(hostId, backend, general, imageRef, job);
     });
+  }
+
+  /**
+   * The one-time v0.1 -> v0.2 DATA migration of the claude login (backend.md v0.2 §12.4).
+   *
+   * v0.1 kept the login in two global volumes (`sharedClaudeVolume` + `sharedClaudeHomeVolume`
+   * mounted at `~/.claude` / `~/.claude-home`); v0.2 keeps it in the per-host auth volume
+   * `<prefix>auth-claude`. Without this copy every upgraded instance would silently ask for
+   * `/login` again. It runs inside a one-shot ROOT container on the host (the only place that
+   * can read a volume), is guarded by the marker `.pc-import-v1` inside the target volume, and
+   * NEVER deletes the source volumes: a rollback to v0.1 keeps working and deleting the marker
+   * re-runs the import.
+   */
+  private async importLegacyClaudeLogin(
+    hostId: string,
+    backend: DockerBackend,
+    general: { volumePrefix: string; sharedClaudeVolume: string; sharedClaudeHomeVolume: string },
+    imageRef: string,
+    job: JobRecord,
+  ): Promise<void> {
+    if (this.legacyImported.has(hostId)) return;
+    const target = agentAuthVolumeFor(general.volumePrefix, 'claude');
+    if (target === general.sharedClaudeVolume) return; // nothing to import into
+
+    let volumes: string[] = [];
+    try {
+      volumes = (await backend.listVolumes()).map((v) => v.name);
+    } catch (err) {
+      this.deps.log.debug({ err, hostId }, 'listing volumes for the legacy claude import failed');
+      return;
+    }
+    if (!volumes.includes(general.sharedClaudeVolume)) {
+      // a fresh install has no v0.1 volumes: nothing to do, and nothing to report
+      this.legacyImported.add(hostId);
+      return;
+    }
+    if (!volumes.includes(target)) {
+      await backend.createVolume({
+        name: target,
+        labels: { 'porterclaude.managed': 'true', 'porterclaude.agent': 'claude' },
+      });
+    }
+
+    const hasHome = volumes.includes(general.sharedClaudeHomeVolume);
+    const script = [
+      'set -u',
+      `if [ -f /auth/${LEGACY_IMPORT_MARKER} ]; then echo ${IMPORT_SKIPPED}; exit 0; fi`,
+      'mkdir -p /auth/claude',
+      'if [ -n "$(ls -A /legacy 2>/dev/null)" ] && [ -z "$(ls -A /auth/claude 2>/dev/null)" ]; then',
+      '  cp -a /legacy/. /auth/claude/ || { echo "copying the v0.1 login failed" >&2; exit 1; }',
+      'fi',
+      hasHome
+        ? 'if [ -f /legacy-home/.claude.json ] && [ ! -e /auth/claude.json ]; then cp -a /legacy-home/.claude.json /auth/claude.json; fi'
+        : ':',
+      "own=$(stat -c '%u:%g' /legacy 2>/dev/null || true)",
+      `case "\${own:-}" in ''|0:*) own='1000:1000';; esac`,
+      'chown -R "$own" /auth 2>/dev/null || true',
+      '[ -f /auth/claude/.credentials.json ] && chmod 0600 /auth/claude/.credentials.json 2>/dev/null',
+      `touch /auth/${LEGACY_IMPORT_MARKER} && chown "$own" /auth/${LEGACY_IMPORT_MARKER} 2>/dev/null || true`,
+      `echo ${IMPORT_DONE}`,
+      'exit 0',
+    ].join('\n');
+
+    const name = `porterclaude-claude-import-${shortId(4)}`;
+    let containerId: string | null = null;
+    try {
+      this.append(job, `importing the v0.1 claude login from ${general.sharedClaudeVolume} into ${target}`);
+      const created = await backend.createContainer({
+        name,
+        image: imageRef,
+        user: '0:0',
+        entrypoint: ['/bin/sh', '-c'],
+        cmd: [script],
+        labels: { [TOOLS_SYNC_LABEL]: 'true' },
+        mounts: [
+          { type: 'volume', source: general.sharedClaudeVolume, target: '/legacy', readOnly: true },
+          ...(hasHome
+            ? [
+                {
+                  type: 'volume' as const,
+                  source: general.sharedClaudeHomeVolume,
+                  target: '/legacy-home',
+                  readOnly: true,
+                },
+              ]
+            : []),
+          { type: 'volume', source: target, target: '/auth', readOnly: false },
+        ],
+        tty: false,
+        openStdin: false,
+        restartPolicy: 'no',
+      });
+      containerId = created.id;
+      await backend.startContainer(containerId);
+      const { statusCode } = await backend.waitContainer(containerId);
+      const logs = await backend.containerLogs(containerId, { tail: 50 }).catch(() => '');
+      for (const line of logs.split('\n')) if (line.trim()) this.append(job, line.trimEnd());
+      if (statusCode === 0) {
+        this.legacyImported.add(hostId);
+        this.append(
+          job,
+          logs.includes(IMPORT_SKIPPED)
+            ? 'the v0.1 claude login was already imported (marker present); the old volumes are kept'
+            : 'imported the v0.1 claude login; the old volumes are kept',
+        );
+      } else {
+        this.append(job, `WARNING: importing the v0.1 claude login failed (exit ${statusCode})`);
+      }
+    } catch (err) {
+      this.append(job, `WARNING: importing the v0.1 claude login failed: ${errMessage(err)}`);
+    } finally {
+      if (containerId) {
+        try {
+          await backend.removeContainer(containerId, { force: true, removeVolumes: false });
+        } catch (err) {
+          this.deps.log.debug({ err, containerId }, 'removing the legacy import container failed');
+        }
+      }
+    }
   }
 
   /**
@@ -546,9 +775,13 @@ export class ImageService {
    * A container still using it answers 409 — that is an expected outcome, not a build
    * failure, so every error is reported into the job log and swallowed.
    */
-  private async removeReplacedImage(job: JobRecord, previousId: string | null, tag: string): Promise<void> {
+  private async removeReplacedImage(
+    backend: DockerBackend,
+    job: JobRecord,
+    previousId: string | null,
+    tag: string,
+  ): Promise<void> {
     if (!previousId) return;
-    const backend = this.deps.backends.get();
     try {
       const current = await backend.inspectImage(tag);
       if (!current || current.id === previousId) return;      // the tag did not move
@@ -579,13 +812,13 @@ export class ImageService {
    * GET /api/images/recipes (or /tools) has the answer. A failed read is remembered for
    * VERSION_RETRY_MS so a broken/rootless image cannot turn a poll into a container storm.
    */
-  private claudeVersionOf(imageId: string | null): string | null {
+  private claudeVersionOf(backend: DockerBackend | null, imageId: string | null): string | null {
     if (!imageId) return null;
     const entry = this.claudeVersions.get(imageId);
     if (entry && (entry.version !== null || Date.now() - entry.at < VERSION_RETRY_MS)) {
       return entry.version;
     }
-    void this.probeClaudeVersion(imageId);
+    if (backend) void this.probeClaudeVersion(backend, imageId);
     return entry?.version ?? null;
   }
 
@@ -594,22 +827,27 @@ export class ImageService {
    * (docker/recipes/common.sh emits PORTERCLAUDE_CLAUDE_VERSION=<v>), which is free but
    * absent from a cached build; otherwise the image is read.
    */
-  private async recordClaudeVersion(job: JobRecord, imageId: string | null, logged: string | null): Promise<void> {
+  private async recordClaudeVersion(
+    backend: DockerBackend,
+    job: JobRecord,
+    imageId: string | null,
+    logged: string | null,
+  ): Promise<void> {
     if (!imageId) return;
     if (logged) {
       this.claudeVersions.set(imageId, { version: logged, at: Date.now() });
       this.append(job, `claude version: ${logged}`);
       return;
     }
-    const version = await this.probeClaudeVersion(imageId);
+    const version = await this.probeClaudeVersion(backend, imageId);
     this.append(job, version ? `claude version: ${version}` : 'could not read the claude version of the image');
   }
 
   /** dedup wrapper around readClaudeVersion; never rejects. */
-  private async probeClaudeVersion(imageId: string): Promise<string | null> {
+  private async probeClaudeVersion(backend: DockerBackend, imageId: string): Promise<string | null> {
     const inflight = this.versionProbes.get(imageId);
     if (inflight) return inflight;
-    const probe = this.readClaudeVersion(imageId)
+    const probe = this.readClaudeVersion(backend, imageId)
       .catch((err: unknown) => {
         this.deps.log.debug({ err, imageId }, 'reading the claude version of an image failed');
         return null;
@@ -628,9 +866,7 @@ export class ImageService {
    * the only way to see a file inside an image. Deliberately its own entrypoint/cmd so it
    * also works for the tools image (whose CMD would populate a volume).
    */
-  private async readClaudeVersion(imageId: string): Promise<string | null> {
-    const backend = this.deps.backends.tryGet();
-    if (!backend) return null;
+  private async readClaudeVersion(backend: DockerBackend, imageId: string): Promise<string | null> {
     const name = `porterclaude-version-${shortId(4)}`;
     let containerId: string | null = null;
     try {
@@ -663,8 +899,7 @@ export class ImageService {
 
   /** inspectImage, pull when missing, then report arch/user/warnings. */
   async validateCustomImage(hostId: string, image: string): Promise<CustomImageCheck> {
-    void hostId; // TODO(B2)
-    const backend = this.deps.backends.get();
+    const backend = this.deps.hosts.backendFor(hostId);
     const result: CustomImageCheck = {
       image,
       ok: false,
@@ -693,18 +928,18 @@ export class ImageService {
       result.architecture = inspect.architecture ?? null;
       result.user = inspect.user && inspect.user.length ? inspect.user : 'root';
 
-      // The shared claude volumes are seeded by the recipes and owned by uid 1000; the
-      // session's HOME is pinned to general.containerHome for custom images so claude
-      // still writes into them (backend.md section 7).
+      // The per-agent auth volumes are seeded by the first session that mounts them and are
+      // owned by ONE uid (the recipes' 1000); the session's HOME is pinned to
+      // general.containerHome so the agents write into them (backend.md v0.2 section 12.3).
       const uid = result.user.split(':')[0] ?? '';
       if (uid === 'root' || uid === '0') {
         result.warnings.push(
-          'this image runs as root: claude writes into the shared volumes as root, ' +
+          'this image runs as root: the agents write into the shared auth volumes as root, ' +
             'so recipe sessions (uid 1000) may not be able to read those files',
         );
       } else if (uid !== '1000' && uid !== 'dev') {
         result.warnings.push(
-          `this image runs as '${result.user}': the shared claude volumes are owned by uid 1000, ` +
+          `this image runs as '${result.user}': the agent auth volumes are owned by uid 1000, ` +
             'so the shared login may not be writable',
         );
       }
@@ -784,8 +1019,10 @@ export class ImageService {
 
   /** Newest first. `hostId` filters — the Images panel of one host must not show another's. */
   listJobs(hostId?: string): JobSummary[] {
-    void hostId; // TODO(B2): filter on job.hostId
-    return [...this.jobs.values()].reverse().map((j) => this.summary(j));
+    return [...this.jobs.values()]
+      .reverse()
+      .filter((j) => !hostId || j.hostId === hostId)
+      .map((j) => this.summary(j));
   }
 
   /**
@@ -793,32 +1030,121 @@ export class ImageService {
    * `HostAgentView` (the first half is the definition + the host's enabled list, merged by
    * B1's /api/hosts/:hostId/agents route).
    *
-   * TODO(B2): read `<toolsMount>/AGENTS.json` (agents/model.ts TOOLS_AGENT_MANIFEST) out of
-   * the volume with a one-shot container (`cat`), exactly like readClaudeVersion() reads a
-   * file out of an image; cache it per host like the version probes and invalidate it after
-   * a tools sync. An unreachable host / missing volume answers `installed:false` for every
-   * enabled agent instead of throwing — the panel must render for a dead host too.
+   * `<toolsMount>/AGENTS.json` is read out of the volume with a one-shot container (the same
+   * trick readClaudeVersion() uses to read a file out of an image), cached per host and
+   * invalidated after every sync. An unreachable host, a missing volume or a manifest an
+   * older tools image never wrote answers `installed:false` for every agent the host enables
+   * instead of throwing — the Images/agents panel must render for a dead host too.
    */
   async agentStatuses(hostId: string): Promise<AgentToolStatus[]> {
-    void hostId;
-    return [];
+    const host = this.deps.hosts.get(hostId);
+    if (!host) return [];
+    const enabled = this.enabledAgents(host);
+    const general = this.deps.hosts.settingsForHost(host);
+
+    const manifest = await this.agentManifest(hostId, general);
+    const known = new Map((manifest?.agents ?? []).map((a) => [a.id, a]));
+    const ids = [...new Set([...enabled.map((a) => a.id), ...known.keys()])];
+    return ids.map((id): AgentToolStatus => {
+      const entry = known.get(id);
+      return {
+        id,
+        installed: Boolean(entry?.installed),
+        version: entry?.version ?? null,
+        installedAt: entry ? manifest?.syncedAt ?? null : null,
+        error: entry?.error ?? null,
+      };
+    });
   }
 
-  getJob(id: string): JobSummary | null {
-    const job = this.jobs.get(id);
-    return job ? this.summary(job) : null;
+  /** cached `<toolsMount>/AGENTS.json` of a host (null when it cannot be read). */
+  private async agentManifest(
+    hostId: string,
+    general: GeneralConfig,
+  ): Promise<ToolsAgentManifest | null> {
+    const cached = this.manifests.get(hostId);
+    if (cached && Date.now() - cached.at < MANIFEST_TTL_MS) return cached.manifest;
+    const backend = this.tryBackend(hostId);
+    const manifest = backend ? await this.readAgentManifest(backend, general) : null;
+    this.manifests.set(hostId, { at: Date.now(), manifest });
+    return manifest;
   }
 
-  getJobLines(id: string, since = 0): { lines: string[]; nextIndex: number } {
+  /** `cat <volume>/AGENTS.json` in a one-shot container built from the tools image. */
+  private async readAgentManifest(
+    backend: DockerBackend,
+    general: GeneralConfig,
+  ): Promise<ToolsAgentManifest | null> {
+    const imageRef = toolsImageRef(general.imageNamespace);
+    const name = `porterclaude-agents-${shortId(4)}`;
+    let containerId: string | null = null;
+    try {
+      const image = await backend.inspectImage(imageRef);
+      if (!image) return null; // nothing was ever synced on this host
+      const created = await backend.createContainer({
+        name,
+        image: imageRef,
+        entrypoint: ['/bin/sh', '-c'],
+        cmd: [`cat /out/${TOOLS_AGENT_MANIFEST} 2>/dev/null || true`],
+        labels: { 'porterclaude.probe': 'true' },
+        mounts: [{ type: 'volume', source: general.toolsVolume, target: '/out', readOnly: true }],
+        restartPolicy: 'no',
+      });
+      containerId = created.id;
+      await backend.startContainer(containerId);
+      await backend.waitContainer(containerId);
+      return parseAgentManifest(await backend.containerLogs(containerId, { tail: 200 }));
+    } catch (err) {
+      this.deps.log.debug({ err }, 'reading AGENTS.json from the tools volume failed');
+      return null;
+    } finally {
+      if (containerId) {
+        try {
+          await backend.removeContainer(containerId, { force: true, removeVolumes: false });
+        } catch (err) {
+          this.deps.log.debug({ err, containerId }, 'removing the manifest probe container failed');
+        }
+      }
+    }
+  }
+
+  /** definitions of the agents a host enables (unknown ids are dropped by the registry). */
+  private enabledAgents(host: HostConfig): AgentDefinition[] {
+    try {
+      return this.deps.agents.enabledForHost(host);
+    } catch (err) {
+      this.deps.log.debug({ err, host: host.id }, 'resolving the enabled agents of a host failed');
+      return [];
+    }
+  }
+
+  /** `hosts.tryBackendFor` that also survives a manager that throws instead of answering null. */
+  private tryBackend(hostId: string): DockerBackend | null {
+    try {
+      return this.deps.hosts.tryBackendFor(hostId);
+    } catch (err) {
+      this.deps.log.debug({ err, hostId }, 'the host has no usable transport');
+      return null;
+    }
+  }
+
+  /** `hostId` scopes the lookup: a job of another host does not exist for this one (404). */
+  getJob(id: string, hostId?: string): JobSummary | null {
     const job = this.jobs.get(id);
-    if (!job) throw AppError.notFound(`job '${id}' does not exist`);
+    if (!job || (hostId && job.hostId !== hostId)) return null;
+    return this.summary(job);
+  }
+
+  getJobLines(id: string, since = 0, hostId?: string): { lines: string[]; nextIndex: number } {
+    const job = this.jobs.get(id);
+    if (!job || (hostId && job.hostId !== hostId)) throw AppError.notFound(`job '${id}' does not exist`);
     const from = Math.max(0, Math.min(job.lines.length, since - job.dropped));
     return { lines: job.lines.slice(from), nextIndex: job.dropped + job.lines.length };
   }
 
-  cancelJob(id: string): JobSummary {
+  cancelJob(id: string, hostId?: string): JobSummary {
     const job = this.jobs.get(id);
-    if (!job) throw AppError.notFound(`job '${id}' does not exist`);
+    if (!job || (hostId && job.hostId !== hostId)) throw AppError.notFound(`job '${id}' does not exist`);
     if (job.status === 'running' || job.status === 'queued') {
       job.abort.abort();
       job.status = 'cancelled';
@@ -864,22 +1190,30 @@ export class ImageService {
     }
   }
 
-  /** TODO(B2): add a hostId parameter and compare it too - a build on host A must not
-   *  block the same recipe on host B. */
-  private runningJobFor(kind: JobKind, target: string): JobRecord | null {
+  /** Per HOST: building `node` on host A must not block the same recipe on host B. */
+  private runningJobFor(hostId: string, kind: JobKind, target: string): JobRecord | null {
     for (const job of this.jobs.values()) {
-      if (job.kind === kind && job.target === target && (job.status === 'running' || job.status === 'queued')) {
+      if (
+        job.hostId === hostId &&
+        job.kind === kind &&
+        job.target === target &&
+        (job.status === 'running' || job.status === 'queued')
+      ) {
         return job;
       }
     }
     return null;
   }
 
-  /** TODO(B2): take the hostId as the first argument and store it on the record. */
-  private startJob(kind: JobKind, target: string, run: (job: JobRecord) => Promise<void>): JobSummary {
+  private startJob(
+    hostId: string,
+    kind: JobKind,
+    target: string,
+    run: (job: JobRecord) => Promise<void>,
+  ): JobSummary {
     const job: JobRecord = {
       id: shortId(8),
-      hostId: '',
+      hostId,
       kind,
       target,
       status: 'running',
@@ -911,7 +1245,7 @@ export class ImageService {
           job.finishedAt = new Date().toISOString();
           this.append(job, `ERROR: ${message}`);
         }
-        this.deps.log.warn({ err, jobId: job.id, kind, target }, 'image job failed');
+        this.deps.log.warn({ err, jobId: job.id, hostId, kind, target }, 'image job failed');
       }
     })();
 
@@ -956,7 +1290,7 @@ export class ImageService {
   private summary(job: JobRecord): JobSummary {
     return {
       id: job.id,
-      hostId: job.hostId ?? '',
+      hostId: job.hostId,
       kind: job.kind,
       target: job.target,
       status: job.status,

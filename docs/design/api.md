@@ -327,9 +327,18 @@ falls back to the image's Created timestamp until this process has run a sync).
 
 `POST /api/images/tools/sync` body `{ "force"?: boolean }` → `202 { "job": JobSummary }`.
 The sync **rebuilds `<ns>/tools:latest` whenever it is missing or outdated** and only then
-re-populates the volume, so upgrading PorterClaude replaces the entrypoint and the claude
-binaries in the volume without any extra step. `force: true` rebuilds unconditionally,
-pulling the base image and ignoring the layer cache.
+re-populates the volume, so upgrading PorterClaude replaces the entrypoint of every session
+without any extra step.
+
+`force: true` means **upgrade**, and does two things:
+
+* the image is rebuilt unconditionally, pulling the base image and ignoring the layer cache;
+* `PORTERCLAUDE_TOOLS_FORCE=1` goes into the populate container, which turns off the
+  carry-over of an installed agent and reinstalls every enabled agent and bundled runtime
+  from source (v0.2 — see the Agents section below).
+
+`force: false` (the default) is the cheap path: rebuild only when outdated, install only what
+is missing or whose definition changed.
 
 ### `POST /api/images/custom/validate`
 Body `{ "image": "nginx:1.27" }` →
@@ -665,7 +674,9 @@ Rules
 * `id` is immutable. A second **socket** host is `409 conflict` ("the app runs on exactly one
   machine"). A portainer connection whose `credentialId` is unknown is `404`.
 * `GET /api/hosts` without `probe=1` answers from a ≤15 s cached probe and never blocks on a
-  dead engine; `probe=1` refreshes every host in parallel.
+  dead engine; `probe=1` refreshes every host in parallel. A host that has not been probed yet
+  therefore reports `status: "unknown"` with `info: null` — that is the first-render state,
+  not an error; the UI resolves it with a probe.
 * `DELETE` is `409 conflict` while sessions still reference the host; `force=1` deletes the
   host only — **containers, volumes and images on that engine are never touched**.
 * Deleting the default host promotes the first remaining host; the last host leaves
@@ -696,6 +707,12 @@ Rules
 
 The api key is write-only exactly like in v0.1: it can be set and replaced, never read back,
 and never appears in any response or log.
+
+A credential **test** decides `ok` from the Portainer **endpoint listing** (`/api/endpoints`):
+that call is what proves the url and the api key. `endpoints` is therefore always present on
+`ok: true`, while `info` is best effort — it is the docker `/info` of the first docker
+endpoint and stays `null` when the credential can reach Portainer but no endpoint answers.
+A test never probes a fixed endpoint id.
 
 `PortainerImportResult`:
 
@@ -773,6 +790,13 @@ plus an `error` string instead of a 502.
 
 Enabling an agent does **not** install it: run `POST /api/hosts/:hostId/images/tools/sync`
 afterwards (the UI offers it right there), and recreate the sessions that should mount it.
+
+**Upgrading an installed agent needs `{"force": true}`.** The tools sync carries an agent
+over whenever its install spec is unchanged, and a spec does not change when upstream ships a
+new release — so a plain sync leaves `version` where it is forever. `force:true` passes
+`PORTERCLAUDE_TOOLS_FORCE=1` into the populate container: no carry-over, every enabled agent
+(and the bundled Node/Python runtime) is reinstalled, resolving its channel / `latest` again.
+Sessions that are running keep the payload they started with until they are restarted.
 
 ## Sessions
 

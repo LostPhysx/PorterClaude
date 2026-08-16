@@ -1,4 +1,8 @@
 // OWNER: B2. buildContainerSpec / workspaceMountFor / specHash — pure, no docker host.
+// v0.2 contract: one auth volume per agent mounted at <home>/.porterclaude/agents/<id>, the
+// agent's own paths reached through symlinks (PORTERCLAUDE_AGENT_LINKS), the private history
+// volume nested INSIDE the agent volume, and the tools volume + entrypoint in EVERY session
+// (docs/design/backend.md v0.2 §12.3, api.md v0.2 "Container contract").
 import { describe, expect, it } from 'vitest';
 import {
   buildContainerSpec,
@@ -10,55 +14,72 @@ import {
   workspaceMountFor,
 } from '../../src/sessions/container.js';
 import { CONTAINER_LABELS } from '../../src/sessions/model.js';
-import { generalConfig, sessionConfig } from './helpers.js';
+import { generalConfig, sessionConfig, TEST_HOST_ID } from './helpers.js';
 import { BUILTIN_AGENTS } from '../../src/agents/builtin.js';
+import type { AgentDefinition } from '../../src/agents/model.js';
 
 const general = generalConfig();
-// TODO(B2): the v0.1 expectations below still describe the shared-claude-volume layout.
-// Rewrite them against the v0.2 contract (agent auth volumes + symlinks, tools volume in
-// every session, uniform entrypoint) — see docs/design/backend.md v0.2 §7/§12.
-const agents = BUILTIN_AGENTS.filter((a) => a.id === 'claude');
 
-function recipeSpec(overrides = {}) {
+const agent = (id: string): AgentDefinition => {
+  const found = BUILTIN_AGENTS.find((a) => a.id === id);
+  if (!found) throw new Error(`no built-in agent '${id}'`);
+  return found;
+};
+
+const agents = [agent('claude')];
+
+/** the agent dir of the claude agent with the default settings */
+const CLAUDE_DIR = '/home/dev/.porterclaude/agents/claude';
+
+function recipeSpec(overrides = {}, defs: AgentDefinition[] = agents, imageCmd?: string[] | null) {
   const session = sessionConfig(overrides);
   return buildContainerSpec({
     session,
     general,
-    agents,
+    agents: defs,
     resolvedImage: 'porterclaude/node:latest',
     imageType: 'recipe',
+    ...(imageCmd === undefined ? {} : { imageCmd }),
   });
 }
 
-function customSpec(overrides = {}) {
+function customSpec(overrides = {}, defs: AgentDefinition[] = agents) {
   const session = sessionConfig({ image: { type: 'custom', ref: 'nginx:1.27' }, ...overrides });
-  return buildContainerSpec({ session, general, agents, resolvedImage: 'nginx:1.27', imageType: 'custom' });
+  return buildContainerSpec({
+    session,
+    general,
+    agents: defs,
+    resolvedImage: 'nginx:1.27',
+    imageType: 'custom',
+  });
 }
 
 describe('buildContainerSpec', () => {
-  it('names the container pc-<slug> and sets all five labels', () => {
+  it('names the container pc-<slug> and sets every label, host and agents included', () => {
     const spec = recipeSpec();
     expect(spec.name).toBe('pc-web');
     expect(spec.labels?.[CONTAINER_LABELS.managed]).toBe('true');
     expect(spec.labels?.[CONTAINER_LABELS.session]).toBe('web');
+    expect(spec.labels?.[CONTAINER_LABELS.host]).toBe(TEST_HOST_ID);
+    expect(spec.labels?.[CONTAINER_LABELS.agents]).toBe('claude');
     expect(spec.labels?.[CONTAINER_LABELS.imageType]).toBe('recipe');
     expect(spec.labels?.[CONTAINER_LABELS.recipe]).toBe('node');
     expect(spec.labels?.[CONTAINER_LABELS.createdAt]).toBe('2026-01-01T00:00:00.000Z');
     expect(spec.labels?.[CONTAINER_LABELS.specHash]).toMatch(/^[0-9a-f]{64}$/);
   });
 
-  it('mounts both shared claude volumes and the workspace volume', () => {
-    const mounts = recipeSpec().mounts ?? [];
+  it('mounts one auth volume per agent at the agent dir, plus the workspace', () => {
+    const mounts = recipeSpec({}, [agent('claude'), agent('opencode')]).mounts ?? [];
     expect(mounts).toContainEqual({
       type: 'volume',
-      source: 'porterclaude-claude',
-      target: '/home/dev/.claude',
+      source: 'porterclaude-auth-claude',
+      target: CLAUDE_DIR,
       readOnly: false,
     });
     expect(mounts).toContainEqual({
       type: 'volume',
-      source: 'porterclaude-claude-home',
-      target: '/home/dev/.claude-home',
+      source: 'porterclaude-auth-opencode',
+      target: '/home/dev/.porterclaude/agents/opencode',
       readOnly: false,
     });
     expect(mounts).toContainEqual({
@@ -67,52 +88,105 @@ describe('buildContainerSpec', () => {
       target: '/workspace',
       readOnly: false,
     });
+    // v0.1's shared login volumes are gone for good
+    expect(mounts.some((m) => m.source === 'porterclaude-claude')).toBe(false);
+    expect(mounts.some((m) => m.source === 'porterclaude-claude-home')).toBe(false);
   });
 
-  it('does not mount the tools volume or override the entrypoint for recipes', () => {
-    const spec = recipeSpec();
-    expect(spec.entrypoint).toBeUndefined();
-    expect(spec.cmd).toBeUndefined();
-    expect((spec.mounts ?? []).some((m) => m.source === 'porterclaude-tools')).toBe(false);
+  it('mounts NOTHING agent related for a session without agents', () => {
+    const mounts = recipeSpec({}, []).mounts ?? [];
+    expect(mounts.some((m) => m.source.startsWith('porterclaude-auth-'))).toBe(false);
+    expect(recipeSpec({}, []).labels?.[CONTAINER_LABELS.agents]).toBe('');
+    expect(recipeSpec({}, []).env?.PORTERCLAUDE_AGENT_IDS).toBe('');
   });
 
-  it('mounts the tools volume read-only and overrides the entrypoint for custom images', () => {
-    const spec = customSpec();
-    expect(spec.entrypoint).toEqual(['/opt/porterclaude/entrypoint.sh']);
-    expect(spec.cmd).toEqual(['sleep', 'infinity']);
-    expect(spec.mounts).toContainEqual({
-      type: 'volume',
-      source: 'porterclaude-tools',
-      target: '/opt/porterclaude',
-      readOnly: true,
-    });
-    expect(spec.env?.PORTERCLAUDE_TOOLS).toBe('/opt/porterclaude');
-    expect(spec.env?.PORTERCLAUDE_HOME).toBe('/home/dev');
-    expect(spec.labels?.[CONTAINER_LABELS.recipe]).toBeUndefined();
+  it('mounts the tools volume read-only and sets the entrypoint for BOTH image types', () => {
+    for (const spec of [recipeSpec(), customSpec()]) {
+      expect(spec.entrypoint).toEqual(['/opt/porterclaude/entrypoint.sh']);
+      expect(spec.mounts).toContainEqual({
+        type: 'volume',
+        source: 'porterclaude-tools',
+        target: '/opt/porterclaude',
+        readOnly: true,
+      });
+      expect(spec.env?.PORTERCLAUDE_TOOLS).toBe('/opt/porterclaude');
+      expect(spec.env?.PORTERCLAUDE_HOME).toBe('/home/dev');
+    }
   });
 
-  it('pins HOME to the container home for custom images only (BE-4)', () => {
-    // Docker would otherwise inherit HOME from the image (/root for root images) and
-    // claude would write credentials/history outside the shared volumes.
+  it('repeats the image CMD for recipes (php still starts supervisord) and idles custom images', () => {
+    // The engine drops the image Cmd as soon as the create request sets an Entrypoint, so a
+    // recipe that is not given its own CMD back would idle instead of serving (v2-O1.md 1).
+    const php = ['supervisord', '-n', '-c', '/etc/supervisor/supervisord.conf'];
+    expect(recipeSpec({}, agents, php).cmd).toEqual(php);
+    // an image without a CMD, and the pre-inspect callers, still idle
+    expect(recipeSpec({}, agents, []).cmd).toEqual(['sleep', 'infinity']);
+    expect(recipeSpec({}, agents, null).cmd).toEqual(['sleep', 'infinity']);
+    expect(recipeSpec().cmd).toEqual(['sleep', 'infinity']);
+    // a custom image idles even when it declares a CMD of its own
+    expect(customSpec().cmd).toEqual(['sleep', 'infinity']);
+    expect(customSpec().labels?.[CONTAINER_LABELS.recipe]).toBeUndefined();
+  });
+
+  it('folds the cmd into the spec hash, so a recipe whose CMD changed needs a recreate', () => {
+    const a = recipeSpec({}, agents, ['supervisord', '-n']);
+    const b = recipeSpec({}, agents, ['sleep', 'infinity']);
+    expect(a.labels?.[CONTAINER_LABELS.specHash]).not.toBe(b.labels?.[CONTAINER_LABELS.specHash]);
+  });
+
+  it('pins HOME to the container home for every session (BE-4)', () => {
+    // Docker would otherwise inherit HOME from the image (/root for root images) and the
+    // agents would write their credentials outside the shared auth volumes.
     expect(customSpec().env?.HOME).toBe('/home/dev');
-    expect(recipeSpec().env?.HOME).toBeUndefined();
+    expect(recipeSpec().env?.HOME).toBe('/home/dev');
   });
 
   it('lets an explicit session env override the pinned HOME', () => {
     expect(customSpec({ env: { HOME: '/root' } }).env?.HOME).toBe('/root');
   });
 
-  it('adds the history volume only when shareHistory is false', () => {
-    const shared = recipeSpec().mounts ?? [];
-    expect(shared.some((m) => m.source === 'porterclaude-hist-web')).toBe(false);
+  it('describes the agent symlinks in PORTERCLAUDE_AGENT_LINKS / _IDS / _HOST', () => {
+    const spec = recipeSpec({}, [agent('claude')]);
+    expect(spec.env?.PORTERCLAUDE_AGENT_IDS).toBe('claude');
+    expect(spec.env?.PORTERCLAUDE_HOST).toBe(TEST_HOST_ID);
+    expect(spec.env?.PORTERCLAUDE_AGENT_LINKS).toBe(
+      `/home/dev/.claude|${CLAUDE_DIR}/claude|dir;/home/dev/.claude.json|${CLAUDE_DIR}/claude.json|file`,
+    );
+  });
 
-    const isolated = recipeSpec({ shareHistory: false }).mounts ?? [];
+  it('merges the agent env first and lets the session env win', () => {
+    const withEnv: AgentDefinition = { ...agent('claude'), env: { AGENT_FLAG: '1', FOO: 'agent' } };
+    const spec = recipeSpec({ env: { FOO: 'user' } }, [withEnv]);
+    expect(spec.env?.AGENT_FLAG).toBe('1');
+    expect(spec.env?.FOO).toBe('user');
+  });
+
+  it('adds one history volume per agent WITH a historyPath, nested inside its auth volume', () => {
+    const shared = recipeSpec({ shareHistory: true }, [agent('claude'), agent('codex')]).mounts ?? [];
+    expect(shared.some((m) => m.source.startsWith('porterclaude-hist-'))).toBe(false);
+
+    const isolated = recipeSpec({ shareHistory: false }, [agent('claude'), agent('codex')]).mounts ?? [];
+    // claude keeps the v0.1 volume name so an upgraded session keeps its history
     expect(isolated).toContainEqual({
       type: 'volume',
       source: 'porterclaude-hist-web',
-      target: '/home/dev/.claude/projects',
+      target: `${CLAUDE_DIR}/claude/projects`,
       readOnly: false,
     });
+    expect(isolated).toContainEqual({
+      type: 'volume',
+      source: 'porterclaude-hist-web-codex',
+      target: '/home/dev/.porterclaude/agents/codex/codex/sessions',
+      readOnly: false,
+    });
+    // NEVER at ~/.claude/projects: that path is a symlink the bootstrap creates, and docker
+    // resolves mount targets before the bootstrap runs
+    expect(isolated.some((m) => m.target === '/home/dev/.claude/projects')).toBe(false);
+  });
+
+  it('gives an agent without a historyPath no history volume', () => {
+    const mounts = recipeSpec({ shareHistory: false }, [agent('opencode')]).mounts ?? [];
+    expect(mounts.some((m) => m.source.startsWith('porterclaude-hist-'))).toBe(false);
   });
 
   it('sets the session env, working dir, init and pids limit', () => {
@@ -157,6 +231,30 @@ describe('buildContainerSpec', () => {
       target: '/cache',
       readOnly: false,
     });
+  });
+
+  it('honours a per-host volumePrefix and containerHome (host overrides)', () => {
+    const edge = generalConfig({ volumePrefix: 'edge-', containerHome: '/root' });
+    const spec = buildContainerSpec({
+      session: sessionConfig({ hostId: 'edge' }),
+      general: edge,
+      agents,
+      resolvedImage: 'porterclaude/node:latest',
+      imageType: 'recipe',
+    });
+    expect(spec.mounts).toContainEqual({
+      type: 'volume',
+      source: 'edge-auth-claude',
+      target: '/root/.porterclaude/agents/claude',
+      readOnly: false,
+    });
+    expect(spec.mounts).toContainEqual({
+      type: 'volume',
+      source: 'edge-ws-web',
+      target: '/workspace',
+      readOnly: false,
+    });
+    expect(spec.labels?.[CONTAINER_LABELS.host]).toBe('edge');
   });
 });
 
@@ -257,6 +355,15 @@ describe('specHash', () => {
     for (const variant of variants) expect(specHash(variant)).not.toBe(base);
   });
 
+  // enabling an agent on the host must make its sessions ask for a recreate: the new agent
+  // only appears once the container carries its auth mount (api.md v0.2 Sessions)
+  it('changes when the AGENT SET changes and is stable while it does not', () => {
+    const one = recipeSpec({}, [agent('claude')]);
+    const two = recipeSpec({}, [agent('claude'), agent('opencode')]);
+    expect(specHash(two)).not.toBe(specHash(one));
+    expect(specHash(recipeSpec({}, [agent('claude')]))).toBe(specHash(one));
+  });
+
   it('is stable across repeated builds of the same config', () => {
     expect(recipeSpec().labels?.[CONTAINER_LABELS.specHash]).toBe(
       recipeSpec().labels?.[CONTAINER_LABELS.specHash],
@@ -264,10 +371,10 @@ describe('specHash', () => {
   });
 });
 
-// BE-6: a custom image that runs as a non-root user cannot persist PATH in any rc file
-// (docker creates <containerHome> as root:root), so the tools PATH has to live in the
-// container env where every `docker exec` inherits it.
-describe('custom image PATH (BE-6)', () => {
+// BE-6: a non-root image cannot persist PATH in any rc file (docker creates <containerHome>
+// as root:root), so the tools PATH has to live in the container env where every `docker exec`
+// inherits it. v0.2 does that for RECIPES TOO — the agents live in the tools volume for both.
+describe('container PATH (BE-6)', () => {
   it('prepends the tools bin dir to the image PATH', () => {
     const session = sessionConfig({ image: { type: 'custom', ref: 'alpine:3.20' } });
     const spec = buildContainerSpec({
@@ -289,8 +396,16 @@ describe('custom image PATH (BE-6)', () => {
     );
   });
 
-  it('never touches PATH for recipe images (claude is installed in the image)', () => {
-    expect(recipeSpec().env?.PATH).toBeUndefined();
+  it('sets PATH for recipe images as well (v0.2: agents come from the tools volume)', () => {
+    const spec = buildContainerSpec({
+      session: sessionConfig(),
+      general,
+      agents,
+      resolvedImage: 'porterclaude/node:latest',
+      imageType: 'recipe',
+      imageEnvPath: '/usr/local/bin:/usr/bin',
+    });
+    expect(spec.env?.PATH).toBe('/opt/porterclaude/bin:/home/dev/.local/bin:/usr/local/bin:/usr/bin');
   });
 
   it('lets a user-supplied PATH win', () => {

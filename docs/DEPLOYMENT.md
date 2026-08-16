@@ -3,28 +3,56 @@
 PorterClaude is one container. It needs:
 
 - a **persistent** `/data` volume (config, encrypted secrets, session definitions)
-- a way to reach Docker: **socket mode** (mount `/var/run/docker.sock`) or
-  **Portainer mode** (URL + API key entered in Settings)
+- a way to reach Docker: at least one **host** — the local socket (mount
+  `/var/run/docker.sock`) or a **Portainer** credential + endpoint, added in Settings
 - an HTTPS reverse proxy in front of it that passes WebSockets (terminals)
 
+Everything else — hosts, coding agents, images, sessions — is configured in the app. The
+agent-facing half of the documentation (what an agent is, the built-ins, adding a custom one)
+is [AGENTS.md](AGENTS.md).
+
 > **`/data` is load-bearing.** It holds `secret.key`, which encrypts the stored Portainer
-> API key and signs session cookies. Losing the volume logs everyone out and makes the
-> stored key undecryptable — you then have to re-enter it in Settings. Set `APP_SECRET`
+> API keys and signs session cookies. Losing the volume logs everyone out and makes the
+> stored keys undecryptable — you then have to re-enter them in Settings. Set `APP_SECRET`
 > explicitly if you prefer to manage the key yourself.
 
-## Modes
+## Hosts
 
-| | Socket mode | Portainer mode |
+Since v0.2 PorterClaude manages **several Docker engines**. A *host* is a named connection:
+
+| Connection | What it is | Notes |
+|---|---|---|
+| `socket` | the engine the app itself runs on | mount `/var/run/docker.sock` (+ `group_add`, below). **At most one socket host** per install |
+| `portainer` | a stored Portainer credential + an endpoint id | the app anywhere, the engine anywhere Portainer can reach |
+| `tcp`, `ssh` | reserved | accepted by the schema, every operation answers `501 not_implemented` |
+
+A **credential** (`Settings → Hosts → Portainer credentials`) is a Portainer URL + API key,
+stored once and encrypted with `secret.key`. Any number of hosts reference it, and
+*Import endpoints* turns a credential's endpoint list into one host per endpoint in a single
+step.
+
+| | Socket host | Portainer host |
 |---|---|---|
 | Where the app runs | on the Docker host it manages | anywhere |
-| Setup | mount `/var/run/docker.sock` (+ `group_add`, see below) | paste Portainer URL + API key in Settings |
+| Setup | mount `/var/run/docker.sock` (+ `group_add`) | paste URL + API key, pick the endpoint |
 | Terminal stream | hijacked exec over the socket | `wss://<portainer>/api/websocket/exec` (API key OK) |
-| Multiple Docker hosts | no | yes — pick the endpoint in Settings |
-| Security note | app has root-equivalent access to the host | key scoped by Portainer RBAC |
+| Security note | app has root-equivalent access to that host | key scoped by Portainer RBAC |
 
-Both are chosen/changed in **Settings** at runtime. Env vars can pre-seed them for
-unattended installs (`PORTERCLAUDE_BACKEND`, `PORTAINER_URL`, `PORTAINER_API_KEY`,
-`PORTAINER_ENDPOINT_ID`).
+**Nothing is shared between hosts.** Images, recipe builds, the tools volume, the agent auth
+volumes (i.e. the logins), workspaces and sessions all belong to exactly one host. An agent
+login on host A says nothing about host B; a recipe built on A must be built again on B.
+
+Two caveats worth knowing before you add the second host:
+
+* A host that is unreachable degrades **only itself**: it is listed with
+  `status: unreachable`, its sessions show as absent, and every other host keeps working.
+* Two hosts may point at the *same* engine (e.g. the local socket and a Portainer endpoint of
+  the same machine). That is allowed, and they then share volumes and images by construction.
+  If you want two genuinely independent installs on one engine, give one host
+  `volumePrefix` / `containerPrefix` overrides (Settings → Hosts → *(host)* → Overrides).
+* Deleting a host **never touches the engine** — containers, volumes and images stay; only
+  PorterClaude forgets them. It refuses while sessions still reference the host unless you
+  force it.
 
 ### The docker socket and the non-root user
 
@@ -46,8 +74,8 @@ that is unset, asks the engine itself: it runs a throwaway `alpine` container th
 bind-mounts the socket read-only, prints `stat -c %g`, and is removed again.
 
 Alternatives: `user: "0:0"` (drops the non-root hardening) or a socket proxy. Without it the
-app starts fine but Settings reports the socket as unavailable — that hint is *correct*, not
-a bug. Portainer mode needs no socket at all.
+app starts fine but the socket host reports itself unavailable — that hint is *correct*, not
+a bug. Portainer hosts need no socket at all.
 
 ## Environment variables
 
@@ -60,11 +88,11 @@ Complete list (server defaults in brackets):
 | `DATA_DIR` | `./data` (`/data` in the image) | config + secret key — must persist |
 | `APP_PASSWORD` | – | first-run password seed for the web UI |
 | `APP_SECRET` | auto (`<DATA_DIR>/secret.key`) | encryption + JWT key material |
-| `PORTERCLAUDE_BACKEND` | – | `socket` or `portainer` seed |
-| `PORTAINER_URL` | – | Portainer base URL seed |
-| `PORTAINER_API_KEY` | – | Portainer API key seed (stored encrypted, never returned by the API) |
-| `PORTAINER_ENDPOINT_ID` | – | Portainer endpoint id seed |
-| `DOCKER_SOCKET` | `/var/run/docker.sock` | socket path for socket mode |
+| `PORTERCLAUDE_BACKEND` | – | `socket` or `portainer` — **seeds the first host** |
+| `PORTAINER_URL` | – | Portainer base URL for the seeded host |
+| `PORTAINER_API_KEY` | – | Portainer API key (stored encrypted as a credential, never returned by the API) |
+| `PORTAINER_ENDPOINT_ID` | – | Portainer endpoint id for the seeded host |
+| `DOCKER_SOCKET` | `/var/run/docker.sock` | socket path of the seeded socket host |
 | `LOG_LEVEL` | `info` | pino log level |
 | `COOKIE_SECURE` | `auto` | `auto` (secure when the request is https, `X-Forwarded-Proto` aware) / `true` / `false` |
 | `TRUST_PROXY` | `1` | Express `trust proxy` value — set it when behind a reverse proxy |
@@ -73,12 +101,16 @@ Complete list (server defaults in brackets):
 | `WEB_DIR` | `<repo>/web/public` | static root |
 | `ENABLE_REQUEST_LOG` | `true` | pino-http request logging on/off |
 
-Env vars only *seed* the config: once `config.json` exists, Settings wins.
+**The five Docker variables only seed the *first* host, and only while no host exists.** They
+are an unattended-install convenience: once a host is stored in `config.json`, they are
+ignored, and hosts two … N are added in Settings (or through `/api/hosts`). There is no
+environment variable for a second host, for agents or for images — all of that is app
+configuration.
 
 ### `DATA_DIR` and the repository checkout
 
 `DATA_DIR` holds `secret.key` and `config.json` — the key that encrypts the Portainer API
-key, and the encrypted key itself. Treat that directory as secret material.
+keys, and the encrypted keys themselves. Treat that directory as secret material.
 
 If you point `DATA_DIR` at a path **inside a checkout of this repository** (handy for local
 development), its name **must start with `data`** — `data/`, `data.dev`, `data.qa.frontend`,
@@ -104,7 +136,7 @@ services:
       TRUST_PROXY: "1"
     volumes:
       - porterclaude-data:/data                      # MUST persist
-      - /var/run/docker.sock:/var/run/docker.sock    # remove for Portainer-only mode
+      - /var/run/docker.sock:/var/run/docker.sock    # only for a socket host
     group_add:
       - "999"                                        # stat -c %g /var/run/docker.sock
 volumes:
@@ -174,15 +206,17 @@ volumes:
 ### Reverse-proxy requirements for the **Portainer** vhost
 
 This is a *different* vhost from the PorterClaude one above, and it is easy to miss:
-PorterClaude drives the managed engine through Portainer's Docker proxy, and two of those
-calls are long-running streams — `POST …/docker/build` (recipe images, and the app image
-when `deploy/deploy.sh` builds remotely) and the container log/attach streams.
+PorterClaude drives a Portainer host through Portainer's Docker proxy, and several of those
+calls are long-running streams — `POST …/docker/build` (recipe images, the tools image, and
+the app image when `deploy/deploy.sh` builds remotely), the tools-sync container's log
+stream, and the container log/attach streams.
 
 Measured on the reference host (Portainer behind nginx-proxy, defaults): the `/build`
 response was buffered and only delivered when the build finished, and a build that ran
 longer than 60 s got an HTML `504 Gateway Time-out` instead — at which point docker cancels
 the build ("aborted"). Every recipe whose build takes more than a minute (`php`, `python`,
-`go`, `dotnet`) and every remote app-image build is affected.
+`go`, `dotnet`), every remote app-image build **and every tools sync** (which downloads
+agents and runtimes and legitimately runs for minutes) are affected.
 
 So the vhost in front of **Portainer** needs:
 
@@ -196,7 +230,7 @@ client_max_body_size 0;       # a build context can be tens of MB
 
 With nginx-proxy that is a file `vhost.d/<portainer-host>` on the proxy container, followed
 by a reload (`docker kill -s HUP <nginx-proxy>`). **Do this before running
-`deploy/deploy.sh` or building recipes from Settings → Images.**
+`deploy/deploy.sh`, building recipes or syncing tools from Settings → Images.**
 
 [`deploy/host-prep.sh`](../deploy/README.md) writes both vhost files and reloads the proxy
 through the Portainer API, so it needs no shell on the host:
@@ -241,87 +275,145 @@ the stack at a registry image instead (`pullImage: true`).
 chores — nginx vhost snippets, proxy reload, leftover QA containers, dangling images — each
 behind its own flag and all of them previewable with `--dry-run`.
 
-## Images
+## Upgrading from v0.1 to v0.2
+
+v0.2 turns the single Docker backend into *hosts* and the hard-wired Claude Code into
+*agents*. The upgrade is automatic but has two manual steps; plan for a few minutes of
+downtime plus one tools sync per host.
+
+1. **Back up `/data`** (or at least copy `config.json`), then pull the new image and restart
+   the container. Nothing else changes in the compose file.
+2. **The config migrates itself on first boot.** `config.json` v1 is copied to
+   `config.json.v1.bak` before the first v2 write. The migration is lossless: the single
+   backend becomes the host **`default`** (a Portainer backend additionally becomes the
+   credential `portainer-1`, re-using the already-encrypted key), every session gets
+   `hostId: "default"` and inherits the host's agents, and the general settings are carried
+   over unchanged. If anything looks wrong, stop the container, restore the `.v1.bak` file
+   and go back to the v0.1 image — nothing on the engine has been touched yet.
+3. **Settings → Agents → Sync tools, once per host.** This is the step that installs the
+   agents: recipe images no longer contain Claude Code, so until the sync has run, sessions
+   come up with no agent on `PATH`. The same sync performs the **one-time login import**: the
+   contents of the v0.1 `porterclaude-claude` and `porterclaude-claude-home` volumes are
+   copied into `porterclaude-auth-claude` (marker file `.pc-import-v1`), so **nobody has to
+   log in again**. The old volumes are never deleted or modified, which is what keeps a
+   rollback to v0.1 possible; to re-run the import, delete the marker.
+4. **Rebuild the recipe images you use** (Settings → Images). They are flagged *outdated*
+   because the shared provisioning script changed. An un-rebuilt image still works — the
+   tools volume shadows the stale `claude` binary on `PATH` — but it wastes ~100 MB and is
+   confusing.
+5. **Recreate your sessions.** The agent auth volumes, the tools mount and the entrypoint are
+   part of the container spec, so existing containers keep the v0.1 layout until they are
+   recreated. Sessions that need it say *needs recreate* in the Sessions tab. Workspace
+   volumes are untouched by a recreate.
+6. Optional: once everything is verified, remove the leftover v0.1 volumes
+   `porterclaude-claude` and `porterclaude-claude-home` (and, if you never rolled back,
+   `config.json.v1.bak`).
+
+After the upgrade, `which claude` inside a session resolves to `/opt/porterclaude/bin/claude`
+(the tools volume), not to `/usr/local/bin/claude` (the old baked-in copy).
+
+## Images, the tools volume and agents
 
 * The **app image** is released multi-arch (`linux/amd64`, `linux/arm64`) to
   `ghcr.io/<owner>/porterclaude` on `v*` tags.
-* **Recipe images** (`porterclaude/<recipe>:latest`) and the **tools volume** are built by
-  the app itself, on the Docker host it manages, from Settings → Images. They are therefore
-  always native-arch and never pulled from a registry.
+* **Recipe images** (`porterclaude/<recipe>:latest`) are built by the app itself, per host,
+  from Settings → Images. They are language-toolchain images only — since v0.2 they contain
+  **no coding agent**.
+* The **tools volume** (`porterclaude-tools`, one per host) carries the agents, their
+  runtimes and the session entrypoint. Every session mounts it read-only at
+  `/opt/porterclaude`, so this is the single place an agent is installed and upgraded.
+
+**What a tools sync needs**, on the *Docker host*, not on the machine running the browser:
+
+* **Outbound HTTPS**: the agents' installers, `registry.npmjs.org`, `nodejs.org`,
+  `github.com/astral-sh`. An engine on an air-gapped network cannot install agents.
+* **Time**: minutes on the first run (image build + downloads). Later syncs carry unchanged
+  agents over and are fast. Do not shorten proxy timeouts for this — see the Portainer vhost
+  section above.
+* **An explicit upgrade** to move an installed agent to a newer upstream release: the
+  carry-over compares the agent's definition, which does not change when a new CLI version
+  ships. Settings → Agents → caret next to *Install / update on this host* → **Upgrade all
+  agents** (API: `POST /api/hosts/:hostId/images/tools/sync {"force":true}`) reinstalls every
+  enabled agent and the bundled runtimes, and costs what a first sync costs. Sessions pick the
+  new version up when they are restarted.
+* **Disk**: ~100 MB for `claude` alone; ~60 MB more for the bundled Node (npm agents), ~90 MB
+  for the managed CPython and ~250 MB for aider's dependencies — roughly 500 MB with
+  everything enabled.
+
+A single agent that fails to install is a **warning**, not a failed sync: it is recorded in
+`/opt/porterclaude/AGENTS.json` as `installed: false` plus a one-line error, which is what the
+Agents and Images panels show. See [AGENTS.md](AGENTS.md) for the agent-side details.
+
+**Alpine (musl) session images** need two extra things, because the tools volume is built
+once per host and shared by every libc (measured, docs/design/requests/v2-O1.md 4):
+
+* agents installed from npm need the GCC runtime libraries in the *session* image —
+  `RUN apk add --no-cache libstdc++ libgcc`. Without them the shim dies with a loader error
+  (the dispatcher prints that exact hint);
+* agents installed from pip are **glibc-only** and refuse to start on musl with a clear
+  message. Give those sessions a Debian/Ubuntu-based image.
 
 ### Disk: dangling images after a rebuild
 
 Every rebuild re-tags `porterclaude/<name>:latest` and leaves the **previous** image untagged
-(0.6–1.4 GB per recipe, ~1.2 GB per tools sync). The app removes the image a successful build
-replaced, unless a container still uses it. To collect what is left — old images from before
-that behaviour existed, or ones a stopped container was holding:
+(0.6–1.4 GB per recipe, ~0.2 GB per tools image). The app removes the image a successful
+build replaced, unless a container still uses it. To collect what is left — old images from
+before that behaviour existed, or ones a stopped container was holding:
 
 ```bash
-docker image prune -f --filter label=porterclaude.recipe          # recipe images
-docker image prune -f --filter label=porterclaude.claude-version  # + the tools image
+docker image prune -f --filter label=porterclaude.recipe        # recipe images
+docker image prune -f --filter label=porterclaude.context-hash  # recipes + the tools image
 ```
 
-Without shell access to the host, `bash deploy/host-prep.sh --prune` does the same through
-the Portainer API and only ever touches dangling images carrying a `porterclaude.*` label.
-Run it with `--dry-run` first: it prints every image and its size.
+(Images built by v0.1 also carry `porterclaude.claude-version`; v0.2 no longer sets that
+label anywhere.) Without shell access to the host, `bash deploy/host-prep.sh --prune` does
+the same through the Portainer API and only ever touches dangling images carrying a
+`porterclaude.*` label. Run it with `--dry-run` first: it prints every image and its size.
 
-## Volumes created on the managed host
+## Volumes created on a managed host
 
-| Volume | Mounted in sessions at | Purpose |
-|---|---|---|
-| `porterclaude-claude` | `/home/dev/.claude` | shared Claude login + settings |
-| `porterclaude-claude-home` | `/home/dev/.claude-home` (symlinked `~/.claude.json`) | account/onboarding |
-| `porterclaude-tools` (ro) | `/opt/porterclaude` | claude binary + entrypoint for custom images |
-| `porterclaude-ws-<session>` | `/workspace` | per-session workspace when no host path is given |
-| `porterclaude-hist-<session>` | `/home/dev/.claude/projects` | only when a session opts out of shared history |
+One set per host — the names are identical on every engine, the contents are not.
+
+| Volume | Mounted in sessions at | Purpose | Back up? |
+|---|---|---|---|
+| `porterclaude-auth-<agentId>` | `/home/dev/.porterclaude/agents/<agentId>` | **the agent's login and settings**, shared by every session on that host | **yes** |
+| `porterclaude-tools` (ro) | `/opt/porterclaude` | the installed agents, their runtimes and the session entrypoint | no — a sync rebuilds it |
+| `porterclaude-ws-<session>` | `/workspace` | per-session workspace when no host path is given | yes, if you keep code in it |
+| `porterclaude-hist-<session>[-<agentId>]` | inside the agent volume (e.g. `…/claude/projects`) | conversation history of a session that opted out of shared history | optional |
+| `porterclaude-claude`, `porterclaude-claude-home` | – (v0.1 only) | the v0.1 shared Claude login; **read once** by the v0.2 import, then unused | removable after the upgrade |
+
+The prefix is `general.volumePrefix` (default `porterclaude-`) and can be overridden per host.
+
+The volume to protect is **`porterclaude-auth-<agentId>`**: it is the only copy of an agent's
+authentication on that host. Losing it means logging in again, on every host it happened to.
 
 ## Architecture notes for operators
 
-- Session containers are named `pc-<session>` and labelled `porterclaude.managed=true` and
-  `porterclaude.session=<name>`; the app rebuilds its view from these labels, so losing
+- Session containers are named `pc-<session>` and labelled `porterclaude.managed=true`,
+  `porterclaude.session=<name>`, `porterclaude.host=<hostId>` and
+  `porterclaude.agents=<id,id,…>`; the app rebuilds its view from these labels, so losing
   `/data` costs you the settings, not the containers (`POST /api/sessions/reconcile`).
-- Sessions share one Claude login through `porterclaude-claude`: log in once in any session.
-- Backups: back up the `porterclaude-data` volume (settings + encrypted key) and any
-  workspace volumes you care about.
+- Session **names are unique across hosts** — that is what lets a terminal find its host.
+- Every session (recipe *and* custom image) starts through `/opt/porterclaude/entrypoint.sh`
+  from the tools volume; recipe images keep their own `CMD` (the `php` recipe still starts
+  supervisord). The entrypoint wires `PATH`, symlinks each agent's config paths into its auth
+  volume and repairs ownership — it never aborts the container.
+- Backups: the `porterclaude-data` volume of the app (settings + encrypted keys), every
+  `porterclaude-auth-*` volume on every host (the logins), and the workspace volumes you care
+  about.
 
----
+## Troubleshooting
 
-# v0.2 — hosts and agents (TODO(O2): fold into the sections above)
-
-> **PLANNER SKELETON.** O2 owns this file: work the points below into the existing sections
-> (do not leave this block standing as an appendix). Sources of truth:
-> `docs/design/orchestration.md` §11–§18, `docs/design/backend.md` §11–§16,
-> `docs/design/api.md` §v0.2, and `docs/AGENTS.md` for the agent-facing half.
-
-1. **Hosts.** PorterClaude now talks to *several* Docker engines. A host is
-   `socket` (the engine the app runs on, at most one) or `portainer` (a stored credential +
-   an endpoint id); `tcp`/`ssh` are reserved. Portainer credentials are stored once and
-   "Import endpoints" creates one host per endpoint. Everything below — images, the tools
-   volume, the agent auth volumes, sessions — is **per host**; nothing is shared between
-   hosts, including logins.
-2. **Env vars.** `PORTERCLAUDE_BACKEND`, `PORTAINER_URL`, `PORTAINER_API_KEY`,
-   `PORTAINER_ENDPOINT_ID` and `DOCKER_SOCKET` now **seed the first host**, and only while no
-   host exists. No new environment variable; the compose files are unchanged.
-3. **Upgrade procedure (v0.1 → v0.2).** Pull the new image → the config is migrated in place
-   (a `config.json.v1.bak` is written and the existing backend becomes the host `default`;
-   every session gets `hostId: default`) → open **Settings → Images → Sync tools** for each
-   host → the one-time import copies the old `porterclaude-claude` / `-claude-home` volumes
-   into `porterclaude-auth-claude`, so **nobody has to log in again** → recreate sessions to
-   pick up the new mounts. The old volumes are never deleted (rollback stays possible).
-4. **Agents.** Recipes no longer contain Claude Code: every agent is installed into the
-   per-host tools volume by the sync and mounted into every session. Point at
-   [AGENTS.md](AGENTS.md).
-5. **What a sync needs.** Outbound HTTPS **from the docker host** (nodejs.org,
-   github.com/astral-sh, the agents' own installers), several minutes on the first run, and
-   disk: the tools volume grows to roughly 100 MB (claude only) … 500 MB (with a Node runtime
-   and a Python toolchain).
-6. **Volumes on a managed host** — update the existing table:
-   `porterclaude-tools` (per host, read-only in sessions), `porterclaude-auth-<agentId>`
-   (one per agent per host, **holds the logins — back these up**),
-   `porterclaude-ws-<session>`, `porterclaude-hist-<session>[-<agentId>]`. The v0.1
-   `porterclaude-claude` / `porterclaude-claude-home` volumes stay behind after the import
-   and can be removed once the upgrade is confirmed.
-7. **Troubleshooting additions.** "no agents installed on this host" (sync never ran), a
-   terminal closing with 4410 (`agent_not_available` — recreate the session) or 4411
-   (`host_unavailable` — the engine is unreachable), and a host that shows as unreachable
-   without affecting the other hosts.
+| Symptom | Cause / fix |
+|---|---|
+| Settings reports the socket host as unavailable | missing `group_add` (see above), or no socket mounted at all |
+| a host shows *unreachable* | that engine or its Portainer is down; other hosts and the UI keep working. Fix the connection, then *Refresh* |
+| **"no agents installed on this host"** | the tools volume was never populated on it — Settings → Agents → **Sync tools** |
+| a terminal closes with **4410** (`agent_not_available`) | the agent is not mounted into that session: enable it on the host, sync, and **recreate** the session. The client does not reconnect on purpose |
+| a terminal closes with **4411** (`host_unavailable`) | the session's host is gone or unreachable |
+| an agent asks for a login again after the upgrade | the tools sync (which performs the one-time v0.1 login import) has not run yet on that host, or the session predates it — sync, then recreate |
+| a login on one host does not work on another | by design: auth volumes are per host |
+| a tools sync fails after ~60 s on a Portainer host | the reverse proxy in front of Portainer is cutting the stream — install the vhost snippet above |
+| a tools sync fails with download errors | the **Docker host** has no outbound HTTPS |
+| a build job dies after ~60 s with `aborted` | same proxy cause as above |
+| the container is `unhealthy` although the app answers | the image's `HEALTHCHECK` was overridden with `curl`/`wget`, neither of which exists in the runtime image |

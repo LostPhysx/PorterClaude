@@ -1,21 +1,29 @@
 # docker/ — images
 
-> **v0.2 — TODO(O1): rewrite this file for the agent model.** Recipes no longer bake a
-> coding agent in; every agent is delivered through the per-host tools volume and every
-> session (recipe and custom alike) is started with `<toolsMount>/entrypoint.sh`. See
-> [`docs/design/orchestration.md` §13–§15](../docs/design/orchestration.md).
-
-
-OWNER: O1. Design: [`docs/design/orchestration.md`](../docs/design/orchestration.md).
+OWNER: O1. Design: [`docs/design/orchestration.md`](../docs/design/orchestration.md)
+(§11–§15 describe v0.2 and win where they contradict the older sections).
 
 | Path | Image | Built by | Tag |
 |---|---|---|---|
 | `Dockerfile` | the PorterClaude app | `deploy/deploy.sh` (Portainer `/build`) or CI buildx | `porterclaude:local` / `ghcr.io/<owner>/porterclaude:<ver>` |
 | `recipes/<name>/Dockerfile` | session dev images | the app itself, Settings → Images | `porterclaude/<name>:latest` |
-| `tools/Dockerfile` | payload for the shared tools volume | the app itself, Settings → Images → Sync tools | `porterclaude/tools:latest` |
+| `tools/Dockerfile` | payload for the per-host tools volume | the app itself, Settings → Images → Sync tools | `porterclaude/tools:latest` |
 
-Recipes are **never** published: they are built natively on whichever host runs the
-sessions, so amd64 and arm64 both work without buildx.
+Recipes and the tools image are **never** published: they are built natively on whichever
+host runs the sessions, so amd64 and arm64 both work without buildx.
+
+## Coding agents are not part of any image (v0.2)
+
+A recipe is a **language-toolchain image and nothing else**. Claude Code, opencode, gemini,
+codex, aider and any custom agent live in the **per-host tools volume**
+([`tools/README.md`](tools/README.md)), which PorterClaude mounts read-only into *every*
+session — recipe and custom image alike — and whose `entrypoint.sh` it uses as the container
+entrypoint. That is what makes "enable an agent → Sync tools" work without rebuilding an
+image, and what makes one login per host authenticate every session on it.
+
+**Never add an agent installer to a recipe.** It would shadow the volume's version on
+`PATH`, inflate the image, and break the shared-login model. CI greps `docker/recipes/` for
+installer patterns and for `ARG CLAUDE_VERSION` and fails the build if one comes back.
 
 ## How a recipe is built
 
@@ -33,10 +41,12 @@ itself with heredocs (that is why `/usr/local/bin/pc-entrypoint.sh` is written b
 `common.sh` rather than copied). Editing `common.sh` changes the context hash of **all six**
 recipes, so the Images panel flips every one of them to *outdated*. That is intended.
 
-`common.sh` provisions: the apt toolchain (`git gh ripgrep tmux curl jq unzip …`, deliberately
-**no sudo**), user `dev` with **uid 1000 / gid 1000** and `HOME=/home/dev` (a pre-existing
-uid-1000 account such as `node` is *renamed*, never deleted), Claude Code via the native
-installer, `/etc/profile.d/porterclaude.sh` and `/usr/local/bin/pc-entrypoint.sh`.
+`common.sh` provisions: the apt toolchain (`git gh ripgrep tmux curl jq unzip …`,
+deliberately **no sudo**), user `dev` with **uid 1000 / gid 1000** and `HOME=/home/dev` (a
+pre-existing uid-1000 account such as `node` is *renamed*, never deleted),
+`/home/dev/.porterclaude/agents` owned by `1000:1000` (the parent of every per-agent auth
+volume mount, so docker's copy-up has an owner to work with), `/etc/porterclaude/recipe`,
+`/etc/profile.d/porterclaude.sh` and `/usr/local/bin/pc-entrypoint.sh`.
 
 ### PATH in terminals
 
@@ -53,41 +63,31 @@ $HOME/.local/bin : $PORTERCLAUDE_PATH_EXTRA : /usr/local/bin : <image ENV PATH> 
 with duplicates dropped (`pc_path_compose`, so sourcing it twice is a no-op). A recipe
 Dockerfile adds directories that only exist at runtime by setting `ENV PORTERCLAUDE_PATH_EXTRA`
 **before** it runs `common.sh`: `go` → `/home/dev/go/bin` (`$GOPATH/bin`), `dotnet` →
-`/home/dev/.dotnet/tools`, `php` → `/home/dev/.composer/vendor/bin`.
+`/home/dev/.dotnet/tools`, `php` → `/home/dev/.composer/vendor/bin`. The agents' own
+directory (`<toolsMount>/bin`) is prepended at *runtime* by the tools volume's entrypoint,
+not here — an image must stay usable without the volume.
 
 Builds go through the **classic** builder: no BuildKit-only features at all (no syntax
 directive, no build mounts, no per-build platform override, no heredoc `COPY`). Nothing may
 hardcode an architecture — use `dpkg --print-architecture` or a `uname -m` `case`.
 
-## Versions and labels
+## Labels and versions
 
-* Build arg `CLAUDE_VERSION` (default **`stable`** in every recipe *and* in
-  `tools/Dockerfile`, so a recipe session and a custom-image session run the same Claude
-  Code) is both **passed to the installer** by `common.sh` and recorded as the label
-  `porterclaude.claude-version`:
-
-  ```bash
-  docker build --build-arg CLAUDE_VERSION=2.1.200 …    # installs 2.1.200, label says 2.1.200
-  ```
-
-  `install.sh [version]` takes `stable`, `latest` or an exact version. `stable` is the
-  installer's own default and is therefore passed as *no* argument at all, so an older
-  installer that ignores arguments still produces what the label promises. When an exact
-  version is requested and the installer produces something else, the build log carries a
-  `[porterclaude][warn] requested claude version … but the installer produced …` line — the
-  label must never claim a version the image does not have.
-* The **exact** installed version is written to `/etc/porterclaude/claude-version` inside the
-  image (`docker exec <c> cat /etc/porterclaude/claude-version`). The recipe name lands in
-  `/etc/porterclaude/recipe`.
+* `porterclaude.recipe=<name>` is set by every recipe Dockerfile; the recipe name also lands
+  in `/etc/porterclaude/recipe` inside the image.
 * `porterclaude.context-hash` and `porterclaude.built-at` are added by the server at build
   time — Dockerfiles must not set them.
+* There is **no** claude version in a recipe image any more (no `ARG CLAUDE_VERSION`, no
+  `porterclaude.claude-version` label, no `/etc/porterclaude/claude-version`). The version
+  the Images panel shows comes from the tools volume's `AGENTS.json`; an image built by v0.1
+  may still carry the old label, which is then a stale hint and nothing else.
 
 ## Disk usage: rebuilds leave the previous image behind
 
 A rebuild re-tags `porterclaude/<name>:latest`, and the image the tag pointed at before
 becomes **untagged (dangling)** — it is not deleted, and it is not small: ~0.6 GB for `base`,
-1.4 GB for `node`, ~1.2 GB for the tools image (four claude binaries). A handful of
-*Sync tools* / rebuild cycles fills a small VPS; the reference host had 23 GB of them.
+1.4 GB for `node`. A handful of rebuild cycles fills a small VPS; the reference host had
+23 GB of them.
 
 The server therefore removes the image a successful build replaced (`ImageService`
 `removeReplacedImage`, `server/src/images/service.ts`): only when the tag really moved, the
@@ -98,40 +98,46 @@ stopped container, still have to be collected by hand:
 ```bash
 # on the docker host: only images this project built
 docker image prune -f --filter label=porterclaude.recipe
-docker image prune -f --filter label=porterclaude.claude-version
 ```
 
 or, through the Portainer API and without shell access to the host,
 [`deploy/host-prep.sh --prune`](../deploy/README.md) (`--dry-run` first: it lists every
 image it would remove with its size).
 
-## Runtime contract of a recipe image
+## Runtime contract of a session
+
+Identical for a recipe image and a custom image — the difference is only which `CMD` runs:
 
 ```
-user        dev (uid 1000, gid 1000), HOME=/home/dev, no sudo
-workdir     /workspace
-entrypoint  ["/usr/local/bin/pc-entrypoint.sh"]     links ~/.claude.json into ~/.claude-home
-cmd         ["sleep","infinity"]                    (php: supervisord)
-mounts      porterclaude-claude       -> /home/dev/.claude
-            porterclaude-claude-home  -> /home/dev/.claude-home
-            porterclaude-hist-<slug>  -> /home/dev/.claude/projects   (shareHistory:false)
-            workspace                 -> /workspace
+entrypoint  ["<toolsMount>/entrypoint.sh"]          always the tools volume's bootstrap
+cmd         recipe: the image CMD (base/node/…: sleep infinity, php: supervisord)
+            custom: ["sleep","infinity"]
+user        recipe: dev (uid 1000, gid 1000), HOME=/home/dev, no sudo
+            custom: whatever the image uses; $HOME is pinned to the container home
+workdir     /workspace (recipes)
+mounts      porterclaude-tools          -> /opt/porterclaude                        (read-only)
+            porterclaude-auth-<agentId> -> /home/dev/.porterclaude/agents/<agentId>
+            porterclaude-hist-<slug>    -> <agent dir>/<shared path>/…  (shareHistory:false)
+            <workspace volume>          -> /workspace
+env         PORTERCLAUDE_TOOLS, PORTERCLAUDE_HOME, HOME, PATH, TERM,
+            PORTERCLAUDE_SESSION, PORTERCLAUDE_HOST,
+            PORTERCLAUDE_AGENT_IDS=claude,gemini
+            PORTERCLAUDE_AGENT_LINKS=<target>|<source>|<kind>;…
 ```
 
-`common.sh` ships `/home/dev/.claude/projects` (0700, `dev:dev`) **in the image**, and that
-is load-bearing: when a `shareHistory:false` session mounts its private history volume at
-`/home/dev/.claude/projects`, docker creates a *missing* mountpoint inside the shared
-`porterclaude-claude` volume as `root:root`, and from then on every uid-1000 session gets
-`Permission denied` on `~/.claude/projects` — Claude Code's conversation store. Because the
-directory exists in the image, docker's copy-up seeds both the shared volume and each fresh
-history volume with the right owner instead. (The server repairs volumes that predate this;
-see `docs/design/backend.md` §7.)
+The entrypoint creates one symlink per `PORTERCLAUDE_AGENT_LINKS` entry (`~/.claude` →
+`~/.porterclaude/agents/claude/claude`, `~/.claude.json` →
+`~/.porterclaude/agents/claude/claude.json`, …), parks anything already sitting there as
+`*.pc-backup` instead of deleting it, seeds a missing `kind:file` source (`{}` for
+`.json`/`.yml`/`.yaml`, an empty file otherwise — a zero-byte `.yml` makes aider abort with
+`yaml.load(...) returned type NoneType`), repairs the ownership of the agent volumes, drops
+`/usr/local/bin` wrappers for non-login shells and bridges the image's own home when it
+differs from `$HOME`. Every step is best effort: nothing in it may abort the container.
 
-`pc-entrypoint.sh` is best-effort throughout: every step logs on failure and the container
-still comes up. It never deletes user data — an existing regular `~/.claude.json` is moved
-into the shared volume (or parked as `~/.claude.json.pc-backup`) before the symlink is made.
-When the command is exactly `sleep infinity` it runs a portable idle loop instead, so images
-whose `sleep` rejects `infinity` still stay up and `docker stop` is still honoured.
+`pc-entrypoint.sh` (written by `common.sh`) only matters when somebody runs a recipe image by
+hand: it sets `HOME`/`TERM`, writes `/tmp/porterclaude-ready` and `exec "$@"` (with a portable
+idle loop when the command is `sleep infinity`, so images whose `sleep` rejects `infinity`
+still stay up).
 
 ## The recipes
 
@@ -155,14 +161,21 @@ Where an engine does *not* allow it (hardened sysctls, some rootless setups), ng
 bind and supervisord restarts it in a loop. The escape hatch is the env var **`PC_HTTP_PORT`**
 (default `80`): set it on the session, and `/usr/local/bin/pc-nginx.sh` rewrites `listen 80;`
 into a copy of the config in `/tmp` before starting nginx. Publish that port instead
-(e.g. `PC_HTTP_PORT=8080`, ports `8080:8080`).
+(e.g. `PC_HTTP_PORT=8080`, ports `8080:8080`). The php image keeps its own `CMD`
+(`supervisord`) under the entrypoint override, so the sample page is served exactly as before.
 
 ## Adding a recipe
 
-1. Create `docker/recipes/<name>/Dockerfile` from the frozen skeleton (`ARG CLAUDE_VERSION`,
-   the two labels, `COPY common.sh /tmp/common.sh`, `RUN bash /tmp/common.sh`, `USER dev`,
-   `WORKDIR /workspace`, the `pc-entrypoint.sh` ENTRYPOINT).
-2. Add the matching entry to `RECIPES` in `server/src/images/recipes.ts`. **That file is
+1. Create `docker/recipes/<name>/Dockerfile` from the frozen skeleton: `FROM <base>`,
+   `LABEL porterclaude.recipe="<name>"`, `ENV … PORTERCLAUDE_RECIPE=<name>`
+   (plus `PORTERCLAUDE_PATH_EXTRA` if the toolchain needs it),
+   `COPY common.sh /tmp/common.sh`, `RUN bash /tmp/common.sh && rm -f /tmp/common.sh`,
+   the recipe-specific layers, `USER dev`, `WORKDIR /workspace`,
+   `ENTRYPOINT ["/usr/local/bin/pc-entrypoint.sh"]`, `CMD ["sleep","infinity"]`.
+2. **No coding agent, no `ARG CLAUDE_VERSION`, no architecture literal, no BuildKit
+   feature.** Everything the session user writes to must be owned by `1000:1000` or live
+   under `/tmp`.
+3. Add the matching entry to `RECIPES` in `server/src/images/recipes.ts`. **That file is
    backend-owned** — raise the change with the backend topic instead of editing it here.
    The directory name and the registry name must be identical.
 
@@ -174,9 +187,11 @@ every root-level `data*` directory and any `secret.key` — **secrets must never
 context**; the build stage does `COPY . .`, and `deploy/deploy.sh` uploads the very same tar
 to a remote engine). A `DATA_DIR` placed inside the checkout therefore has to be named
 `data…`; see `docs/DEPLOYMENT.md`. The runtime layer ships `/app/node_modules`,
-`/app/server/dist`, `/app/web/public` and `/app/docker`, runs as uid 10001, exposes 8080 and
-healthchecks `GET /api/health` with node's built-in `fetch` (there is no curl or wget in the
-image, so no compose file may override the healthcheck with one).
+`/app/server/dist`, `/app/web/public` and `/app/docker` (which is how the recipe **and** the
+tools build contexts, including `docker/tools/lib` and `docker/tools/agents`, reach the
+running server), runs as uid 10001, exposes 8080 and healthchecks `GET /api/health` with
+node's built-in `fetch` (there is no curl or wget in the image, so no compose file may
+override the healthcheck with one).
 
 Because it runs as a non-root uid, socket mode needs the docker group:
 

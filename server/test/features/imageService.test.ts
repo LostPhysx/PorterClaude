@@ -3,19 +3,25 @@ import { describe, expect, it, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { ImageService, parseClaudeVersion } from '../../src/images/service.js';
+import { ImageService, parseAgentManifest, parseClaudeVersion } from '../../src/images/service.js';
 import { RECIPES } from '../../src/images/recipes.js';
 import { IMAGE_LABELS } from '../../src/sessions/model.js';
 import { hashContext } from '../../src/images/tarContext.js';
 import {
+  generalConfig,
+  hostConfig,
   imageInspect,
+  otherHostConfig,
   serviceDeps,
   stubBackend,
-  stubBackendManager,
+  stubHostManager,
+  stubHosts,
   stubConfigStore,
   testPaths,
   TEST_HOST_ID,
 } from './helpers.js';
+import { TOOLS_AGENTS_ENV } from '../../src/agents/model.js';
+import { stubAgentRegistry } from './helpers.js';
 
 let dockerDir: string;
 
@@ -29,17 +35,32 @@ async function makeDockerDir(): Promise<string> {
   return root;
 }
 
-function makeService(backend = stubBackend()) {
-  const cfg = stubConfigStore([]);
-  const paths = testPaths({
+function imagePaths() {
+  return testPaths({
     dockerDir,
     recipesDir: path.join(dockerDir, 'recipes'),
     toolsDir: path.join(dockerDir, 'tools'),
   });
-  const service = new ImageService(
-    serviceDeps({ config: cfg.store, backends: stubBackendManager(backend.backend), paths }),
-  );
+}
+
+function makeService(backend = stubBackend(), opts: { host?: ReturnType<typeof hostConfig> } = {}) {
+  const cfg = stubConfigStore([]);
+  const hosts = stubHostManager(backend.backend, opts.host ? { host: opts.host } : {});
+  const service = new ImageService(serviceDeps({ config: cfg.store, hosts, paths: imagePaths() }));
   return { service, sb: backend };
+}
+
+/** two hosts with their own engines - jobs, images and tools volumes are per host. */
+function makeTwoHosts() {
+  const cfg = stubConfigStore([]);
+  const home = stubBackend();
+  const edge = stubBackend();
+  const hosts = stubHosts([
+    { host: hostConfig(), backend: home.backend },
+    { host: otherHostConfig(), backend: edge.backend, general: generalConfig({ volumePrefix: 'edge-' }) },
+  ]);
+  const service = new ImageService(serviceDeps({ config: cfg.store, hosts, paths: imagePaths() }));
+  return { service, home, edge };
 }
 
 async function settle(service: ImageService, jobId: string, tries = 50): Promise<void> {
@@ -397,9 +418,10 @@ describe('job registry', () => {
     await settle(service, first.id);
     const second = await service.pull(TEST_HOST_ID, 'nginx:1.27');
     await settle(service, second.id);
-    const jobs = service.listJobs();
+    const jobs = service.listJobs(TEST_HOST_ID);
     expect(jobs[0]?.id).toBe(second.id);
     expect(jobs[1]?.id).toBe(first.id);
+    expect(jobs.every((j) => j.hostId === TEST_HOST_ID)).toBe(true);
   });
 });
 
@@ -424,6 +446,107 @@ describe('syncTools', () => {
     const create = sb.log.find((c) => c.method === 'createContainer');
     expect((create?.args[0] as { mounts: unknown[] }).mounts).toEqual([
       { type: 'volume', source: 'porterclaude-tools', target: '/out', readOnly: false },
+    ]);
+  });
+
+  // the sync is what INSTALLS the agents of a host (backend.md v0.2 section 12.3)
+  it('hands PORTERCLAUDE_AGENTS to the populate container', async () => {
+    const cfg = stubConfigStore([]);
+    const sb = stubBackend();
+    const specs = [
+      {
+        id: 'claude',
+        command: 'claude',
+        versionCommand: ['claude', '--version'],
+        install: { kind: 'script' as const, url: 'https://claude.ai/install.sh' },
+      },
+    ];
+    const agents = stubAgentRegistry();
+    (agents as unknown as { installSpecsForHost: () => unknown }).installSpecsForHost = () => specs;
+    const service = new ImageService(
+      serviceDeps({
+        config: cfg.store,
+        hosts: stubHostManager(sb.backend),
+        agents,
+        paths: imagePaths(),
+      }),
+    );
+
+    const job = await service.syncTools(TEST_HOST_ID);
+    await settle(service, job.id);
+    expect(service.getJob(job.id)?.status).toBe('success');
+
+    const populate = sb.log
+      .filter((c) => c.method === 'createContainer')
+      .map((c) => c.args[0] as { name: string; env?: Record<string, string> })
+      .find((c) => c.name.startsWith('porterclaude-tools-sync-'));
+    expect(JSON.parse(populate?.env?.[TOOLS_AGENTS_ENV] ?? 'null')).toEqual(specs);
+    expect(service.getJobLines(job.id).lines.join(' ')).toContain('installing 1 agent(s): claude');
+    // a plain sync must NOT force: the installer then carries an unchanged agent over
+    expect(populate?.env?.PORTERCLAUDE_TOOLS_FORCE).toBeUndefined();
+
+    // OPS-3: `force` is the AGENT UPGRADE switch, not just an image rebuild. Without
+    // PORTERCLAUDE_TOOLS_FORCE=1 the installer carries every installed agent over (its spec
+    // does not change when upstream ships a release), so an agent could never be updated.
+    const forced = await service.syncTools(TEST_HOST_ID, { force: true });
+    await settle(service, forced.id);
+    expect(service.getJob(forced.id)?.status).toBe('success');
+    const forcedPopulate = sb.log
+      .filter((c) => c.method === 'createContainer')
+      .map((c) => c.args[0] as { name: string; env?: Record<string, string> })
+      .filter((c) => c.name.startsWith('porterclaude-tools-sync-'))
+      .pop();
+    expect(forcedPopulate?.env?.PORTERCLAUDE_TOOLS_FORCE).toBe('1');
+    expect(JSON.parse(forcedPopulate?.env?.[TOOLS_AGENTS_ENV] ?? 'null')).toEqual(specs);
+    expect(service.getJobLines(forced.id).lines.join(' ')).toContain(
+      'forced: every agent is reinstalled from source',
+    );
+  });
+
+  it('keeps the job successful when ONE agent failed to install', async () => {
+    const manifest = JSON.stringify({
+      syncedAt: '2026-08-16T10:00:00.000Z',
+      agents: [
+        { id: 'claude', command: 'claude', installed: true, version: '2.1.233' },
+        { id: 'opencode', command: 'opencode', installed: false, version: null, error: 'download failed: 404' },
+      ],
+    });
+    // the manifest is read out of the volume with a one-shot container built from the
+    // tools image, so the build has to leave that image behind
+    const sb: ReturnType<typeof stubBackend> = stubBackend({
+      containerLogs: async () => manifest,
+      buildImage: async (opts) => {
+        sb.images.set(opts.tag, imageInspect({ id: 'sha256:tools', tags: [opts.tag] }));
+      },
+    });
+    const { service } = makeService(sb, { host: hostConfig({ agents: { enabled: ['claude', 'opencode'] } }) });
+
+    const job = await service.syncTools(TEST_HOST_ID);
+    await settle(service, job.id);
+
+    expect(service.getJob(job.id)?.status).toBe('success');
+    const log = service.getJobLines(job.id).lines.join('\n');
+    expect(log).toContain('agent claude: installed (2.1.233)');
+    expect(log).toContain('WARNING: agent opencode was not installed: download failed: 404');
+
+    // ...and the manifest is what the status reports
+    const status = await service.toolsStatus(TEST_HOST_ID);
+    expect(status.hostId).toBe(TEST_HOST_ID);
+    expect(status.agents).toEqual([
+      {
+        id: 'claude',
+        installed: true,
+        version: '2.1.233',
+        installedAt: '2026-08-16T10:00:00.000Z',
+        error: null,
+      },
+      {
+        id: 'opencode',
+        installed: false,
+        version: null,
+        installedAt: '2026-08-16T10:00:00.000Z',
+        error: 'download failed: 404',
+      },
     ]);
   });
 
@@ -542,5 +665,255 @@ describe('validateCustomImage', () => {
     const result = await service.validateCustomImage(TEST_HOST_ID, 'nope:latest');
     expect(result.ok).toBe(false);
     expect(result.error).toContain('manifest unknown');
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// v0.2: everything is per host
+// ---------------------------------------------------------------------------
+describe('host scoping', () => {
+  it('does not let a build on host A block the same recipe on host B', async () => {
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const cfg = stubConfigStore([]);
+    const home = stubBackend({ buildImage: async () => gate });
+    const edge = stubBackend({ buildImage: async () => gate });
+    const hosts = stubHosts([
+      { host: hostConfig(), backend: home.backend },
+      { host: otherHostConfig(), backend: edge.backend },
+    ]);
+    const service = new ImageService(serviceDeps({ config: cfg.store, hosts, paths: imagePaths() }));
+
+    const first = await service.buildRecipe(TEST_HOST_ID, 'node');
+    // the SAME recipe on the SAME host is a conflict...
+    await expect(service.buildRecipe(TEST_HOST_ID, 'node')).rejects.toMatchObject({ code: 'conflict' });
+    // ...on another host it just runs
+    const second = await service.buildRecipe('edge', 'node');
+    expect(second.hostId).toBe('edge');
+    expect(first.hostId).toBe(TEST_HOST_ID);
+
+    release();
+    await settle(service, first.id);
+    await settle(service, second.id);
+  });
+
+  it('lists and looks up jobs per host', async () => {
+    const { service } = makeTwoHosts();
+    const home = await service.buildRecipe(TEST_HOST_ID, 'node');
+    await settle(service, home.id);
+    const edge = await service.buildRecipe('edge', 'python');
+    await settle(service, edge.id);
+
+    expect(service.listJobs(TEST_HOST_ID).map((j) => j.id)).toEqual([home.id]);
+    expect(service.listJobs('edge').map((j) => j.id)).toEqual([edge.id]);
+    // without a filter every job is visible (health/debug)
+    expect(service.listJobs().map((j) => j.id)).toEqual([edge.id, home.id]);
+
+    // a job of another host does not exist for this one
+    expect(service.getJob(home.id, 'edge')).toBeNull();
+    expect(service.getJob(home.id, TEST_HOST_ID)?.id).toBe(home.id);
+    expect(() => service.getJobLines(home.id, 0, 'edge')).toThrow();
+    expect(() => service.cancelJob(home.id, 'edge')).toThrow();
+  });
+
+  it('builds on the host that was asked, with that host s image namespace', async () => {
+    const { service, home, edge } = makeTwoHosts();
+    const job = await service.buildRecipe('edge', 'node');
+    await settle(service, job.id);
+    expect(edge.calls).toContain('buildImage');
+    expect(home.calls).not.toContain('buildImage');
+  });
+});
+
+describe('the agents of a host (AGENTS.json)', () => {
+  const manifest = {
+    syncedAt: '2026-08-16T09:00:00.000Z',
+    agents: [
+      { id: 'claude', command: 'claude', installed: true, version: '2.1.233', error: null },
+      { id: 'opencode', command: 'opencode', installed: false, version: null, error: 'download failed: 404' },
+    ],
+  };
+
+  function toolsBackend(logs: string) {
+    const sb = stubBackend({ containerLogs: async () => logs });
+    sb.images.set('porterclaude/tools:latest', imageInspect({ tags: ['porterclaude/tools:latest'] }));
+    sb.volumes.push({ name: 'porterclaude-tools', driver: 'local', labels: {} });
+    return sb;
+  }
+
+  it('reads the manifest out of the tools volume with a one-shot container', async () => {
+    const sb = toolsBackend(JSON.stringify(manifest));
+    const { service } = makeService(sb, { host: hostConfig({ agents: { enabled: ['claude', 'opencode'] } }) });
+
+    const agents = await service.agentStatuses(TEST_HOST_ID);
+    expect(agents).toEqual([
+      { id: 'claude', installed: true, version: '2.1.233', installedAt: manifest.syncedAt, error: null },
+      {
+        id: 'opencode',
+        installed: false,
+        version: null,
+        installedAt: manifest.syncedAt,
+        error: 'download failed: 404',
+      },
+    ]);
+
+    const probe = sb.log
+      .filter((c) => c.method === 'createContainer')
+      .map((c) => c.args[0] as { cmd?: string[]; mounts?: Array<{ source: string; readOnly?: boolean }> })
+      .at(-1);
+    expect(probe?.cmd?.[0]).toContain('AGENTS.json');
+    expect(probe?.mounts?.[0]).toMatchObject({ source: 'porterclaude-tools', readOnly: true });
+    expect(sb.calls).toContain('removeContainer');
+  });
+
+  it('caches the manifest instead of starting one container per poll', async () => {
+    const sb = toolsBackend(JSON.stringify(manifest));
+    const { service } = makeService(sb);
+    await service.agentStatuses(TEST_HOST_ID);
+    const containers = sb.calls.filter((c) => c === 'createContainer').length;
+    await service.agentStatuses(TEST_HOST_ID);
+    expect(sb.calls.filter((c) => c === 'createContainer').length).toBe(containers);
+  });
+
+  it('answers installed:false for every enabled agent when the host is unreachable', async () => {
+    const cfg = stubConfigStore([]);
+    const hosts = stubHosts([
+      { host: hostConfig({ agents: { enabled: ['claude', 'opencode'] } }), backend: null },
+    ]);
+    const service = new ImageService(serviceDeps({ config: cfg.store, hosts, paths: imagePaths() }));
+
+    const agents = await service.agentStatuses(TEST_HOST_ID);
+    expect(agents).toEqual([
+      { id: 'claude', installed: false, version: null, installedAt: null, error: null },
+      { id: 'opencode', installed: false, version: null, installedAt: null, error: null },
+    ]);
+    // ...and the panel still renders for that host
+    const status = await service.toolsStatus(TEST_HOST_ID);
+    expect(status).toMatchObject({ hostId: TEST_HOST_ID, present: false });
+    expect(status.agents).toHaveLength(2);
+  });
+
+  it('answers an empty list for an unknown host', async () => {
+    const { service } = makeService();
+    expect(await service.agentStatuses('nope')).toEqual([]);
+  });
+
+  it('degrades to installed:false when the volume has no manifest yet', async () => {
+    const sb = toolsBackend('cat: /out/AGENTS.json: No such file');
+    const { service } = makeService(sb, { host: hostConfig({ agents: { enabled: ['claude'] } }) });
+    expect(await service.agentStatuses(TEST_HOST_ID)).toEqual([
+      { id: 'claude', installed: false, version: null, installedAt: null, error: null },
+    ]);
+  });
+});
+
+describe('parseAgentManifest', () => {
+  it('reads the documented shape', () => {
+    const parsed = parseAgentManifest(
+      '{"syncedAt":"2026-08-16T09:00:00.000Z","agents":[{"id":"claude","command":"claude","installed":true,"version":"2.1.233"}]}',
+    );
+    expect(parsed).toEqual({
+      syncedAt: '2026-08-16T09:00:00.000Z',
+      agents: [{ id: 'claude', command: 'claude', installed: true, version: '2.1.233', error: null }],
+    });
+  });
+
+  it('survives a log line in front of the json (docker log framing, shell noise)', () => {
+    const parsed = parseAgentManifest('some warning\n{"syncedAt":"x","agents":[{"id":"a","installed":false}]}\n');
+    expect(parsed?.agents).toEqual([{ id: 'a', command: 'a', installed: false, version: null, error: null }]);
+  });
+
+  it.each(['', 'cat: no such file', '{', '{"agents":42}', 'null'])('answers null for %j', (raw) => {
+    expect(parseAgentManifest(raw)).toBeNull();
+  });
+
+  it('drops entries without an id', () => {
+    expect(parseAgentManifest('{"agents":[{"installed":true},{"id":"ok","installed":true}]}')?.agents).toEqual([
+      { id: 'ok', command: 'ok', installed: true, version: null, error: null },
+    ]);
+  });
+});
+
+// backend.md v0.2 section 12.4: without this copy every upgraded instance would ask for
+// /login again. It must run once, and it must never delete the v0.1 volumes.
+describe('the one-time legacy claude import', () => {
+  function legacyBackend(opts: { marker?: boolean } = {}) {
+    const sb = stubBackend({
+      containerLogs: async (id: string) => (opts.marker ? 'PC_IMPORT_SKIPPED' : `imported ${id}`),
+    });
+    sb.volumes.push({ name: 'porterclaude-claude', driver: 'local', labels: {} });
+    sb.volumes.push({ name: 'porterclaude-claude-home', driver: 'local', labels: {} });
+    return sb;
+  }
+
+  const importContainers = (sb: ReturnType<typeof stubBackend>) =>
+    sb.log
+      .filter((c) => c.method === 'createContainer')
+      .map((c) => c.args[0] as { name: string; user?: string; mounts?: Array<{ source: string; target: string; readOnly?: boolean }>; cmd?: string[] })
+      .filter((c) => c.name.startsWith('porterclaude-claude-import-'));
+
+  it('copies the v0.1 volumes into the claude auth volume exactly once', async () => {
+    const sb = legacyBackend();
+    const { service } = makeService(sb);
+
+    const first = await service.syncTools(TEST_HOST_ID);
+    await settle(service, first.id);
+    expect(service.getJob(first.id)?.status).toBe('success');
+
+    const runs = importContainers(sb);
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.user).toBe('0:0');
+    expect(runs[0]?.mounts).toEqual([
+      { type: 'volume', source: 'porterclaude-claude', target: '/legacy', readOnly: true },
+      { type: 'volume', source: 'porterclaude-claude-home', target: '/legacy-home', readOnly: true },
+      { type: 'volume', source: 'porterclaude-auth-claude', target: '/auth', readOnly: false },
+    ]);
+    const script = runs[0]?.cmd?.[0] ?? '';
+    expect(script).toContain('cp -a /legacy/. /auth/claude/');
+    expect(script).toContain('cp -a /legacy-home/.claude.json /auth/claude.json');
+    expect(script).toContain('.pc-import-v1');
+    // the old volumes are NEVER deleted (a rollback to v0.1 has to keep working)
+    expect(sb.calls).not.toContain('removeVolume');
+
+    // a second sync does not run it again
+    const second = await service.syncTools(TEST_HOST_ID);
+    await settle(service, second.id);
+    expect(importContainers(sb)).toHaveLength(1);
+  });
+
+  it('reports an already imported login (the marker inside the volume wins)', async () => {
+    const sb = legacyBackend({ marker: true });
+    const { service } = makeService(sb);
+    const job = await service.syncTools(TEST_HOST_ID);
+    await settle(service, job.id);
+    expect(service.getJobLines(job.id).lines.join(' ')).toContain('already imported');
+  });
+
+  it('does nothing on a fresh install that has no v0.1 volumes', async () => {
+    const sb = stubBackend();
+    const { service } = makeService(sb);
+    const job = await service.syncTools(TEST_HOST_ID);
+    await settle(service, job.id);
+    expect(importContainers(sb)).toHaveLength(0);
+    expect(service.getJob(job.id)?.status).toBe('success');
+  });
+
+  it('keeps the sync successful when the import container fails', async () => {
+    const sb = legacyBackend();
+    let waits = 0;
+    (sb.backend as unknown as { waitContainer: (id: string) => Promise<{ statusCode: number }> }).waitContainer =
+      async () => {
+        waits += 1;
+        // the populate container succeeds, the import container does not
+        return { statusCode: waits === 1 ? 0 : 9 };
+      };
+    const { service } = makeService(sb);
+    const job = await service.syncTools(TEST_HOST_ID);
+    await settle(service, job.id);
+    expect(service.getJob(job.id)?.status).toBe('success');
+    expect(service.getJobLines(job.id).lines.join(' ')).toContain('WARNING: importing the v0.1 claude login failed');
   });
 });

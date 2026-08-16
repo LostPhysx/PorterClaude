@@ -75,9 +75,11 @@ export function createImagesRouter(ctx: AppContext): Router {
     asyncHandler(async (req, res) => {
       const { id } = parseParams(JobParams, req);
       const { since } = parseQuery(SinceQuery, req);
-      const job = ctx.images.getJob(id);
+      // host-scoped on purpose: a job of ANOTHER host does not exist for this one (404)
+      const hostId = host(req);
+      const job = ctx.images.getJob(id, hostId);
       if (!job) throw AppError.notFound(`job '${id}' does not exist`);
-      const { lines, nextIndex } = ctx.images.getJobLines(id, since);
+      const { lines, nextIndex } = ctx.images.getJobLines(id, since, hostId);
       res.json({ job, lines, nextIndex });
     }),
   );
@@ -86,7 +88,7 @@ export function createImagesRouter(ctx: AppContext): Router {
     '/jobs/:id/cancel',
     asyncHandler(async (req, res) => {
       const { id } = parseParams(JobParams, req);
-      res.json({ job: ctx.images.cancelJob(id) });
+      res.json({ job: ctx.images.cancelJob(id, host(req)) });
     }),
   );
 

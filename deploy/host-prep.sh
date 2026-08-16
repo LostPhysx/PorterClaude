@@ -152,7 +152,9 @@ clean_qa_containers() {
   while IFS="$(printf '\t')" read -r cid name state; do
     [ -n "$cid" ] || continue
     # Named workspace/history volumes are only reachable through the container spec, so they
-    # have to be collected BEFORE the container disappears.
+    # have to be collected BEFORE the container disappears. The prefix list is deliberately
+    # short: the per-agent auth volumes (porterclaude-auth-<agentId>) hold the LOGINS and are
+    # shared by every session on the host — they must never be removed with a QA container.
     vols=""
     if api_get "$base/containers/$cid/json"; then
       vols="$(pyx mount-volumes --prefix porterclaude-ws- --prefix porterclaude-hist- \
@@ -220,8 +222,10 @@ prune_dangling_images() {
 # ---------------------------------------------------------------------------------------
 # --vhost : nginx-proxy per-host snippets
 # ---------------------------------------------------------------------------------------
-# The Portainer vhost carries the long-stream settings; the app vhost only needs the two
-# timeouts (terminals are idle WebSockets — buffering stays on for ordinary app traffic).
+# The Portainer vhost carries the long-stream settings — they cover the app-image build, the
+# recipe/tools image builds and the tools-sync container's log stream (a first sync downloads
+# the host's coding agents and runs for minutes). The app vhost only needs the two timeouts
+# (terminals are idle WebSockets — buffering stays on for ordinary app traffic).
 portainer_vhost_body() {
   cat <<'CONF'
 # PorterClaude (deploy/host-prep.sh --vhost): Portainer proxies long-running docker streams

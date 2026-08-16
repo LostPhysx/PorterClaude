@@ -59,6 +59,11 @@ jobs:
           # -x so the `. "$PC_TOOLS_SRC/lib/*.sh"` sources are followed via the
           # `# shellcheck source=` directives in the tools scripts.
           find deploy docker -type f -name '*.sh' -print0             | sort -z | xargs -0 shellcheck -x -S warning
+          # A skeleton silences its own "unused / never called" noise with a blanket header.
+          # None may survive in the shipped tree, or shellcheck above would be checking nothing.
+          if grep -rn 'shellcheck disable=SC2034,SC2119,SC2120,SC2317' deploy docker; then
+            echo "a blanket shellcheck-disable header survived"; exit 1
+          fi
       - name: python helpers compile
         run: |
           python3 -m compileall -q deploy/lib
@@ -134,15 +139,55 @@ jobs:
           fi
       - name: tools installer plan mode (no network, no writes)
         run: |
-          # orchestration.md §16/§18.2: --plan parses PORTERCLAUDE_AGENTS, prints the plan and
-          # touches nothing. Run it against an empty OUT and assert the directory stays empty.
+          # orchestration.md §16/§18.2: `--plan` parses PORTERCLAUDE_AGENTS, prints ONE line
+          # per agent ending in `-> agents/<id>`, writes nothing and reaches no network.
+          # One spec per install kind, so every branch of the driver is parsed here.
           out="$(mktemp -d)"
-          PORTERCLAUDE_AGENTS='[{"id":"claude","command":"claude","versionCommand":["claude","--version"],"install":{"kind":"script","url":"https://claude.ai/install.sh","binPath":"bin/claude"}},{"id":"gemini","command":"gemini","versionCommand":["gemini","--version"],"install":{"kind":"npm","package":"@google/gemini-cli","version":"latest","bin":"gemini"}},{"id":"aider","command":"aider","versionCommand":["aider","--version"],"install":{"kind":"pip","package":"aider-chat","bin":"aider","preferUv":true}}]'             OUT="$out" PORTERCLAUDE_TOOLS_MOUNT="$out/mount"             bash docker/tools/install-agents.sh --plan
+          specs='[
+            {"id":"claude","command":"claude","versionCommand":["claude","--version"],
+             "install":{"kind":"script","url":"https://claude.ai/install.sh","binPath":"bin/claude"}},
+            {"id":"opencode","command":"opencode","versionCommand":["opencode","--version"],
+             "install":{"kind":"script","url":"https://opencode.ai/install","binPath":"bin/opencode"}},
+            {"id":"gemini","command":"gemini","versionCommand":["gemini","--version"],
+             "install":{"kind":"npm","package":"@google/gemini-cli","version":"latest","bin":"gemini"}},
+            {"id":"aider","command":"aider","versionCommand":["aider","--version"],
+             "install":{"kind":"pip","package":"aider-chat","bin":"aider","preferUv":true}},
+            {"id":"demo-binary","command":"demo","versionCommand":["demo","--version"],
+             "install":{"kind":"binary","archive":"tar.gz","path":"dist/demo","urls":{
+               "linux-x64":"https://example.invalid/demo-x64.tar.gz",
+               "linux-arm64":"https://example.invalid/demo-arm64.tar.gz"}}}
+          ]'
+          if ! env PORTERCLAUDE_AGENTS="$specs" OUT="$out" PORTERCLAUDE_TOOLS_MOUNT="$out/mount" bash docker/tools/install-agents.sh --plan > /tmp/plan.txt 2>&1; then
+            echo "--plan exited non-zero:"; cat /tmp/plan.txt; exit 1
+          fi
+          cat /tmp/plan.txt
+          # exactly one plan line per agent, and no line for an agent that was not asked for
+          for row in "claude claude script" "opencode opencode script" "gemini gemini npm" "aider aider pip" "demo-binary demo binary"; do
+            set -- $row
+            n="$(grep -cE -- "\($2\):[[:space:]]+$3([[:space:]]|$).*->[[:space:]]*agents/$1[[:space:]]*$" /tmp/plan.txt || true)"
+            if [ "$n" != "1" ]; then
+              echo "expected exactly 1 plan line for $1 ($3), got $n"; exit 1
+            fi
+          done
+          total="$(grep -cE -- "->[[:space:]]*agents/" /tmp/plan.txt || true)"
+          if [ "$total" != "5" ]; then
+            echo "expected 5 plan lines in total, got $total"; exit 1
+          fi
+          # QA B-4: a kind:script installer must not be forced through /bin/sh (dash on
+          # debian) — opencode's installer is bash and dies on `set -o pipefail` there.
+          if grep -qE '[[:space:]]sh "\$installer"' docker/tools/lib/kinds.sh; then
+            echo "script installers must run under their interpreter (pc_script_interpreter), not plain sh"
+            exit 1
+          fi
+          grep -q 'pc_script_interpreter' docker/tools/lib/kinds.sh || {
+            echo "lib/kinds.sh lost pc_script_interpreter (QA B-4)"; exit 1; }
+          # a broken spec is a server bug, not an agent problem: refuse it before writing
+          if env PORTERCLAUDE_AGENTS='[{"id":' OUT="$out" bash docker/tools/install-agents.sh --plan >/dev/null 2>&1; then
+            echo "--plan accepted malformed PORTERCLAUDE_AGENTS"; exit 1
+          fi
           if [ -n "$(ls -A "$out")" ]; then
             echo "--plan wrote into OUT"; ls -la "$out"; exit 1
           fi
-          # TODO(O2, once install-agents.sh is implemented): assert one plan line per agent and
-          # that malformed JSON exits non-zero.
       - name: recipes ship no coding agent
         run: |
           # v0.2: agents come from the tools volume only (orchestration.md §15).
@@ -159,8 +204,23 @@ jobs:
           # … and every per-agent override must name an id the server actually ships
           for f in docker/tools/agents/*.sh; do
             id="$(basename "$f" .sh)"
-            grep -q "id: '$id'" server/src/agents/builtin.ts               || { echo "unknown agent override: $f"; exit 1; }
+            if ! grep -q "id: '$id'" server/src/agents/builtin.ts; then
+              echo "unknown agent override: $f (no such id in server/src/agents/builtin.ts)"; exit 1
+            fi
           done
+          # v0.1's claude-only downloader is folded into agents/claude.sh (change list §11.4)
+          if [ -e docker/tools/fetch-claude.sh ]; then
+            echo "docker/tools/fetch-claude.sh must be deleted in v0.2"; exit 1
+          fi
+          # AGENTS.json is the tools half of ToolsAgentManifest (server/src/agents/model.ts)
+          for key in syncedAt id command installed version error; do
+            grep -q "$key" server/src/agents/model.ts || { echo "model.ts lost $key"; exit 1; }
+            grep -q "$key" docker/tools/install-agents.sh || { echo "AGENTS.json writer lost $key"; exit 1; }
+          done
+          # installedAt belongs to the API view (HostAgentView), never to the volume manifest
+          if grep -q 'installedAt' docker/tools/install-agents.sh; then
+            echo "the AGENTS.json writer emits a key ToolsAgentManifest does not have"; exit 1
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: rendered-stack

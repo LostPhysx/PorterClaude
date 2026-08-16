@@ -1,6 +1,7 @@
 # PorterClaude release: multi-arch app image to ghcr.io on tags. OWNER: O2.
-# Spec: docs/design/orchestration.md §8. Recipe images are NOT released — they are built on
-# the target host by the app itself (see docker/README.md).
+# Spec: docs/design/orchestration.md §8. The recipe images and the tools image are NOT
+# released — the app builds them on each managed docker host itself, natively, and the
+# coding agents are installed into that host's tools volume at sync time (docker/README.md).
 name: release
 
 on:

@@ -1,28 +1,27 @@
-// OWNER: B2. Session lifecycle. Public API FROZEN — terminals/ws.ts and routes depend on it.
+// OWNER: B2. Session lifecycle, host- and agent-aware (v0.2).
 //
-// v0.2 SKELETON STATE (planner). The file still carries the v0.1 bodies so the repo
-// compiles and the existing tests keep running; B2 owns turning it host + agent aware:
+// Every docker call goes through the SESSION'S host — the global settings and the
+// deprecated default-host transport shim of v0.1 are gone:
+//   const general = this.deps.hosts.settingsFor(hostId);
+//   const backend = this.deps.hosts.backendFor(hostId);
+// A `HostScope` bundles both with the HostConfig so nothing below has to look them up twice.
 //
-//   1. EVERY docker call must go through the SESSION'S host:
-//        const hostId  = <from the stored config / the create input>;
-//        const general = this.deps.hosts.settingsFor(hostId);     // not config.general()
-//        const backend = this.deps.hosts.backendFor(hostId);      // not deps.backends.get()
-//      `deps.backends` is a deprecated shim pinned to the default host — no call site of it
-//      may survive (integration QA greps for it).
-//   2. `create()` resolves `input.hostId ?? defaultHostId` ONCE and stores it; `update()`
+//   1. `create()` resolves `input.hostId ?? defaultHostId` ONCE and stores it; `update()`
 //      rejects a different hostId with 422 (immutable — moving hosts = recreate elsewhere).
-//   3. Session NAMES are unique across hosts (api.md v0.2): the create conflict check must
-//      look at every stored session, and additionally at the containers of the TARGET host.
-//   4. `list()` must merge the containers of EVERY host (one listManagedContainers per host,
-//      failures degrade that host's sessions to status 'absent' + a warning — one dead host
-//      must never break the whole page), and honour `opts.hostId` as a filter.
-//   5. Agent awareness: `resolveAgents(cfg)` (below) feeds `buildContainerSpec`,
-//      `ensureAgentVolumes` creates one auth volume per agent, and the ownership repairs in
-//      `afterStart` must chown the agent dirs instead of ~/.claude.
-//   6. `reconcile()` reads `porterclaude.host` / `porterclaude.agents` back from the labels
-//      when adopting an orphan, and only lists hosts that are reachable.
+//   2. Session NAMES are unique across hosts (api.md v0.2): the create conflict check looks
+//      at every stored session and at the containers of the TARGET host. That invariant is
+//      what lets the terminal websocket route session -> host with nothing but the name.
+//   3. `list()` merges the containers of EVERY host (one listManagedContainers per host, in
+//      parallel); a failing host only degrades ITS sessions to status 'absent' + a warning,
+//      and a session whose host was deleted comes back with hostMissing:true.
+//   4. Agents: `resolveAgents(cfg)` feeds buildContainerSpec, `ensureAgentVolumes` creates
+//      one auth volume per agent, and the root repairs in `afterStart` chown the agent dirs
+//      (<containerHome>/.porterclaude/agents/<id>) and re-create the agent symlinks.
+//   5. `reconcile()` reads porterclaude.host / porterclaude.agents back from the labels when
+//      it adopts an orphan, and skips hosts it cannot reach.
 import type { ServiceDeps } from '../context.js';
 import type { GeneralConfig } from '../config/schema.js';
+import { GeneralConfigSchema } from '../config/schema.js';
 import type {
   ContainerInspect,
   ContainerState,
@@ -36,11 +35,20 @@ import { AppError, DockerApiError } from '../http/errors.js';
 import { getRecipe, recipeImageRef } from '../images/recipes.js';
 import { shortId } from '../util/ids.js';
 import { shQuote } from '../util/slug.js';
+import type { HostConfig } from '../hosts/model.js';
 import type { AgentDefinition } from '../agents/model.js';
+import {
+  agentAuthVolumeFor,
+  agentDataDir,
+  agentDataRoot,
+  agentHistoryTarget,
+  agentLinks,
+} from '../agents/model.js';
 import type { SessionConfig, SessionInput, SessionView } from './model.js';
 import {
   CONTAINER_LABELS,
   SessionNameSchema,
+  containerAgentIds,
   containerNameFor,
   historyVolumeFor,
   workspaceVolumeFor,
@@ -59,18 +67,21 @@ import {
 /** label of the short-lived helper containers; deliberately NOT porterclaude.managed. */
 const VOLUME_INIT_LABEL = 'porterclaude.volume-init';
 
-/** scratch mount of porterclaude-hist-<slug> inside the volume-init container. */
+/** label every auth volume carries so the UI/QA can tell whose login lives in it. */
+const VOLUME_AGENT_LABEL = 'porterclaude.agent';
+
+/** scratch mount prefix of a private history volume inside the volume-init container. */
 const HISTORY_INIT_MOUNT = '/pc-hist';
 
 /** uid:gid the recipe images give their session user - the canonical owner of the shared
- *  login volumes while they are still root-owned (docker/recipes/common.sh). */
+ *  agent volumes while they are still root-owned (docker/recipes/common.sh). */
 const SHARED_VOLUME_OWNER = '1000:1000';
 
 /** marker every file generated inside a container carries (docker/tools/entrypoint.sh). */
 const GENERATED_MARKER = '# porterclaude (generated) - do not duplicate';
 
 export interface RemoveOptions {
-  /** also delete porterclaude-ws-<slug> / porterclaude-hist-<slug> */
+  /** also delete <prefix>ws-<slug> / the per-agent <prefix>hist-<slug>[-<agent>] volumes */
   removeVolumes?: boolean;
   /** delete the stored config too (default true; false = keep definition, drop container) */
   forget?: boolean;
@@ -86,6 +97,27 @@ export interface ReconcileReport {
   adopted: string[];
   /** stored sessions whose container is gone */
   missing: string[];
+}
+
+/** What `resolveAgents` needs of a session (a stored config always satisfies it). */
+type SessionAgentRef = Pick<SessionConfig, 'name' | 'hostId' | 'agents'>;
+
+/** A host plus everything a session operation on it needs. */
+interface HostScope {
+  host: HostConfig;
+  general: GeneralConfig;
+  backend: DockerBackend;
+}
+
+/** One host's live state, gathered once per list()/reconcile() call. */
+interface HostScan {
+  host: HostConfig;
+  general: GeneralConfig;
+  backend: DockerBackend | null;
+  containers: ContainerSummary[];
+  inspects: Map<string, ContainerInspect>;
+  /** why this host contributed nothing (dead engine, missing credential, tcp/ssh, ...) */
+  warning: string | null;
 }
 
 /** docker 404 (missing container/volume/image) rather than a broken engine. */
@@ -138,30 +170,184 @@ export class SessionService {
   constructor(private readonly deps: ServiceDeps) {}
 
   // -------------------------------------------------------------------------
+  // hosts
+  // -------------------------------------------------------------------------
+
+  /** host + effective settings + live transport. Throws like `hosts.backendFor`. */
+  private scope(hostId: string): HostScope {
+    return this.scopeForHost(this.deps.hosts.require(hostId));
+  }
+
+  private scopeForHost(host: HostConfig): HostScope {
+    return {
+      host,
+      general: this.deps.hosts.settingsForHost(host),
+      backend: this.deps.hosts.backendFor(host.id),
+    };
+  }
+
+  /**
+   * Settings used to render a session whose host is GONE (deleted with force=1): the
+   * default host's, or the plain defaults when there is no host at all. Only ever used for
+   * cosmetics (container name, image ref) — such a session is read-only until its host
+   * exists again.
+   */
+  private settingsWithoutHost(): GeneralConfig {
+    const fallback = this.deps.hosts.defaultHostId();
+    if (fallback) {
+      try {
+        return this.deps.hosts.settingsFor(fallback);
+      } catch (err) {
+        this.deps.log.debug({ err, hostId: fallback }, 'settings of the default host unavailable');
+      }
+    }
+    return GeneralConfigSchema.parse({});
+  }
+
+  /** Gather one host's managed containers; never throws (a dead host is a warning). */
+  private async scanHost(host: HostConfig): Promise<HostScan> {
+    const general = this.deps.hosts.settingsForHost(host);
+    let backend: DockerBackend | null = null;
+    let containers: ContainerSummary[] = [];
+    let warning: string | null = null;
+    try {
+      backend = this.deps.hosts.backendFor(host.id);
+      containers = this.ownContainers(host, await this.listManagedContainers(backend));
+    } catch (err) {
+      warning = `docker backend unavailable: ${errMessage(err)}`;
+      containers = [];
+    }
+    const inspects = backend && containers.length ? await this.inspectAll(backend, containers) : new Map();
+    return { host, general, backend, containers, inspects, warning };
+  }
+
+  /**
+   * QA B-3: two hosts may point at the SAME engine (backend.md §12.1 — a socket host plus the
+   * imported Portainer endpoint of the same machine is the normal v0.1 -> v0.2 case). Both
+   * scans then see every `porterclaude.managed=true` container of that engine, so a container
+   * that explicitly belongs to ANOTHER configured host is dropped here: it is that host's scan
+   * to report. Without this every session showed up twice in GET /api/sessions (once matched,
+   * once as the other host's orphan), `?hostId=` leaked foreign rows and reconcile(adopt)
+   * stored other hosts' containers. Label-less (v0.1) containers and containers whose label
+   * names a host this install does not know stay with the scanning host.
+   */
+  private ownContainers(host: HostConfig, containers: ContainerSummary[]): ContainerSummary[] {
+    return containers.filter((container) => {
+      const label = container.labels[CONTAINER_LABELS.host];
+      if (!label || label === host.id) return true;
+      return !this.deps.hosts.get(label);
+    });
+  }
+
+  /**
+   * Second half of the same-engine rule (QA B-3): a container that carries NO usable
+   * `porterclaude.host` label (a v0.1 container, or one labelled for a host this install does
+   * not know) is visible in the scan of every host that points at that engine. Assign each of
+   * them to exactly one host — the one whose stored session or whose `containerPrefix` claims
+   * the name, else the default host, else the first scan — so nothing is listed (or adopted)
+   * twice. Container ids are engine-unique, so seeing one id in two scans means one engine.
+   */
+  private dedupeScans(scans: HostScan[]): HostScan[] {
+    if (scans.length < 2) return scans;
+    const seenIn = new Map<string, HostScan[]>();
+    for (const scan of scans) {
+      for (const container of scan.containers) {
+        const list = seenIn.get(container.id);
+        if (list) list.push(scan);
+        else seenIn.set(container.id, [scan]);
+      }
+    }
+
+    const configs = this.deps.config.listSessions();
+    const defaultHostId = this.deps.hosts.defaultHostId();
+    const owner = new Map<string, string>();
+    for (const [id, candidates] of seenIn) {
+      const first = candidates[0] as HostScan;
+      if (candidates.length === 1) {
+        owner.set(id, first.host.id);
+        continue;
+      }
+      const container = first.containers.find((c) => c.id === id) as ContainerSummary;
+      const claimed = candidates.find((scan) =>
+        configs.some(
+          (cfg) => cfg.hostId === scan.host.id && this.matchContainer([container], cfg.name, scan.general),
+        ));
+      const prefixed = candidates
+        .filter((scan) => container.name.startsWith(scan.general.containerPrefix))
+        .sort((a, b) => b.general.containerPrefix.length - a.general.containerPrefix.length)[0];
+      const fallback = candidates.find((scan) => scan.host.id === defaultHostId) ?? first;
+      owner.set(id, (claimed ?? prefixed ?? fallback).host.id);
+    }
+
+    return scans.map((scan) => ({
+      ...scan,
+      containers: scan.containers.filter((c) => owner.get(c.id) === scan.host.id),
+    }));
+  }
+
+  /**
+   * The host a scanned container belongs to: the `porterclaude.host` label when this install
+   * knows that host, else the host whose backend listed it (backend.md §13). A label naming an
+   * unknown host must never win — that produced dangling `hostMissing:true` sessions on adopt.
+   */
+  private hostIdForContainer(container: ContainerSummary, scanningHostId: string): string {
+    const label = container.labels[CONTAINER_LABELS.host];
+    return label && this.deps.hosts.get(label) ? label : scanningHostId;
+  }
+
+  // -------------------------------------------------------------------------
   // queries
   // -------------------------------------------------------------------------
 
-  /** Stored configs merged with live container state. Never throws when the backend is
-   *  down: returns configs with status 'absent' and a warning instead. */
+  /**
+   * Stored configs merged with live container state, across EVERY host. Never throws when a
+   * backend is down: those sessions come back with status 'absent' and a warning, the other
+   * hosts are unaffected. `opts.hostId` filters (api.md v0.2 `GET /api/sessions?hostId=`).
+   */
   async list(opts?: { hostId?: string }): Promise<SessionView[]> {
-    // TODO(B2): iterate over every host (or only opts.hostId) instead of the default one.
-    void opts;
-    const general = this.deps.config.general();
-    const configs = this.deps.config.listSessions();
+    const wanted = opts?.hostId;
+    const configs = this.deps.config.listSessions().filter((c) => !wanted || c.hostId === wanted);
 
-    let containers: ContainerSummary[] = [];
-    let backendWarning: string | null = null;
-    try {
-      const backend = this.deps.backends.get();
-      containers = await this.listManagedContainers(backend);
-    } catch (err) {
-      backendWarning = `docker backend unavailable: ${errMessage(err)}`;
+    // `?hostId=` narrows the scan itself: only that host's engine is contacted.
+    const hosts = this.deps.hosts.list().filter((h) => !wanted || h.id === wanted);
+    const scans = this.dedupeScans(await Promise.all(hosts.map((host) => this.scanHost(host))));
+    const byHost = new Map(scans.map((scan) => [scan.host.id, scan]));
+
+    const views: SessionView[] = [];
+    for (const scan of scans) {
+      views.push(...(await this.viewsForHost(scan, configs.filter((c) => c.hostId === scan.host.id))));
+    }
+    // sessions whose host was deleted (force): still listed, read-only, flagged
+    const dangling = configs.filter((c) => !byHost.has(c.hostId));
+    if (dangling.length) {
+      const general = this.settingsWithoutHost();
+      for (const cfg of dangling) {
+        views.push(
+          this.toView(cfg, null, null, general, {
+            hostName: cfg.hostId,
+            hostMissing: true,
+            warnings: [`host '${cfg.hostId}' no longer exists; this session is read-only`],
+          }),
+        );
+      }
     }
 
-    const inspects = await this.inspectAll(containers);
-    const views: SessionView[] = [];
+    views.sort((a, b) => a.name.localeCompare(b.name));
+    // `?hostId=` filters on the RESULT: a reconstructed config may resolve to another host
+    // than the one that scanned it (porterclaude.host label), and that row belongs to the
+    // labelled host, not to this filter.
+    return wanted ? views.filter((v) => v.hostId === wanted) : views;
+  }
 
-    const matched = configs.map((cfg) => ({ cfg, container: this.matchContainer(containers, cfg.name, general) }));
+  /** The views of one host: stored sessions first, then the orphan containers. */
+  private async viewsForHost(scan: HostScan, configs: SessionConfig[]): Promise<SessionView[]> {
+    const { general, containers, inspects, backend } = scan;
+    const hostWarnings = scan.warning ? [scan.warning] : [];
+
+    const matched = configs.map((cfg) => ({
+      cfg,
+      container: this.matchContainer(containers, cfg.name, general),
+    }));
     const used = new Set(matched.map((m) => m.container?.id).filter((id): id is string => Boolean(id)));
     const orphanContainers = containers.filter((c) => !used.has(c.id));
 
@@ -169,15 +355,19 @@ export class SessionService {
     // tell whether the container still runs what <ns>/<recipe>:latest points at, see
     // SessionView.imageOutdated) plus the images of the orphan containers (whose config is
     // reconstructed from them).
-    const images = await this.inspectRefs([
+    const images = await this.inspectRefs(backend, [
       ...matched.map((m) => resolvedImageRefFor(m.cfg, general)),
       ...orphanContainers.map((c) => c.image),
     ]);
 
+    const views: SessionView[] = [];
     for (const { cfg, container } of matched) {
-      const extra = backendWarning ? [backendWarning] : [];
       views.push(
-        this.toView(cfg, container, container ? inspects.get(container.id) ?? null : null, general, false, extra, images),
+        this.toView(cfg, container, container ? inspects.get(container.id) ?? null : null, general, {
+          hostName: scan.host.name,
+          images,
+          warnings: hostWarnings,
+        }),
       );
     }
 
@@ -186,7 +376,7 @@ export class SessionService {
       return {
         container,
         inspect,
-        cfg: this.synthesizeConfig(container, inspect, general, images.get(container.image) ?? null),
+        cfg: this.synthesizeConfig(container, inspect, general, scan.host.id, images.get(container.image) ?? null),
       };
     });
 
@@ -197,20 +387,25 @@ export class SessionService {
       .map((o) => resolvedImageRefFor(o.cfg, general))
       .filter((ref) => !images.has(ref));
     if (extraRefs.length) {
-      for (const [ref, image] of await this.inspectRefs(extraRefs)) images.set(ref, image);
+      for (const [ref, image] of await this.inspectRefs(backend, extraRefs)) images.set(ref, image);
     }
 
     for (const { container, inspect, cfg } of orphans) {
-      views.push(this.toView(cfg, container, inspect, general, true, [], images));
+      views.push(
+        this.toView(cfg, container, inspect, general, {
+          hostName: scan.host.name,
+          orphan: true,
+          images,
+        }),
+      );
     }
-
-    views.sort((a, b) => a.name.localeCompare(b.name));
     return views;
   }
 
   /** AppError.notFound when unknown. */
   async get(name: string): Promise<SessionView> {
-    const views = await this.list();
+    const stored = this.deps.config.getSession(name);
+    const views = await this.list(stored ? { hostId: stored.hostId } : undefined);
     const view = views.find((v) => v.name === name);
     if (!view) throw AppError.notFound(`session '${name}' does not exist`);
     return view;
@@ -221,54 +416,58 @@ export class SessionService {
   // -------------------------------------------------------------------------
 
   /**
-   * Create: validate the name is free (config + container), ensure the volumes exist,
-   * resolve the image, create the container, start it when autoStart, and persist the
-   * config only after a successful create (rolling the container back when persisting
-   * fails).
+   * Create on `input.hostId ?? defaultHostId`: validate the name is free (every stored
+   * session plus the containers of the TARGET host), ensure the volumes exist, resolve the
+   * image, create the container, start it when autoStart, and persist the config only after
+   * a successful create (rolling the container back when persisting fails).
    */
   async create(input: SessionInput): Promise<SessionView> {
-    const general = this.deps.config.general();
-    const backend = this.deps.backends.get();
+    const hostId = this.deps.hosts.requireHostId(input.hostId);
+    const scope = this.scope(hostId);
 
+    // names are unique ACROSS hosts (api.md v0.2)
     if (this.deps.config.getSession(input.name)) {
       throw AppError.conflict(`session '${input.name}' already exists`);
     }
-    const existing = this.matchContainer(await this.listManagedContainers(backend), input.name, general);
+    const existing = this.matchContainer(
+      await this.listManagedContainers(scope.backend),
+      input.name,
+      scope.general,
+    );
     if (existing) {
       throw AppError.conflict(
-        `a container named '${containerNameFor(general.containerPrefix, input.name)}' already exists`,
+        `a container named '${containerNameFor(scope.general.containerPrefix, input.name)}' ` +
+          `already exists on host '${hostId}'`,
       );
     }
 
     const now = new Date().toISOString();
-    // TODO(B2): resolve against the TARGET host (hosts.requireHostId(input.hostId)) and use
-    // its settings/backend above instead of the default host's.
     const cfg: SessionConfig = {
       ...input,
-      hostId: this.deps.hosts.requireHostId(input.hostId),
+      hostId,
       createdAt: now,
       updatedAt: now,
     };
 
-    const created = await this.createContainerFor(backend, cfg, general);
+    const created = await this.createContainerFor(scope, cfg);
     cfg.specHash = created.specHash;
 
     if (cfg.autoStart) {
       try {
-        await backend.startContainer(created.id);
+        await scope.backend.startContainer(created.id);
       } catch (err) {
-        await this.safeRemoveContainer(backend, created.id);
-        await this.removeFreshVolumes(backend, created.freshVolumes);
+        await this.safeRemoveContainer(scope.backend, created.id);
+        await this.removeFreshVolumes(scope.backend, created.freshVolumes);
         throw err;
       }
-      await this.afterStart(backend, cfg, general, created.id);
+      await this.afterStart(scope, cfg, created.id);
     }
 
     try {
       await this.deps.config.putSession(cfg);
     } catch (err) {
-      await this.safeRemoveContainer(backend, created.id);
-      await this.removeFreshVolumes(backend, created.freshVolumes);
+      await this.safeRemoveContainer(scope.backend, created.id);
+      await this.removeFreshVolumes(scope.backend, created.freshVolumes);
       throw err;
     }
 
@@ -286,8 +485,12 @@ export class SessionService {
         { path: ['name'], message: `expected '${name}'` },
       ]);
     }
-    // TODO(B2): 422 when input.hostId is set and differs from stored.hostId ("the host of a
-    // session is immutable; create the session on the other host instead").
+    if (input.hostId && input.hostId !== stored.hostId) {
+      throw AppError.validation(
+        'the host of a session is immutable; create the session on the other host instead',
+        [{ path: ['hostId'], message: `expected '${stored.hostId}'` }],
+      );
+    }
     const cfg: SessionConfig = {
       ...input,
       hostId: stored.hostId,
@@ -304,63 +507,64 @@ export class SessionService {
   }
 
   async start(name: string): Promise<SessionView> {
-    const general = this.deps.config.general();
-    const backend = this.deps.backends.get();
-    const containers = await this.listManagedContainers(backend);
-    const container = this.matchContainer(containers, name, general);
+    const { scope, container } = await this.locate(name);
     // An orphan (container labelled porterclaude.session=<name> with no stored config,
     // e.g. after losing /data) is adopted here instead of 404ing.
-    const cfg = await this.loadConfig(name, container);
+    const cfg = await this.loadConfig(name, scope, container);
 
     if (!container) {
-      const created = await this.createContainerFor(backend, cfg, general);
+      const created = await this.createContainerFor(scope, cfg);
       cfg.specHash = created.specHash;
       await this.deps.config.putSession(cfg);
-      await backend.startContainer(created.id);
-      await this.afterStart(backend, cfg, general, created.id);
+      await scope.backend.startContainer(created.id);
+      await this.afterStart(scope, cfg, created.id);
       return this.get(name);
     }
 
     if (container.state !== 'running') {
-      await backend.startContainer(container.id);
-      await this.afterStart(backend, cfg, general, container.id);
+      await scope.backend.startContainer(container.id);
+      await this.afterStart(scope, cfg, container.id);
     }
     return this.get(name);
   }
 
   async stop(name: string): Promise<SessionView> {
-    const general = this.deps.config.general();
-    const backend = this.deps.backends.get();
-    const container = this.matchContainer(await this.listManagedContainers(backend), name, general);
-    this.assertKnown(name, container);
+    const { scope, container } = await this.locate(name);
     if (container && container.state !== 'exited' && container.state !== 'created') {
-      await backend.stopContainer(container.id, { timeoutSec: 10 });
+      await scope.backend.stopContainer(container.id, { timeoutSec: 10 });
     }
     return this.get(name);
   }
 
   async restart(name: string): Promise<SessionView> {
-    const general = this.deps.config.general();
-    const backend = this.deps.backends.get();
-    const container = this.matchContainer(await this.listManagedContainers(backend), name, general);
-    this.assertKnown(name, container);
+    const { scope, container } = await this.locate(name);
     if (!container) throw AppError.conflict(`session '${name}' has no container; recreate it first`);
-    await backend.restartContainer(container.id, { timeoutSec: 10 });
+    await scope.backend.restartContainer(container.id, { timeoutSec: 10 });
     // Same post-start repairs as start(): the container layer survives a restart, but the
     // tools volume (and with it the bootstrap the server installs from the outside) may
     // have been updated in the meantime - a restart is how a user applies that. Orphans
     // are skipped on purpose: a restart must not adopt them (see reconcile).
     const stored = this.deps.config.getSession(name);
-    if (stored) await this.afterStart(backend, stored, general, container.id);
+    if (stored) await this.afterStart(scope, stored, container.id);
     return this.get(name);
   }
 
   async remove(name: string, opts?: RemoveOptions): Promise<void> {
-    const general = this.deps.config.general();
-    const backend = this.deps.backends.get();
-    const stored = this.deps.config.getSession(name);
-    const container = this.matchContainer(await this.listManagedContainers(backend), name, general);
-    if (!stored && !container) throw AppError.notFound(`session '${name}' does not exist`);
+    // A session whose host was deleted (force=1) has no engine to talk to any more, but it
+    // must still be deletable - otherwise it would be stuck in the list forever.
+    const dangling = this.deps.config.getSession(name);
+    if (dangling && !this.deps.hosts.get(dangling.hostId)) {
+      this.deps.log.warn(
+        { session: name, host: dangling.hostId },
+        'removing a session whose host is gone: dropping the definition only',
+      );
+      if (opts?.forget !== false) await this.deps.config.deleteSession(name);
+      this.warnings.delete(name);
+      return;
+    }
+
+    const { scope, container, stored } = await this.locate(name);
+    const { backend, general } = scope;
 
     if (container) {
       if (container.state === 'running' || container.state === 'restarting' || container.state === 'paused') {
@@ -378,10 +582,11 @@ export class SessionService {
     }
 
     if (opts?.removeVolumes) {
-      // ONLY the per-session volumes; the shared agent/tools volumes are never touched.
+      // ONLY the per-session volumes; the shared agent auth volumes and the tools volume are
+      // never touched (deleting an auth volume would drop the login of every session).
       for (const volume of [
         workspaceVolumeFor(general.volumePrefix, name),
-        ...this.historyVolumesFor(name, stored, general),
+        ...this.historyVolumesFor(name, stored ?? { hostId: scope.host.id, agents: null }, general),
       ]) {
         try {
           await backend.removeVolume(volume, { force: true });
@@ -396,21 +601,18 @@ export class SessionService {
   }
 
   async logs(name: string, opts?: { tail?: number; timestamps?: boolean }): Promise<string> {
-    const general = this.deps.config.general();
-    const backend = this.deps.backends.get();
-    const container = this.matchContainer(await this.listManagedContainers(backend), name, general);
-    this.assertKnown(name, container);
+    const { scope, container } = await this.locate(name);
     if (!container) throw AppError.conflict(`session '${name}' has no container`);
-    return backend.containerLogs(container.id, {
+    return scope.backend.containerLogs(container.id, {
       tail: opts?.tail ?? 200,
       timestamps: opts?.timestamps ?? false,
     });
   }
 
   /**
-   * Rebuild the view from container labels: report containers labelled
-   * porterclaude.managed=true that have no stored config, and flag stored sessions whose
-   * container disappeared.
+   * Rebuild the view from container labels, across every reachable host: report containers
+   * labelled porterclaude.managed=true that have no stored config, and flag stored sessions
+   * whose container disappeared. `opts.hostId` limits it to one host.
    *
    * `adopt` (the explicit POST /api/sessions/reconcile, never the startup call) persists a
    * definition reconstructed from those containers so they become editable again; those
@@ -420,113 +622,167 @@ export class SessionService {
    * reconstructed definition behind the user's back. start/recreate/update adopt on demand
    * as well (loadConfig).
    */
-  async reconcile(opts?: { adopt?: boolean }): Promise<ReconcileReport> {
-    const general = this.deps.config.general();
-    const backend = this.deps.backends.get();
-    const containers = await this.listManagedContainers(backend);
-    const configs = this.deps.config.listSessions();
+  async reconcile(opts?: { adopt?: boolean; hostId?: string }): Promise<ReconcileReport> {
+    const wanted = opts?.hostId;
+    const hosts = this.deps.hosts.list().filter((h) => !wanted || h.id === wanted);
+    const scans = this.dedupeScans(await Promise.all(hosts.map((host) => this.scanHost(host))));
 
     const orphans: string[] = [];
     const adopted: string[] = [];
     const missing: string[] = [];
-    const matched = new Set<string>();
+    let running = 0;
 
-    for (const cfg of configs) {
-      const container = this.matchContainer(containers, cfg.name, general);
-      if (container) matched.add(container.id);
-      else missing.push(cfg.name);
-    }
-    const orphanContainers = containers.filter((c) => !matched.has(c.id));
-    const inspects = opts?.adopt ? await this.inspectAll(orphanContainers) : new Map();
-    for (const container of orphanContainers) {
-      const label = container.labels[CONTAINER_LABELS.session] ?? container.name;
-      if (!opts?.adopt) {
-        orphans.push(label);
+    for (const scan of scans) {
+      const backend = scan.backend;
+      if (scan.warning || !backend) {
+        this.deps.log.warn(
+          { host: scan.host.id, reason: scan.warning ?? 'no transport' },
+          'reconcile skipped a host',
+        );
         continue;
       }
-      // Explicit user action: adopt the orphan so it becomes startable/editable again. It
-      // is reported as `adopted`, NOT as an orphan: by the time this response is written
-      // the session is stored and a following GET already says orphan:false.
-      try {
-        const cfg = await this.adopt(container, inspects.get(container.id) ?? null, general);
-        adopted.push(cfg.name);
-      } catch (err) {
-        this.deps.log.warn({ err, session: label }, 'adopting an orphan container failed');
-        orphans.push(label);
+      const configs = this.deps.config.listSessions().filter((c) => c.hostId === scan.host.id);
+      const matched = new Set<string>();
+      for (const cfg of configs) {
+        const container = this.matchContainer(scan.containers, cfg.name, scan.general);
+        if (container) matched.add(container.id);
+        else missing.push(cfg.name);
+      }
+      running += scan.containers.filter((c) => c.state === 'running').length;
+
+      for (const container of scan.containers.filter((c) => !matched.has(c.id))) {
+        const label = container.labels[CONTAINER_LABELS.session] ?? container.name;
+        if (!opts?.adopt) {
+          orphans.push(label);
+          continue;
+        }
+        // Explicit user action: adopt the orphan so it becomes startable/editable again. It
+        // is reported as `adopted`, NOT as an orphan: by the time this response is written
+        // the session is stored and a following GET already says orphan:false.
+        try {
+          const cfg = await this.adopt(
+            { host: scan.host, general: scan.general, backend },
+            container,
+            scan.inspects.get(container.id) ?? null,
+          );
+          adopted.push(cfg.name);
+        } catch (err) {
+          this.deps.log.warn({ err, session: label }, 'adopting an orphan container failed');
+          orphans.push(label);
+        }
       }
     }
 
-    const report: ReconcileReport = {
-      // after the (optional) adoption above, so the report describes the resulting state
-      known: this.deps.config.listSessions().length,
-      running: containers.filter((c) => c.state === 'running').length,
-      orphans,
-      adopted,
-      missing,
-    };
+    const known = this.deps.config
+      .listSessions()
+      .filter((c) => !wanted || c.hostId === wanted).length;
+    const report: ReconcileReport = { known, running, orphans, adopted, missing };
     this.deps.log.info({ report }, 'session reconcile');
     return report;
   }
 
   /**
-   * FROZEN SIGNATURE — used by TerminalService. Resolves a session name to a RUNNING
-   * container id. Throws AppError.notFound / AppError.conflict('session not running').
+   * FROZEN SIGNATURE (additive only) — used by TerminalService. Resolves a session name to a
+   * RUNNING container id on ITS host. Throws AppError.notFound / AppError.conflict('session
+   * not running'); a session whose host is gone throws so the websocket can answer 4411
+   * (terminals/service.ts maps it).
+   *
+   * `containerAgents` is what the CONTAINER really mounts (porterclaude.agents label, or the
+   * PORTERCLAUDE_AGENT_IDS env of a container whose label was lost), `null` for a v0.1
+   * container that carries neither. TerminalService gates `shell=agent:<id>` on it instead of
+   * on `agents ?? host.agents.enabled`: enabling an agent on the host does not retro-mount an
+   * auth volume into a container created before that, and running it anyway would start a
+   * fresh, unauthenticated instance.
    */
-  async requireRunningContainer(
-    name: string,
-  ): Promise<{ containerId: string; config: SessionConfig; hostId: string }> {
-    const general = this.deps.config.general();
-    const backend = this.deps.backends.get();
-    const containers = await this.listManagedContainers(backend);
-    const container = this.matchContainer(containers, name, general);
-    const stored = this.deps.config.getSession(name);
+  async requireRunningContainer(name: string): Promise<{
+    containerId: string;
+    config: SessionConfig;
+    hostId: string;
+    containerAgents: string[] | null;
+  }> {
+    const { scope, container, stored } = await this.locate(name, { requireContainer: false });
     if (!container) {
       if (!stored) throw AppError.notFound(`session '${name}' does not exist`);
       throw AppError.conflict(`session '${name}' is not running`);
     }
     if (container.state !== 'running') throw AppError.conflict(`session '${name}' is not running`);
-    const config = stored ?? this.synthesizeConfig(container, null, general);
-    return { containerId: container.id, config, hostId: config.hostId };
+    const config = stored ?? this.synthesizeConfig(container, null, scope.general, scope.host.id);
+    return {
+      containerId: container.id,
+      config,
+      hostId: config.hostId,
+      containerAgents: await this.containerAgents(scope, container),
+    };
   }
 
   /**
-   * Ensure the per-agent auth volumes of a session exist on ITS host (idempotent).
-   *
-   * TODO(B2): create `agentAuthVolumeFor(general.volumePrefix, agent.id)` for every agent of
-   * `resolveAgents(cfg)` (labels: porterclaude.managed=true, porterclaude.agent=<id>). The
-   * v0.1 shared claude volumes are NOT created any more — they only survive as the source of
-   * the one-time legacy import done by the tools sync (images/service.ts).
+   * `containerAgentIds` of a live container: the label first, and only when it is missing
+   * (v0.1 container, or one whose labels were stripped) one inspect for the env. The inspect
+   * is best effort — an engine hiccup here must not turn a terminal open into a 500, it just
+   * means "unknown" and the caller falls back to the configured agents.
    */
-  async ensureSharedVolumes(): Promise<void> {
-    const general = this.deps.config.general();
-    const backend = this.deps.backends.get();
-    for (const name of [general.sharedClaudeVolume, general.sharedClaudeHomeVolume]) {
-      await backend.createVolume({ name, labels: { [CONTAINER_LABELS.managed]: 'true' } });
+  private async containerAgents(
+    scope: HostScope,
+    container: ContainerSummary,
+  ): Promise<string[] | null> {
+    const fromLabel = containerAgentIds(container.labels);
+    if (fromLabel) return fromLabel;
+    try {
+      const inspect = await scope.backend.inspectContainer(container.id);
+      return containerAgentIds(container.labels, inspect.env);
+    } catch (err) {
+      this.deps.log.debug({ err, containerId: container.id }, 'reading the container agents failed');
+      return null;
+    }
+  }
+
+  /**
+   * Ensure the per-agent auth volumes of a session exist on ITS host (idempotent). The v0.1
+   * shared claude volumes are NOT created any more — they only survive as the source of the
+   * one-time legacy import done by the tools sync (images/service.ts).
+   */
+  async ensureAgentVolumes(scope: HostScope, agents: AgentDefinition[]): Promise<void> {
+    for (const agent of agents) {
+      await scope.backend.createVolume({
+        name: agentAuthVolumeFor(scope.general.volumePrefix, agent.id),
+        labels: { [CONTAINER_LABELS.managed]: 'true', [VOLUME_AGENT_LABEL]: agent.id },
+      });
     }
   }
 
   /**
    * The agents mounted into a session: `session.agents ?? host.agents.enabled`, resolved
-   * against the registry and sorted by id (the order goes into the spec hash).
-   *
-   * TODO(B2):
-   *   const host = this.deps.hosts.hostForSession(cfg);
-   *   return this.deps.agents.resolveForSession(host, cfg).sort((a, b) => a.id.localeCompare(b.id));
+   * against the registry and sorted by id (the order goes into the spec hash and into the
+   * porterclaude.agents label).
    */
-  resolveAgents(cfg: SessionConfig): AgentDefinition[] {
-    void cfg;
-    return [];
+  resolveAgents(cfg: SessionAgentRef): AgentDefinition[] {
+    const host = this.deps.hosts.hostForSession(cfg);
+    return [...this.deps.agents.resolveForSession(host, cfg)].sort((a, b) => a.id.localeCompare(b.id));
+  }
+
+  /** resolveAgents for a rendering path: a dangling host must not break the session list. */
+  private tryResolveAgents(cfg: SessionAgentRef): AgentDefinition[] {
+    try {
+      return this.resolveAgents(cfg);
+    } catch (err) {
+      this.deps.log.debug({ err, session: cfg.name }, 'resolving the agents of a session failed');
+      return [];
+    }
   }
 
   /**
-   * Private-history volume names of a session (one per agent that declares a historyPath).
-   *
-   * TODO(B2): derive from resolveAgents(cfg); `historyVolumeFor` keeps the v0.1 name for the
-   * claude agent, which is what makes an upgraded session keep its history.
+   * Private-history volume names of a session: one per resolved agent that declares a
+   * `historyPath`. `historyVolumeFor` keeps the v0.1 name for the claude agent, which is
+   * what makes an upgraded session keep its history.
    */
-  private historyVolumesFor(name: string, cfg: SessionConfig | null, general: GeneralConfig): string[] {
-    void cfg;
-    return [historyVolumeFor(general.volumePrefix, name, 'claude')];
+  private historyVolumesFor(
+    name: string,
+    cfg: Pick<SessionConfig, 'hostId' | 'agents'>,
+    general: GeneralConfig,
+  ): string[] {
+    return this.tryResolveAgents({ name, hostId: cfg.hostId, agents: cfg.agents })
+      .filter((agent) => Boolean(agent.historyPath))
+      .map((agent) => historyVolumeFor(general.volumePrefix, name, agent.id));
   }
 
   // -------------------------------------------------------------------------
@@ -534,38 +790,90 @@ export class SessionService {
   // -------------------------------------------------------------------------
 
   /**
+   * Find a session's host, and its container on that host. A stored session always resolves
+   * through its `hostId`; a session that only exists as a container (orphan after a /data
+   * loss) is searched for on every reachable host.
+   */
+  private async locate(
+    name: string,
+    opts?: { requireContainer?: boolean },
+  ): Promise<{ scope: HostScope; container: ContainerSummary | null; stored: SessionConfig | null }> {
+    const stored = this.deps.config.getSession(name) ?? null;
+    if (stored) {
+      const scope = this.scope(stored.hostId);
+      const container = this.matchContainer(
+        await this.listManagedContainers(scope.backend),
+        name,
+        scope.general,
+      );
+      return { scope, container, stored };
+    }
+
+    let fallback: HostScope | null = null;
+    for (const host of this.deps.hosts.list()) {
+      let scope: HostScope;
+      try {
+        scope = this.scopeForHost(host);
+      } catch (err) {
+        this.deps.log.debug({ err, host: host.id }, 'host unusable while locating a session');
+        continue;
+      }
+      fallback = fallback ?? scope;
+      let containers: ContainerSummary[];
+      try {
+        containers = await this.listManagedContainers(scope.backend);
+      } catch (err) {
+        this.deps.log.debug({ err, host: host.id }, 'listing containers while locating a session failed');
+        continue;
+      }
+      const container = this.matchContainer(containers, name, scope.general);
+      if (container) return { scope, container, stored: null };
+    }
+    if (opts?.requireContainer === false && fallback) return { scope: fallback, container: null, stored: null };
+    throw AppError.notFound(`session '${name}' does not exist`);
+  }
+
+  /**
    * The stored definition of a session, or - when `/data` was lost and only the container
    * survived - a definition synthesized from its labels/inspect which is then PERSISTED
    * (adopted). This is what makes start/recreate/update work on `orphan:true` sessions
    * instead of 404ing (backend.md section 7, "losing /data does not lose your sessions").
    */
-  private async loadConfig(name: string, known?: ContainerSummary | null): Promise<SessionConfig> {
+  private async loadConfig(
+    name: string,
+    knownScope?: HostScope,
+    known?: ContainerSummary | null,
+  ): Promise<SessionConfig> {
     const stored = this.deps.config.getSession(name);
     if (stored) return { ...stored };
 
-    const general = this.deps.config.general();
-    const backend = this.deps.backends.get();
-    const container =
-      known ?? this.matchContainer(await this.listManagedContainers(backend), name, general);
+    const located = known && knownScope ? { scope: knownScope, container: known } : await this.locate(name);
+    const { scope, container } = located;
     if (!container) throw AppError.notFound(`session '${name}' does not exist`);
 
     let inspect: ContainerInspect | null = null;
     try {
-      inspect = await backend.inspectContainer(container.id);
+      inspect = await scope.backend.inspectContainer(container.id);
     } catch (err) {
       this.deps.log.debug({ err, containerId: container.id }, 'inspect during adoption failed');
     }
-    return this.adopt(container, inspect, general);
+    return this.adopt(scope, container, inspect);
   }
 
   /** Persist a synthesized config for a managed container that has none. */
   private async adopt(
+    scope: HostScope,
     container: ContainerSummary,
     inspect: ContainerInspect | null,
-    general: GeneralConfig,
   ): Promise<SessionConfig> {
-    const images = await this.inspectRefs([container.image]);
-    const cfg = this.synthesizeConfig(container, inspect, general, images.get(container.image) ?? null);
+    const images = await this.inspectRefs(scope.backend, [container.image]);
+    const cfg = this.synthesizeConfig(
+      container,
+      inspect,
+      scope.general,
+      scope.host.id,
+      images.get(container.image) ?? null,
+    );
     if (!SessionNameSchema.safeParse(cfg.name).success) {
       throw AppError.conflict(
         `container '${container.name}' cannot be adopted: '${cfg.name}' is not a valid session name`,
@@ -574,15 +882,11 @@ export class SessionService {
     if (this.deps.config.getSession(cfg.name)) return { ...cfg };
     await this.deps.config.putSession(cfg);
     this.adopted.add(cfg.name);
-    this.deps.log.info({ session: cfg.name, containerId: container.id }, 'adopted orphan container');
+    this.deps.log.info(
+      { session: cfg.name, containerId: container.id, host: scope.host.id },
+      'adopted orphan container',
+    );
     return cfg;
-  }
-
-  /** A session exists when it is stored OR when a managed container carries its name. */
-  private assertKnown(name: string, container: ContainerSummary | null): void {
-    if (!container && !this.deps.config.getSession(name)) {
-      throw AppError.notFound(`session '${name}' does not exist`);
-    }
   }
 
   private async listManagedContainers(backend: DockerBackend): Promise<ContainerSummary[]> {
@@ -602,15 +906,12 @@ export class SessionService {
     );
   }
 
-  private async inspectAll(containers: ContainerSummary[]): Promise<Map<string, ContainerInspect>> {
+  private async inspectAll(
+    backend: DockerBackend | null,
+    containers: ContainerSummary[],
+  ): Promise<Map<string, ContainerInspect>> {
     const out = new Map<string, ContainerInspect>();
-    if (!containers.length) return out;
-    let backend: DockerBackend;
-    try {
-      backend = this.deps.backends.get();
-    } catch {
-      return out;
-    }
+    if (!backend || !containers.length) return out;
     const results = await Promise.allSettled(containers.map((c) => backend.inspectContainer(c.id)));
     results.forEach((res, i) => {
       if (res.status === 'fulfilled') out.set(containers[i]!.id, res.value);
@@ -621,16 +922,13 @@ export class SessionService {
   /** image inspects keyed by ref; missing/unreachable images map to nothing. Used to
    *  subtract the image's own env when reconstructing a config and to compare the image a
    *  container runs with the one its ref resolves to today. */
-  private async inspectRefs(wanted: string[]): Promise<Map<string, ImageInspect>> {
+  private async inspectRefs(
+    backend: DockerBackend | null,
+    wanted: string[],
+  ): Promise<Map<string, ImageInspect>> {
     const out = new Map<string, ImageInspect>();
     const refs = [...new Set(wanted.filter((r) => r.length > 0))];
-    if (!refs.length) return out;
-    let backend: DockerBackend;
-    try {
-      backend = this.deps.backends.get();
-    } catch {
-      return out;
-    }
+    if (!backend || !refs.length) return out;
     const results = await Promise.allSettled(refs.map((ref) => backend.inspectImage(ref)));
     results.forEach((res, i) => {
       if (res.status === 'fulfilled' && res.value) out.set(refs[i]!, res.value);
@@ -643,18 +941,19 @@ export class SessionService {
    *
    * The image is resolved FIRST: it is the step most likely to fail (a recipe that is not
    * built -> 409, a custom ref that cannot be pulled -> 502) and creating
-   * porterclaude-ws-<slug> before it would leave an empty volume behind that no session
+   * <prefix>ws-<slug> before it would leave an empty volume behind that no session
    * owns. Whatever this call does create is rolled back when a later step throws — but only
    * the volumes it created itself, never one that already held a workspace.
    */
   private async createContainerFor(
-    backend: DockerBackend,
+    scope: HostScope,
     cfg: SessionConfig,
-    general: GeneralConfig,
   ): Promise<{ id: string; specHash: string; warnings: string[]; freshVolumes: string[] }> {
-    const { ref: resolvedImage, imageEnvPath } = await this.resolveImage(backend, cfg, general);
+    const { backend, general } = scope;
+    const agents = this.resolveAgents(cfg);
+    const { ref: resolvedImage, imageEnvPath, imageCmd } = await this.resolveImage(scope, cfg);
 
-    await this.ensureSharedVolumes();
+    await this.ensureAgentVolumes(scope, agents);
 
     const wanted: string[] = [];
     const workspace = workspaceMountFor(cfg, general);
@@ -676,15 +975,16 @@ export class SessionService {
 
       const warnings: string[] = [];
       if (!cfg.shareHistory) {
-        warnings.push(...(await this.prepareHistoryVolume(backend, cfg, general, resolvedImage)));
+        warnings.push(...(await this.prepareHistoryVolumes(scope, cfg, agents, resolvedImage)));
       }
       const spec = buildContainerSpec({
         session: cfg,
         general,
-        agents: this.resolveAgents(cfg),
+        agents,
         resolvedImage,
         imageType: cfg.image.type,
         imageEnvPath,
+        imageCmd,
       });
       const created = await backend.createContainer(spec);
       return {
@@ -722,37 +1022,60 @@ export class SessionService {
   }
 
   /**
-   * shareHistory=false overlays porterclaude-hist-<slug> on <home>/.claude/projects, which
-   * lives INSIDE the shared claude volume. If that directory does not exist yet, docker
-   * creates it as root:root while setting the mount up - and the fresh history volume is
-   * root-owned too. The unprivileged session user could then write neither its own private
-   * history nor (once the root-owned directory is in the shared volume) the SHARED history
-   * of any other session.
+   * shareHistory=false overlays <prefix>hist-<slug>[-<agent>] on the agent's history
+   * directory, which lives INSIDE that agent's auth volume (agentHistoryTarget). If that
+   * directory does not exist yet, docker creates it as root:root while setting the mount up
+   * - and the fresh history volume is root-owned too. The unprivileged session user could
+   * then write neither its own private history nor (once the root-owned directory is in the
+   * auth volume) the SHARED history of any other session.
    *
-   * So before the session container is ever created we run a one-shot root container that
-   * mounts the shared volume at its real path (keeping docker's empty-volume seeding
-   * semantics intact) plus the history volume on a scratch path, creates `projects` and
-   * gives both the ownership of the shared volume root. Best effort: failures become
-   * session warnings, never a failed create.
+   * So before the session container is ever created we run ONE root container that mounts
+   * every affected auth volume at its real path (keeping docker's empty-volume seeding
+   * semantics intact) plus every history volume on a scratch path, creates the history
+   * directories and hands both to the owner of the auth volume. Best effort: failures
+   * become session warnings, never a failed create.
    */
-  private async prepareHistoryVolume(
-    backend: DockerBackend,
+  private async prepareHistoryVolumes(
+    scope: HostScope,
     cfg: SessionConfig,
-    general: GeneralConfig,
+    agents: AgentDefinition[],
     resolvedImage: string,
   ): Promise<string[]> {
-    const sharedTarget = sharedClaudeTargetFor(general);
-    const projects = historyMountTargetFor(general);
+    const { backend, general } = scope;
+    const home = containerHomeFor(general);
+    const withHistory = agents
+      .map((agent) => ({ agent, target: agentHistoryTarget(agent, home) }))
+      .filter((entry): entry is { agent: AgentDefinition; target: string } => Boolean(entry.target));
+    if (!withHistory.length) return [];
+
+    const mounts = withHistory.flatMap(({ agent }, i) => [
+      {
+        type: 'volume' as const,
+        source: agentAuthVolumeFor(general.volumePrefix, agent.id),
+        target: agentDataDir(home, agent.id),
+        readOnly: false,
+      },
+      {
+        type: 'volume' as const,
+        source: historyVolumeFor(general.volumePrefix, cfg.name, agent.id),
+        target: `${HISTORY_INIT_MOUNT}-${i}`,
+        readOnly: false,
+      },
+    ]);
+
     const script = [
       'set -u',
-      `own=$(stat -c '%u:%g' ${shQuote(sharedTarget)} 2>/dev/null || true)`,
-      `mkdir -p ${shQuote(projects)} || { echo "cannot create ${projects}" >&2; exit 1; }`,
-      'if [ -n "${own:-}" ]; then',
-      `  chown "$own" ${shQuote(projects)} ${HISTORY_INIT_MOUNT} 2>/dev/null || echo "chown $own failed" >&2;`,
-      `  chmod 0700 ${shQuote(projects)} ${HISTORY_INIT_MOUNT} 2>/dev/null || true;`,
-      'else',
-      '  echo "no stat(1): leaving ownership untouched" >&2;',
-      'fi',
+      ...withHistory.flatMap(({ agent, target }, i) => {
+        const dir = shQuote(agentDataDir(home, agent.id));
+        const scratch = `${HISTORY_INIT_MOUNT}-${i}`;
+        return [
+          `own=$(stat -c '%u:%g' ${dir} 2>/dev/null || true)`,
+          `case "\${own:-}" in ''|0:*) own=${shQuote(SHARED_VOLUME_OWNER)};; esac`,
+          `mkdir -p ${shQuote(target)} || { echo "cannot create ${target}" >&2; exit 1; }`,
+          `chown "$own" ${shQuote(target)} ${scratch} 2>/dev/null || echo "chown $own failed" >&2`,
+          `chmod 0700 ${shQuote(target)} ${scratch} 2>/dev/null || true`,
+        ];
+      }),
       'exit 0',
     ].join('\n');
 
@@ -766,19 +1089,7 @@ export class SessionService {
         entrypoint: ['/bin/sh', '-c'],
         cmd: [script],
         labels: { [VOLUME_INIT_LABEL]: cfg.name },
-        mounts: [
-          // TODO(B2): the seed volume is now the CLAUDE AGENT's auth volume
-          // (agentAuthVolumeFor(general.volumePrefix, agent.id)) and the target is
-          // agentHistoryTarget(agent, home); repeat the init for every agent with a
-          // historyPath instead of only for claude.
-          { type: 'volume', source: general.sharedClaudeVolume, target: sharedTarget, readOnly: false },
-          {
-            type: 'volume',
-            source: historyVolumeFor(general.volumePrefix, cfg.name, 'claude'),
-            target: HISTORY_INIT_MOUNT,
-            readOnly: false,
-          },
-        ],
+        mounts,
         tty: false,
         openStdin: false,
         init: true,
@@ -808,45 +1119,40 @@ export class SessionService {
   }
 
   /** Everything that has to happen inside a freshly started session container. */
-  private async afterStart(
-    backend: DockerBackend,
-    cfg: SessionConfig,
-    general: GeneralConfig,
-    containerId: string,
-  ): Promise<void> {
-    await this.ensureHomeWritable(backend, cfg, general, containerId);
-    await this.ensureSharedOwnership(backend, general, containerId);
-    await this.ensureProjectsDir(backend, general, containerId);
-    await this.seedGitWorkspace(backend, cfg, general, containerId);
+  private async afterStart(scope: HostScope, cfg: SessionConfig, containerId: string): Promise<void> {
+    const agents = this.tryResolveAgents(cfg);
+    await this.ensureHomeWritable(scope, cfg, agents, containerId);
+    await this.ensureAgentDirs(scope, cfg, agents, containerId);
+    await this.seedGitWorkspace(scope, cfg, containerId);
   }
 
   /**
    * Custom images that run as a NON-ROOT user (session `user` or an image `USER`) cannot
    * bootstrap themselves: docker creates the mountpoint parent <containerHome> in the
    * container layer as root:root 0755, so the tools entrypoint - which runs as that
-   * unprivileged uid - can write neither <home>/.profile / .bashrc (no PATH persistence,
-   * "cannot persist PATH in /home/dev/.profile") nor the <home>/.claude.json symlink into
-   * the shared login volume ("cannot link /home/dev/.claude.json"). The result is a session
-   * without a usable `claude`.
+   * unprivileged uid - can write neither <home>/.profile / .bashrc (no PATH persistence)
+   * nor the agent symlinks into <home>/.porterclaude. The result is a session without a
+   * usable agent.
    *
    * Nothing inside the container runs as root before the entrypoint, so the fix has to come
    * from outside: right after the start we exec `chown` as uid 0 (docker allows exec --user
    * even for containers running unprivileged) and then re-run the entrypoint's bootstrap
    * (`entrypoint.sh --porterclaude-bootstrap`, idempotent) as the session user, which now
-   * succeeds. A root-owned shared claude volume (fresh volume seeded by an image without
-   * <home>/.claude) is handed to the session user as well - never touched when it already
-   * belongs to somebody else (the recipes' uid 1000).
+   * succeeds. A root-owned agent directory (fresh volume seeded by an image that has none)
+   * is handed to the session user as well - never touched when it already belongs to
+   * somebody else (the recipes' uid 1000).
    *
    * Best effort throughout: a failure is logged, never fatal - PATH also comes from the
    * container env (buildContainerSpec) and from the terminal exec env.
    */
   private async ensureHomeWritable(
-    backend: DockerBackend,
+    scope: HostScope,
     cfg: SessionConfig,
-    general: GeneralConfig,
+    agents: AgentDefinition[],
     containerId: string,
   ): Promise<void> {
     if (cfg.image.type !== 'custom') return; // recipe images own <home> already
+    const { backend, general } = scope;
 
     let user = (cfg.user ?? '').trim();
     if (!user) {
@@ -865,24 +1171,24 @@ export class SessionService {
       '[ -d "$h" ] || mkdir -p "$h" 2>/dev/null || exit 0',
       `chown ${shQuote(user)} "$h" 2>/dev/null || echo "chown $h failed" >&2`,
       'chmod u+rwx "$h" 2>/dev/null || true',
-      // The shared volumes can only ever belong to ONE uid. This session may claim them
-      // while they are still root-owned (docker just created them) or still EMPTY - the
-      // latter matters since ensureSharedOwnership hands a fresh root-owned volume to the
-      // recipes' uid 1000, which would otherwise lock a uid-1500 image out of a volume
-      // that holds nothing yet. A volume with content keeps its owner.
-      'for d in "$h/.claude" "$h/.claude-home"; do',
+      // The agent volumes can only ever belong to ONE uid. This session may claim one while
+      // it is still root-owned (docker just created it) or still EMPTY - the latter matters
+      // since ensureAgentDirs hands a fresh root-owned volume to the recipes' uid 1000,
+      // which would otherwise lock a uid-1500 image out of a volume that holds nothing yet.
+      // A volume with content keeps its owner.
+      `for d in ${[shQuote(agentDataRoot(home)), ...agents.map((a) => shQuote(agentDataDir(home, a.id)))].join(' ')}; do`,
       '  [ -d "$d" ] || continue',
       `  own=$(stat -c '%u' "$d" 2>/dev/null || echo 1);`,
       '  [ "$own" = "0" ] || [ -z "$(ls -A "$d" 2>/dev/null)" ] || continue;',
       `  chown -R ${shQuote(user)} "$d" 2>/dev/null || echo "chown $d failed" >&2;`,
       'done',
-      // The two root-only bits of the entrypoint (install_claude_wrapper, the
-      // /etc/profile.d snippet): the re-bootstrap below runs as the SESSION user and can
-      // still not write either of them. They are what makes `claude` resolvable in a login
-      // shell whose /etc/profile hard-sets PATH (alpine, debian) and in a `docker exec`
-      // that starts from the standard PATH. Both are marker-guarded, so we never clobber a
-      // binary or a profile snippet the image itself shipped.
-      ...this.rootOnlyToolingScript(general),
+      // The root-only bits of the entrypoint (the agent wrappers, the /etc/profile.d
+      // snippet): the re-bootstrap below runs as the SESSION user and can still not write
+      // either of them. They are what makes the agents resolvable in a login shell whose
+      // /etc/profile hard-sets PATH (alpine, debian) and in a `docker exec` that starts from
+      // the standard PATH. Both are marker-guarded, so we never clobber a binary or a
+      // profile snippet the image itself shipped.
+      ...this.rootOnlyToolingScript(general, agents),
       'exit 0',
     ].join('\n');
 
@@ -910,21 +1216,22 @@ export class SessionService {
   }
 
   /**
-   * The two pieces of the tools bootstrap that only uid 0 can install, which the
-   * (unprivileged) entrypoint of a non-root custom image therefore always skips:
+   * The pieces of the tools bootstrap that only uid 0 can install, which the (unprivileged)
+   * entrypoint of a non-root custom image therefore always skips:
    *
    *   * `/etc/profile.d/porterclaude.sh` — sourced by every login shell AFTER
    *     `/etc/profile` has hard-set PATH (alpine and debian both do), so a `bash -l`
    *     terminal and the shells inside tmux panes find `<toolsMount>/bin` even when the
    *     rc files in `$HOME` are missing or unwritable;
-   *   * `/usr/local/bin/claude` — a wrapper on the standard PATH, so `claude` resolves in
-   *     any exec, whatever PATH it starts from.
+   *   * `/usr/local/bin/<agent command>` — a wrapper on the standard PATH per mounted
+   *     agent, so `claude` (or `opencode`, …) resolves in any exec, whatever PATH it
+   *     starts from.
    *
    * Both are skipped when the path exists without our marker: an image that ships its own
-   * `claude` or profile snippet keeps it. Pure string building, no I/O — the caller runs
+   * agent binary or profile snippet keeps it. Pure string building, no I/O — the caller runs
    * this as part of its root exec.
    */
-  private rootOnlyToolingScript(general: GeneralConfig): string[] {
+  private rootOnlyToolingScript(general: GeneralConfig, agents: AgentDefinition[]): string[] {
     const prefix = toolsPathPrefix(general);
     const profileBody = [
       GENERATED_MARKER,
@@ -938,97 +1245,133 @@ export class SessionService {
       'export TERM="${TERM:-xterm-256color}"',
       'export COLORTERM=truecolor',
     ].join('\n');
-    const wrapperBody = [
-      '#!/bin/sh',
-      GENERATED_MARKER,
-      `exec "${toolsMountFor(general)}/bin/claude" "$@"`,
-    ].join('\n');
     const mine = '"porterclaude (generated)"';
-    return [
-      'pcprof=/etc/profile.d/porterclaude.sh; pcwrap=/usr/local/bin/claude',
-      `pcprofbody=${shQuote(profileBody)}; pcwrapbody=${shQuote(wrapperBody)}`,
+    const lines = [
+      'pcprof=/etc/profile.d/porterclaude.sh',
+      `pcprofbody=${shQuote(profileBody)}`,
       `if mkdir -p /etc/profile.d 2>/dev/null && { [ ! -e "$pcprof" ] || grep -q ${mine} "$pcprof" 2>/dev/null; }; then`,
       '  printf \'%s\\n\' "$pcprofbody" > "$pcprof" 2>/dev/null && chmod 0644 "$pcprof" 2>/dev/null || echo "cannot write $pcprof" >&2',
       'fi',
-      `if mkdir -p /usr/local/bin 2>/dev/null && { [ ! -e "$pcwrap" ] || grep -q ${mine} "$pcwrap" 2>/dev/null; }; then`,
-      '  printf \'%s\\n\' "$pcwrapbody" > "$pcwrap" 2>/dev/null && chmod 0755 "$pcwrap" 2>/dev/null || echo "cannot write $pcwrap" >&2',
-      'fi',
     ];
+    // one wrapper per agent command; the command is user-supplied config, so it is quoted
+    const commands = [...new Set(agents.map((a) => a.command))].filter((c) => /^[A-Za-z0-9._-]+$/.test(c));
+    for (const command of commands) {
+      const wrapperBody = ['#!/bin/sh', GENERATED_MARKER, `exec "${toolsMountFor(general)}/bin/${command}" "$@"`].join('\n');
+      lines.push(
+        `pcwrap=${shQuote(`/usr/local/bin/${command}`)}`,
+        `pcwrapbody=${shQuote(wrapperBody)}`,
+        `if mkdir -p /usr/local/bin 2>/dev/null && { [ ! -e "$pcwrap" ] || grep -q ${mine} "$pcwrap" 2>/dev/null; }; then`,
+        '  printf \'%s\\n\' "$pcwrapbody" > "$pcwrap" 2>/dev/null && chmod 0755 "$pcwrap" 2>/dev/null || echo "cannot write $pcwrap" >&2',
+        'fi',
+      );
+    }
+    return lines;
   }
 
   /**
-   * The two shared login volumes (<home>/.claude, <home>/.claude-home) are used by EVERY
-   * session but only ONE uid can own them, and the recipes' session user is hard-wired to
-   * uid 1000 - a recipe session cannot chown anything. Two ways this used to break:
+   * The v0.2 replacement of v0.1's shared-volume repairs, run as uid 0 on every start
+   * (docker allows exec --user even for containers running unprivileged):
    *
-   *   * a session on a ROOT custom image writes .credentials.json / settings.json /
-   *     sessions/ as root:root, so a later recipe session can neither read the login nor
-   *     update the settings ("/theme" fails with EACCES);
-   *   * on a fresh install whose FIRST session is a root custom image, docker cannot
-   *     copy-up a <home>/.claude the image does not have, so the volume ROOT itself stays
-   *     root:root 0755 and uid 1000 can never write into it at all.
+   *   * create `<home>/.porterclaude/agents` and every agent directory — docker creates the
+   *     mountpoint parents as root:root, so an unprivileged session cannot write into them;
+   *   * hand the agent volumes to the owner of `<home>` (the recipes' uid 1000 when that is
+   *     still root, i.e. a freshly created, empty volume);
+   *   * re-create the agent symlinks (`~/.claude -> <agentDir>/claude`, …). The tools
+   *     entrypoint does the same from the inside, but a container created by an OLDER tools
+   *     volume, or one whose HOME is not writable by its user, needs the outside repair;
+   *   * create the history directory of every agent that declares one, so a shared-history
+   *     session finds it and a private one has a well-owned mount point.
    *
-   * So on every start we exec as uid 0 (docker allows that even for containers running
-   * unprivileged) and hand the whole tree to the owner of the volume root, falling back to
-   * the recipes' 1000:1000 while that owner is still root. The tools entrypoint does the
-   * same from the inside (`entrypoint.sh --porterclaude-share`, also called by the claude
-   * dispatcher after every run) - this half is what repairs recipe-only installations and
-   * sessions whose tools volume predates that change. Best effort, never fails a start.
+   * Never fails a start: every step swallows its own error.
    */
-  private async ensureSharedOwnership(
-    backend: DockerBackend,
-    general: GeneralConfig,
+  private async ensureAgentDirs(
+    scope: HostScope,
+    cfg: SessionConfig,
+    agents: AgentDefinition[],
     containerId: string,
   ): Promise<void> {
-    const claude = shQuote(sharedClaudeTargetFor(general));
-    const claudeHome = shQuote(`${containerHomeFor(general)}/.claude-home`);
+    const { backend, general } = scope;
+    const home = containerHomeFor(general);
+    const root = agentDataRoot(home);
+    const user = (cfg.user ?? '').trim();
+
     const script = [
       'set -u',
-      `c=${claude}; h=${claudeHome}`,
-      `own=$(stat -c '%u:%g' "$c" 2>/dev/null || echo)`,
-      `case "\${own:-}" in ''|0:*) own=$(stat -c '%u:%g' "$h" 2>/dev/null || echo);; esac`,
+      `h=${shQuote(home)}; r=${shQuote(root)}`,
+      'mkdir -p "$r" 2>/dev/null || true',
+      user ? `own=${shQuote(user)}` : 'own=',
+      `case "\${own:-}" in '') own=$(stat -c '%u:%g' "$h" 2>/dev/null || echo);; esac`,
       `case "\${own:-}" in ''|0:*) own=${shQuote(SHARED_VOLUME_OWNER)};; esac`,
-      'for d in "$c" "$h"; do',
-      '  [ -d "$d" ] || continue',
-      '  chown -R "$own" "$d" 2>/dev/null || echo "chown $d failed" >&2',
-      'done',
-      '[ -f "$c/.credentials.json" ] && chmod 0600 "$c/.credentials.json" 2>/dev/null',
+      'chown "$own" "$r" 2>/dev/null || true',
+      ...agents.flatMap((agent) => {
+        const dir = shQuote(agentDataDir(home, agent.id));
+        const history = agentHistoryTarget(agent, home);
+        const lines = [
+          `mkdir -p ${dir} 2>/dev/null || true`,
+          `chown -R "$own" ${dir} 2>/dev/null || echo "chown ${agent.id} failed" >&2`,
+        ];
+        for (const link of agentLinks(agent, home)) {
+          const target = shQuote(link.target);
+          const source = shQuote(link.source);
+          // An image may SHIP the agent's path (the v0.1 recipes create ~/.claude): that
+          // real directory would shadow the auth volume and the login would silently live
+          // in the container layer. It is replaced by the symlink - after its content is
+          // copied into the still empty auth volume, so nothing is lost. Only paths BELOW
+          // the container home are ever replaced (an agent definition is user-supplied
+          // config; `~` or `/` must never turn into an `rm -rf`).
+          const replaceable = link.target.startsWith(`${home}/`) && link.target.length > home.length + 1;
+          lines.push(
+            link.kind === 'dir'
+              ? `mkdir -p ${source} 2>/dev/null || true`
+              : `mkdir -p "$(dirname ${source})" 2>/dev/null || true`,
+            `mkdir -p "$(dirname ${target})" 2>/dev/null || true`,
+            `if [ -L ${target} ] || [ ! -e ${target} ]; then`,
+            `  ln -sfn ${source} ${target} 2>/dev/null || echo "cannot link ${link.target}" >&2`,
+            `  chown -h "$own" ${target} 2>/dev/null || true`,
+            ...(replaceable
+              ? [
+                  `elif [ -d ${target} ]; then`,
+                  `  if [ -z "$(ls -A ${source} 2>/dev/null)" ] && [ -n "$(ls -A ${target} 2>/dev/null)" ]; then`,
+                  `    cp -a ${target}/. ${source}/ 2>/dev/null || true`,
+                  '  fi',
+                  `  rm -rf ${target} 2>/dev/null && ln -sfn ${source} ${target} 2>/dev/null &&`,
+                  `    chown -h "$own" ${target} 2>/dev/null || echo "cannot replace ${link.target}" >&2`,
+                  `elif [ -f ${target} ]; then`,
+                  `  [ -e ${source} ] || cp -a ${target} ${source} 2>/dev/null || true`,
+                  `  rm -f ${target} 2>/dev/null && ln -sfn ${source} ${target} 2>/dev/null &&`,
+                  `    chown -h "$own" ${target} 2>/dev/null || echo "cannot replace ${link.target}" >&2`,
+                ]
+              : []),
+            'fi',
+            `chown -R "$own" ${source} 2>/dev/null || true`,
+          );
+        }
+        if (history) {
+          lines.push(
+            `mkdir -p ${shQuote(history)} 2>/dev/null || true`,
+            `chown "$own" ${shQuote(history)} 2>/dev/null || true`,
+          );
+        }
+        // credentials must never be world readable
+        lines.push(
+          `find ${dir} -maxdepth 2 -name '.credentials.json' -exec chmod 0600 {} \\; 2>/dev/null || true`,
+        );
+        return lines;
+      }),
       'exit 0',
     ].join('\n');
+
     try {
       await backend.runExec(containerId, ['sh', '-c', script], { user: '0', timeoutMs: 30_000 });
     } catch (err) {
-      this.deps.log.debug({ err, containerId }, 'repairing the shared volume ownership failed (ignored)');
-    }
-  }
-
-  /**
-   * Self-healing counterpart of prepareHistoryVolume: make sure <home>/.claude/projects
-   * exists and is owned like <home>/.claude. For a shared session that repairs the shared
-   * volume (e.g. damaged by an older build), for a private one it fixes the history volume
-   * root. Runs as root, best effort, never fails a start.
-   */
-  private async ensureProjectsDir(
-    backend: DockerBackend,
-    general: GeneralConfig,
-    containerId: string,
-  ): Promise<void> {
-    const shared = shQuote(sharedClaudeTargetFor(general));
-    const projects = shQuote(historyMountTargetFor(general));
-    const script =
-      `own=$(stat -c '%u:%g' ${shared} 2>/dev/null || true); mkdir -p ${projects} 2>/dev/null || exit 0; ` +
-      `[ -n "\${own:-}" ] && chown "$own" ${projects} 2>/dev/null; exit 0`;
-    try {
-      await backend.runExec(containerId, ['sh', '-c', script], { user: '0', timeoutMs: 15_000 });
-    } catch (err) {
-      this.deps.log.debug({ err, containerId }, 'ensuring ~/.claude/projects failed (ignored)');
+      this.deps.log.debug({ err, containerId }, 'repairing the agent directories failed (ignored)');
     }
   }
 
   /** stop -> remove -> create -> start (used by update/recreate). */
   private async replaceContainer(cfg: SessionConfig): Promise<SessionView> {
-    const general = this.deps.config.general();
-    const backend = this.deps.backends.get();
+    const scope = this.scope(cfg.hostId);
+    const { backend, general } = scope;
     const previous = this.matchContainer(await this.listManagedContainers(backend), cfg.name, general);
     const wasRunning = previous?.state === 'running';
 
@@ -1047,25 +1390,26 @@ export class SessionService {
       }
     }
 
-    const created = await this.createContainerFor(backend, cfg, general);
+    const created = await this.createContainerFor(scope, cfg);
     cfg.specHash = created.specHash;
     await this.deps.config.putSession(cfg);
 
     if (wasRunning || cfg.autoStart) {
       await backend.startContainer(created.id);
-      await this.afterStart(backend, cfg, general, created.id);
+      await this.afterStart(scope, cfg, created.id);
     }
     if (created.warnings.length) this.addWarnings(cfg.name, created.warnings);
     return this.get(cfg.name);
   }
 
-  /** Resolve the image ref and read the PATH it declares (needed for the container PATH
-   *  of custom images, see container.ts composeToolsPath). */
+  /** Resolve the image ref and read the PATH it declares (needed for the container PATH,
+   *  see container.ts composeToolsPath) plus its Cmd (which the create request has to
+   *  repeat verbatim, see container.ts imageCmd). */
   private async resolveImage(
-    backend: DockerBackend,
+    scope: HostScope,
     cfg: SessionConfig,
-    general: GeneralConfig,
-  ): Promise<{ ref: string; imageEnvPath: string | null }> {
+  ): Promise<{ ref: string; imageEnvPath: string | null; imageCmd: string[] | null }> {
+    const { backend, general } = scope;
     if (cfg.image.type === 'recipe') {
       const recipe = getRecipe(cfg.image.recipe);
       if (!recipe) throw AppError.notFound(`unknown recipe '${cfg.image.recipe}'`);
@@ -1076,7 +1420,7 @@ export class SessionService {
           `recipe image '${ref}' is not built yet — build it in Settings → Images first`,
         );
       }
-      return { ref, imageEnvPath: envValue(inspect.env, 'PATH') };
+      return { ref, imageEnvPath: envValue(inspect.env, 'PATH'), imageCmd: inspect.cmd ?? null };
     }
 
     const ref = cfg.image.ref;
@@ -1089,7 +1433,7 @@ export class SessionService {
         this.deps.log.debug({ err, ref }, 'inspecting the pulled image failed (ignored)');
       }
     }
-    return { ref, imageEnvPath: envValue(inspect?.env, 'PATH') };
+    return { ref, imageEnvPath: envValue(inspect?.env, 'PATH'), imageCmd: inspect?.cmd ?? null };
   }
 
   private async safeRemoveContainer(backend: DockerBackend, id: string): Promise<void> {
@@ -1102,19 +1446,18 @@ export class SessionService {
 
   /** git workspaces are seeded on first start; failures are warnings, never errors. */
   private async seedGitWorkspace(
-    backend: DockerBackend,
+    scope: HostScope,
     cfg: SessionConfig,
-    general: GeneralConfig,
     containerId: string,
   ): Promise<void> {
     if (cfg.workspace.type !== 'git') return;
-    const target = general.workspaceMount;
+    const target = scope.general.workspaceMount;
     const branch = cfg.workspace.branch ? ` --branch ${shQuote(cfg.workspace.branch)}` : '';
     const script =
       `set -e; if [ -z "$(ls -A ${shQuote(target)} 2>/dev/null)" ]; then ` +
       `git clone${branch} ${shQuote(cfg.workspace.url)} ${shQuote(target)}; fi`;
     try {
-      const res = await backend.runExec(containerId, ['sh', '-lc', script], { timeoutMs: 300_000 });
+      const res = await scope.backend.runExec(containerId, ['sh', '-lc', script], { timeoutMs: 300_000 });
       if (res.exitCode !== 0) {
         this.addWarnings(cfg.name, [
           `git clone failed (exit ${res.exitCode}): ${(res.stderr || res.stdout).trim().slice(0, 400)}`,
@@ -1136,11 +1479,18 @@ export class SessionService {
     container: ContainerSummary | null,
     inspect: ContainerInspect | null,
     general: GeneralConfig,
-    orphan: boolean,
-    extraWarnings: string[],
-    images: Map<string, ImageInspect> = new Map(),
+    opts: {
+      hostName: string;
+      hostMissing?: boolean;
+      orphan?: boolean;
+      images?: Map<string, ImageInspect>;
+      /** warnings that belong to this render pass (dead host, missing host) */
+      warnings?: string[];
+    },
   ): SessionView {
-    const warnings = [...(this.warnings.get(cfg.name) ?? []), ...extraWarnings];
+    const orphan = opts.orphan ?? false;
+    const images = opts.images ?? new Map<string, ImageInspect>();
+    const warnings = [...(this.warnings.get(cfg.name) ?? []), ...(opts.warnings ?? [])];
     const status: ContainerState | 'absent' = container ? container.state : 'absent';
     const startedAt = inspect?.startedAt ?? null;
     const running = container?.state === 'running';
@@ -1148,6 +1498,15 @@ export class SessionService {
       running && startedAt ? Math.max(0, Math.round((Date.now() - Date.parse(startedAt)) / 1000)) : null;
 
     const resolvedImage = resolvedImageRefFor(cfg, general);
+    // what the session SHOULD mount (drives the spec hash / needsRecreate below) ...
+    const agents = this.tryResolveAgents(cfg);
+    // ... and what its container really mounts, which is what the UI must offer as agent
+    // panes: enabling an agent on the host does not retro-mount it into a running container
+    // (that is exactly the needsRecreate case), and the terminal would refuse it with 4410.
+    const mounted = container ? containerAgentIds(container.labels, inspect?.env) : null;
+    const resolvedAgents = (mounted ?? agents.map((a) => a.id)).filter((id) =>
+      Boolean(this.deps.agents.get(id)),
+    );
 
     const runtimePorts: PortBinding[] = inspect?.ports ?? container?.ports ?? [];
 
@@ -1157,12 +1516,14 @@ export class SessionService {
         const spec = buildContainerSpec({
           session: cfg,
           general,
-          agents: this.resolveAgents(cfg),
+          agents,
           resolvedImage,
           imageType: cfg.image.type,
           // recover the image PATH the container was created with, otherwise the recomputed
-          // hash of a custom-image session would never match (container.ts composeToolsPath)
+          // hash of a session would never match (container.ts composeToolsPath)
           imageEnvPath: imagePathFromEnv(inspect?.env, general),
+          // ... and the Cmd it was created with, for the same reason (container.ts imageCmd)
+          imageCmd: inspect?.cmd ?? null,
         });
         const wanted = spec.labels?.[CONTAINER_LABELS.specHash];
         const actual = container.labels[CONTAINER_LABELS.specHash];
@@ -1195,11 +1556,9 @@ export class SessionService {
 
     return {
       ...cfg,
-      // TODO(B2): hostName = the host's name, hostMissing = hosts.get(cfg.hostId) === null,
-      // resolvedAgents = resolveAgents(cfg).map((a) => a.id).
-      hostName: cfg.hostId,
-      hostMissing: false,
-      resolvedAgents: this.resolveAgents(cfg).map((a) => a.id),
+      hostName: opts.hostName,
+      hostMissing: opts.hostMissing ?? false,
+      resolvedAgents,
       status,
       containerId: container?.id ?? null,
       containerName: container?.name ?? containerNameFor(general.containerPrefix, cfg.name),
@@ -1218,9 +1577,12 @@ export class SessionService {
   /**
    * Best-effort SessionConfig for a managed container with no stored definition (adoption
    * after /data loss). Everything that survives in the container is reconstructed -
-   * env, published ports, extra mounts, cpu/memory limits, network, restart policy and
-   * user - because the adopted definition is what a later Recreate/Edit rebuilds from:
-   * dropping a port mapping or an env var here would silently break the session.
+   * host, agents, env, published ports, extra mounts, cpu/memory limits, network, restart
+   * policy and user - because the adopted definition is what a later Recreate/Edit rebuilds
+   * from: dropping a port mapping or an env var here would silently break the session.
+   *
+   * `hostId` is the host whose backend listed the container; the porterclaude.host label
+   * wins when it is present (a container created by v0.2).
    *
    * `image` is the ImageInspect of the container image when available; its env/user are
    * subtracted so that only what PorterClaude (or the user) added ends up in the config.
@@ -1229,13 +1591,18 @@ export class SessionService {
     container: ContainerSummary,
     inspect: ContainerInspect | null,
     general: GeneralConfig,
+    hostId: string,
     image?: ImageInspect | null,
   ): SessionConfig {
     const prefix = general.containerPrefix;
     const name =
       container.labels[CONTAINER_LABELS.session] ??
       (container.name.startsWith(prefix) ? container.name.slice(prefix.length) : container.name);
-    const recipe = container.labels[CONTAINER_LABELS.recipe];
+    // docker merges the IMAGE labels into the container's, so a custom session whose ref
+    // happens to be a recipe image reports porterclaude.recipe as well - our own
+    // image-type label decides
+    const imageType = container.labels[CONTAINER_LABELS.imageType];
+    const recipe = imageType === 'custom' ? undefined : container.labels[CONTAINER_LABELS.recipe];
     const createdAt =
       container.labels[CONTAINER_LABELS.createdAt] ??
       new Date(container.createdAt * 1000).toISOString();
@@ -1252,30 +1619,44 @@ export class SessionService {
         : { type: 'volume', volume: workspaceMount.name ?? workspaceVolumeFor(general.volumePrefix, name) }
       : { type: 'volume' };
 
-    const historyTarget = historyMountTargetFor(general);
-    const shareHistory = !mounts.some((m) => m.destination === historyTarget);
+    // v0.2 history volumes live inside the agent dir; v0.1 ones at ~/.claude/projects
+    const historyPrefix = `${general.volumePrefix}hist-${name}`;
+    const shareHistory = !mounts.some(
+      (m) =>
+        m.destination === historyMountTargetFor(general) ||
+        m.name === historyPrefix ||
+        Boolean(m.name?.startsWith(`${historyPrefix}-`)),
+    );
 
     // every mount buildContainerSpec creates on its own; the rest belongs to the user
+    const agentRoot = agentDataRoot(home);
     const managedTargets = new Set([
       general.workspaceMount,
       sharedClaudeTargetFor(general),
       `${home}/.claude-home`,
-      historyTarget,
+      historyMountTargetFor(general),
       toolsMountFor(general),
       general.toolsMount,
     ]);
     const extraMounts = mounts
-      .filter((mount) => !managedTargets.has(mount.destination))
+      .filter(
+        (mount) =>
+          !managedTargets.has(mount.destination) &&
+          mount.destination !== agentRoot &&
+          !mount.destination.startsWith(`${agentRoot}/`),
+      )
       .map((mount) => toMountConfig(mount))
       .filter((mount): mount is SessionConfig['extraMounts'][number] => mount !== null);
 
+    const agentsLabel = container.labels[CONTAINER_LABELS.agents];
+
     return {
       name,
-      // TODO(B2): read the host and the agents back from the labels
-      // (CONTAINER_LABELS.host / CONTAINER_LABELS.agents) so adoption is lossless; fall back
-      // to the host whose backend listed the container.
-      hostId: container.labels[CONTAINER_LABELS.host] ?? this.deps.hosts.defaultHostId() ?? 'default',
-      agents: null,
+      // the label wins so adoption is lossless, but only when this install actually has that
+      // host; a v0.1 container (and a label naming an unknown host) falls back to the host
+      // whose backend listed it
+      hostId: this.hostIdForContainer(container, hostId),
+      agents: agentsLabel === undefined ? null : agentsLabel.split(',').filter((id) => id.length > 0),
       image: recipe ? { type: 'recipe', recipe } : { type: 'custom', ref: container.image },
       workspace,
       env: synthesizeEnv(inspect, general, image),
@@ -1301,7 +1682,14 @@ function synthesizeEnv(
 ): Record<string, string> {
   const home = containerHomeFor(general);
   const fromImage = new Set(image?.env ?? []);
-  const managed = new Set(['PORTERCLAUDE_SESSION', 'PORTERCLAUDE_TOOLS', 'PORTERCLAUDE_HOME']);
+  const managed = new Set([
+    'PORTERCLAUDE_SESSION',
+    'PORTERCLAUDE_HOST',
+    'PORTERCLAUDE_TOOLS',
+    'PORTERCLAUDE_HOME',
+    'PORTERCLAUDE_AGENT_IDS',
+    'PORTERCLAUDE_AGENT_LINKS',
+  ]);
   const env: Record<string, string> = {};
   for (const entry of inspect?.env ?? []) {
     if (fromImage.has(entry)) continue;

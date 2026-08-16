@@ -7,7 +7,7 @@ import type { AddressInfo } from 'node:net';
 import { WebSocket } from 'ws';
 import type { AppContext } from '../../src/context.js';
 import { AppError } from '../../src/http/errors.js';
-import { TERMINAL_CLOSE } from '../../src/terminals/protocol.js';
+import { TERMINAL_CLOSE, TerminalRefusal } from '../../src/terminals/protocol.js';
 import { attachTerminalWs, STOP_RECHECK } from '../../src/terminals/ws.js';
 import { silentLog, stubExecStream } from './helpers.js';
 
@@ -35,17 +35,25 @@ let sessionStateChecks = 0;
 let execExitCode: number | null = 0;
 let unregistered: string[] = [];
 let killed: string[] = [];
+/** the host ids the bridge asked for a transport (must be the SESSION'S host) */
+let backendLookups: string[] = [];
+/** what terminals.open() was called with (v0.2: shell + agentId come from the query) */
+let openedWith: { shell: string; agentId: string | null } | null = null;
 
 function makeCtx(): AppContext {
   return {
     log: silentLog,
     terminals: {
-      open: async () => {
+      open: async (input: { shell: string; agentId?: string | null }) => {
+        openedWith = { shell: input.shell, agentId: input.agentId ?? null };
         if (openError) throw openError;
         return {
           terminalId: 't1',
           stream,
           containerId: 'c1',
+          // v0.2: the ready frame names the host and the agent of the pane
+          hostId: 'edge',
+          agentId: input.agentId ?? null,
           tmux: true,
           reattached: false,
         };
@@ -60,13 +68,17 @@ function makeCtx(): AppContext {
       requireRunningContainer: async () => {
         sessionStateChecks += 1;
         if (sessionStateError && sessionStateChecks >= sessionStateErrorAfter) throw sessionStateError;
-        return { containerId: 'c1', config: {} };
+        return { containerId: 'c1', config: {}, hostId: 'edge', containerAgents: ['claude'] };
       },
     },
-    backends: {
-      get: () => ({
-        execInspect: async () => ({ running: false, exitCode: execExitCode, pid: 1 }),
-      }),
+    // v0.2: the exec lives on the SESSION'S host, which the ready frame already named
+    hosts: {
+      backendFor: (hostId: string) => {
+        backendLookups.push(hostId);
+        return {
+          execInspect: async () => ({ running: false, exitCode: execExitCode, pid: 1 }),
+        };
+      },
     },
   } as unknown as AppContext;
 }
@@ -108,6 +120,8 @@ beforeEach(async () => {
   STOP_RECHECK.timeoutMs = 60;
   unregistered = [];
   killed = [];
+  backendLookups = [];
+  openedWith = null;
   stream = stubExecStream() as ReturnType<typeof stubExecStream> & TestStream;
   server = http.createServer((_req, res) => res.end('ok'));
   handle = attachTerminalWs(server, makeCtx());
@@ -151,14 +165,16 @@ describe('attachTerminalWs', () => {
     expect(seen).toEqual(['/somewhere-else']);
   });
 
-  it('sends ready as the first text frame', async () => {
+  it('sends ready as the first text frame, with hostId and agentId (v0.2)', async () => {
     const ws = connect();
     const ready = await nextText(ws);
     expect(ready).toMatchObject({
       type: 'ready',
       terminalId: 't1',
       session: 'web',
+      hostId: 'edge',
       shell: 'bash',
+      agentId: null,
       name: 'main',
       tmux: true,
       reattached: false,
@@ -166,6 +182,32 @@ describe('attachTerminalWs', () => {
       rows: 30,
     });
     ws.close();
+  });
+
+  it('decodes shell=agent:<id> and reports it back in ready', async () => {
+    const ws = connect('session=web&shell=agent:opencode&name=main');
+    const ready = await nextText(ws);
+    expect(openedWith).toEqual({ shell: 'agent', agentId: 'opencode' });
+    expect(ready).toMatchObject({ type: 'ready', shell: 'agent', agentId: 'opencode' });
+    ws.close();
+  });
+
+  // v0.1 clients (and bookmarked URLs) keep working
+  it('accepts the deprecated shell=claude as agent:claude', async () => {
+    const ws = connect('session=web&shell=claude&name=main');
+    const ready = await nextText(ws);
+    expect(openedWith).toEqual({ shell: 'agent', agentId: 'claude' });
+    expect(ready).toMatchObject({ shell: 'agent', agentId: 'claude' });
+    ws.close();
+  });
+
+  it('inspects the finished exec on the SESSION host', async () => {
+    const ws = connect();
+    await nextText(ws);
+    const closed = nextClose(ws);
+    stream.emitClose(1006);
+    await closed;
+    expect(backendLookups).toEqual(['edge']);
   });
 
   it('bridges binary frames in both directions', async () => {
@@ -306,6 +348,9 @@ describe('attachTerminalWs', () => {
     ['session=web&shell=bash', TERMINAL_CLOSE.badRequest],
     ['session=Bad Name&shell=bash&name=main', TERMINAL_CLOSE.badRequest],
     ['session=web&shell=fish&name=main', TERMINAL_CLOSE.badRequest],
+    ['session=web&shell=agent&name=main', TERMINAL_CLOSE.badRequest],
+    ['session=web&shell=agent:&name=main', TERMINAL_CLOSE.badRequest],
+    ['session=web&shell=agent:NOPE&name=main', TERMINAL_CLOSE.badRequest],
     ['session=web&shell=bash&name=' + 'x'.repeat(60), TERMINAL_CLOSE.badRequest],
   ])('closes %s with %i', async (query, expected) => {
     const ws = connect(query);
@@ -317,6 +362,19 @@ describe('attachTerminalWs', () => {
     [AppError.notFound("session 'web' does not exist"), TERMINAL_CLOSE.sessionNotFound, 'session_not_found'],
     [AppError.conflict("session 'web' is not running"), TERMINAL_CLOSE.sessionNotRunning, 'session_not_running'],
     [AppError.backendNotConfigured(), TERMINAL_CLOSE.backendError, 'backend_error'],
+    // v0.2: both are TERMINAL conditions - the client must not auto-reconnect
+    [
+      TerminalRefusal.agentNotAvailable("agent 'opencode' is not available in session 'web'"),
+      TERMINAL_CLOSE.agentNotAvailable,
+      'agent_not_available',
+    ],
+    [
+      TerminalRefusal.hostUnavailable("the host 'edge' of session 'web' no longer exists"),
+      TERMINAL_CLOSE.hostUnavailable,
+      'host_unavailable',
+    ],
+    // a host whose connection type this version cannot talk to (tcp/ssh) is the same thing
+    [AppError.notImplemented('connection type ssh is not implemented'), TERMINAL_CLOSE.hostUnavailable, 'host_unavailable'],
     [new Error('boom'), TERMINAL_CLOSE.internal, 'internal'],
   ])('maps open failures to the documented close code', async (err, closeCode, errorCode) => {
     openError = err;

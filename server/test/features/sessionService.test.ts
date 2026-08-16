@@ -1,30 +1,41 @@
-// OWNER: B2. SessionService against a stubbed DockerBackend (no docker host).
+// OWNER: B2. SessionService against stubbed DockerBackends (no docker host). v0.2: the
+// service is host- and agent-aware, so the expectations below describe the per-agent auth
+// volumes, the porterclaude.host/agents labels and the multi-host list.
 import { describe, expect, it } from 'vitest';
 import { AppError, DockerApiError } from '../../src/http/errors.js';
 import { CONTAINER_LABELS, SessionConfigSchema, SessionInputSchema } from '../../src/sessions/model.js';
 import type { ContainerInspect } from '../../src/backends/types.js';
 import { buildContainerSpec } from '../../src/sessions/container.js';
 import { SessionService } from '../../src/sessions/service.js';
+import { BUILTIN_AGENTS } from '../../src/agents/builtin.js';
 import {
   containerSummary,
   generalConfig,
+  hostConfig,
   imageInspect,
+  otherHostConfig,
   serviceDeps,
   sessionConfig,
   sessionInput,
+  stubAgentRegistry,
   stubBackend,
-  stubBackendManager,
+  stubHostManager,
+  stubHosts,
   stubConfigStore,
 } from './helpers.js';
+
+/** the agents a default test host resolves to (hostConfig enables `claude`) */
+const claudeAgent = BUILTIN_AGENTS.filter((a) => a.id === 'claude');
 
 function makeService(opts: {
   sessions?: ReturnType<typeof sessionConfig>[];
   backend?: ReturnType<typeof stubBackend> | null;
+  host?: ReturnType<typeof hostConfig>;
 } = {}) {
   const cfg = stubConfigStore(opts.sessions ?? []);
   const sb = opts.backend === undefined ? stubBackend() : opts.backend;
-  const manager = stubBackendManager(sb ? sb.backend : null);
-  const service = new SessionService(serviceDeps({ config: cfg.store, backends: manager }));
+  const hosts = stubHostManager(sb ? sb.backend : null, opts.host ? { host: opts.host } : {});
+  const service = new SessionService(serviceDeps({ config: cfg.store, hosts }));
   return { service, cfg, sb };
 }
 
@@ -77,13 +88,51 @@ describe('SessionService.create', () => {
     expect(order[order.length - 1]).toBe('startContainer');
     expect(sb!.calls.indexOf('createContainer')).toBeLessThan(sb!.calls.indexOf('startContainer'));
 
-    // shared volumes + the workspace volume were ensured before the container was created
-    const volumeNames = sb!.log.filter((c) => c.method === 'createVolume').map((c) => (c.args[0] as { name: string }).name);
-    expect(volumeNames).toEqual(['porterclaude-claude', 'porterclaude-claude-home', 'porterclaude-ws-web']);
+    // v0.2: one auth volume per resolved agent + the workspace volume, before the container
+    const volumes = sb!.log.filter((c) => c.method === 'createVolume').map((c) => c.args[0] as { name: string; labels?: Record<string, string> });
+    expect(volumes.map((v) => v.name)).toEqual(['porterclaude-auth-claude', 'porterclaude-ws-web']);
+    expect(volumes[0]?.labels).toMatchObject({ 'porterclaude.managed': 'true', 'porterclaude.agent': 'claude' });
+
+    // ...and the container carries the host + agents contract
+    const spec = sb!.log.find((c) => c.method === 'createContainer')!.args[0] as {
+      labels?: Record<string, string>;
+      env?: Record<string, string>;
+    };
+    expect(spec.labels?.[CONTAINER_LABELS.host]).toBe('default');
+    expect(spec.labels?.[CONTAINER_LABELS.agents]).toBe('claude');
+    expect(spec.env?.PORTERCLAUDE_HOST).toBe('default');
 
     expect(cfg.sessions.get('web')).toBeTruthy();
     expect(cfg.sessions.get('web')?.specHash).toMatch(/^[0-9a-f]{64}$/);
     expect(view.name).toBe('web');
+  });
+
+  // v2-O1.md 1: the engine drops the image Cmd once the create request sets an Entrypoint,
+  // so the server has to read it off the image and pass it back — otherwise the php recipe
+  // reaches entrypoint.sh with no argv and idles instead of starting supervisord.
+  it('passes the image CMD back explicitly when it sets the bootstrap entrypoint', async () => {
+    const php = ['supervisord', '-n', '-c', '/etc/supervisor/supervisord.conf'];
+    const { service, sb } = makeService();
+    sb!.images.set('porterclaude/node:latest', imageInspect({ cmd: php }));
+
+    await service.create(sessionInput({ name: 'web' }));
+
+    const spec = sb!.log.find((c) => c.method === 'createContainer')!.args[0] as {
+      cmd?: string[];
+      entrypoint?: string[];
+    };
+    expect(spec.entrypoint).toEqual(['/opt/porterclaude/entrypoint.sh']);
+    expect(spec.cmd).toEqual(php);
+  });
+
+  it('idles a session whose image declares no CMD', async () => {
+    const { service, sb } = makeService();
+    sb!.images.set('porterclaude/node:latest', imageInspect());
+
+    await service.create(sessionInput({ name: 'web' }));
+
+    const spec = sb!.log.find((c) => c.method === 'createContainer')!.args[0] as { cmd?: string[] };
+    expect(spec.cmd).toEqual(['sleep', 'infinity']);
   });
 
   it('does not persist and rolls the container back when the config write fails', async () => {
@@ -202,7 +251,7 @@ describe('SessionService.update / recreate', () => {
 });
 
 describe('SessionService.remove', () => {
-  it('never removes the shared volumes and only drops the session volumes on request', async () => {
+  it('never removes an auth volume and only drops the session volumes on request', async () => {
     const { service, cfg, sb } = makeService({ sessions: [sessionConfig({ name: 'web' })] });
     sb!.containers.push(containerSummary());
 
@@ -210,10 +259,22 @@ describe('SessionService.remove', () => {
 
     const removed = sb!.log.filter((c) => c.method === 'removeVolume').map((c) => c.args[0]);
     expect(removed).toEqual(['porterclaude-ws-web', 'porterclaude-hist-web']);
-    expect(removed).not.toContain('porterclaude-claude');
-    expect(removed).not.toContain('porterclaude-claude-home');
+    // deleting an auth volume would drop the login of EVERY session on the host
+    expect(removed).not.toContain('porterclaude-auth-claude');
     expect(removed).not.toContain('porterclaude-tools');
     expect(cfg.sessions.has('web')).toBe(false);
+  });
+
+  it('removes one history volume per agent that declares a historyPath', async () => {
+    const host = hostConfig({ agents: { enabled: ['claude', 'codex', 'opencode'] } });
+    const { service, sb } = makeService({ sessions: [sessionConfig({ name: 'web' })], host });
+    sb!.containers.push(containerSummary());
+
+    await service.remove('web', { removeVolumes: true });
+
+    const removed = sb!.log.filter((c) => c.method === 'removeVolume').map((c) => c.args[0]);
+    // claude keeps the v0.1 name; opencode declares no history, so it has no volume
+    expect(removed).toEqual(['porterclaude-ws-web', 'porterclaude-hist-web', 'porterclaude-hist-web-codex']);
   });
 
   it('keeps the volumes by default', async () => {
@@ -265,7 +326,7 @@ describe('SessionService.list', () => {
   it('does not flag needsRecreate when the hash matches', async () => {
     const stored = sessionConfig({ name: 'web' });
     const spec = buildContainerSpec({
-      agents: [],
+      agents: claudeAgent,
       session: stored,
       general: generalConfig(),
       resolvedImage: 'porterclaude/node:latest',
@@ -418,7 +479,7 @@ describe('SessionService private history (BE-2)', () => {
       .filter((c) => c.method === 'createContainer')
       .map((c) => c.args[0] as { name: string; mounts?: Array<{ source: string; target: string }> });
 
-  it('pre-creates ~/.claude/projects with the shared volume ownership before the session container', async () => {
+  it('pre-creates the agent history dir with the auth volume ownership before the session container', async () => {
     const { service, sb } = makeService();
     sb!.images.set('porterclaude/node:latest', imageInspect());
 
@@ -431,18 +492,18 @@ describe('SessionService private history (BE-2)', () => {
     expect(init.name).toMatch(/^porterclaude-histinit-/);
     expect(session.name).toBe('pc-web');
 
-    // the shared volume is mounted at its REAL path so docker's empty-volume seeding keeps
-    // the recipe's uid-1000 ownership; the history volume gets a scratch path
+    // the AUTH volume is mounted at its REAL path so docker's empty-volume seeding keeps the
+    // recipe's uid-1000 ownership; the history volume gets a scratch path
     expect(init.mounts).toContainEqual({
       type: 'volume',
-      source: 'porterclaude-claude',
-      target: '/home/dev/.claude',
+      source: 'porterclaude-auth-claude',
+      target: '/home/dev/.porterclaude/agents/claude',
       readOnly: false,
     });
     expect(init.mounts).toContainEqual({
       type: 'volume',
       source: 'porterclaude-hist-web',
-      target: '/pc-hist',
+      target: '/pc-hist-0',
       readOnly: false,
     });
 
@@ -452,7 +513,8 @@ describe('SessionService private history (BE-2)', () => {
       labels?: Record<string, string>;
     };
     expect(spec.user).toBe('0:0');
-    expect(spec.cmd?.[0]).toContain('mkdir -p');
+    // the directory that is created is the one INSIDE the auth volume, never the ~/ symlink
+    expect(spec.cmd?.[0]).toContain('mkdir -p \'/home/dev/.porterclaude/agents/claude/claude/projects\'');
     expect(spec.cmd?.[0]).toContain("chown \"$own\"");
     // must never look like a session to reconcile/list
     expect(spec.labels?.['porterclaude.managed']).toBeUndefined();
@@ -478,17 +540,64 @@ describe('SessionService private history (BE-2)', () => {
     expect(view.warnings.join(' ')).toContain('private history volume failed');
   });
 
-  it('repairs ~/.claude/projects ownership on every start', async () => {
+  it('repairs the agent dirs, symlinks and history dir on every start (root exec)', async () => {
     const { service, sb } = makeService();
     sb!.images.set('porterclaude/node:latest', imageInspect());
     await service.create(sessionInput({ name: 'web' }));
 
     const exec = sb!.log.find(
-      (c) => c.method === 'runExec' && String((c.args[1] as string[])[2]).includes('.claude/projects'),
+      (c) => c.method === 'runExec' && String((c.args[1] as string[])[2]).includes('.porterclaude/agents'),
     );
     expect(exec).toBeTruthy();
     expect((exec!.args[2] as { user?: string }).user).toBe('0');
-    expect((exec!.args[1] as string[])[2]).toContain("chown \"$own\"");
+    const script = (exec!.args[1] as string[])[2] ?? '';
+    // the agent dir is created and handed to the owner of the container home
+    expect(script).toContain("chown -R \"$own\" '/home/dev/.porterclaude/agents/claude'");
+    // the ~/ paths are (re-)linked into the auth volume - the entrypoint does the same from
+    // the inside, but a container created by an older tools volume needs the outside repair
+    expect(script).toContain(
+      "ln -sfn '/home/dev/.porterclaude/agents/claude/claude' '/home/dev/.claude'",
+    );
+    expect(script).toContain(
+      "ln -sfn '/home/dev/.porterclaude/agents/claude/claude.json' '/home/dev/.claude.json'",
+    );
+    // ...and the shared history directory exists (inside the auth volume)
+    expect(script).toContain("mkdir -p '/home/dev/.porterclaude/agents/claude/claude/projects'");
+
+    // an image that SHIPS ~/.claude (the v0.1 recipes do) would shadow the auth volume:
+    // its content is copied into the still empty volume and the path becomes the symlink
+    expect(script).toContain("cp -a '/home/dev/.claude'/. '/home/dev/.porterclaude/agents/claude/claude'/");
+    expect(script).toContain("rm -rf '/home/dev/.claude'");
+  });
+
+  it('never turns an agent path outside the container home into an rm -rf', async () => {
+    // an AgentDefinition is user-supplied config: only paths BELOW <containerHome> may be
+    // replaced, so a definition sharing `~` (or `/`) can never wipe the home
+    const hostile = {
+      ...BUILTIN_AGENTS[0]!,
+      id: 'hostile',
+      sharedPaths: [{ path: '~', kind: 'dir' as const }],
+      historyPath: null,
+    };
+    const agents = stubAgentRegistry([hostile]);
+    const cfg = stubConfigStore([]);
+    const sb = stubBackend();
+    sb.images.set('porterclaude/node:latest', imageInspect());
+    const service = new SessionService(
+      serviceDeps({
+        config: cfg.store,
+        hosts: stubHostManager(sb.backend, { host: hostConfig({ agents: { enabled: ['hostile'] } }) }),
+        agents,
+      }),
+    );
+
+    await service.create(sessionInput({ name: 'web' }));
+    const script = sb.log
+      .filter((c) => c.method === 'runExec')
+      .map((c) => String((c.args[1] as string[])[2]))
+      .find((sc) => sc.includes('.porterclaude/agents'));
+    expect(script).toBeTruthy();
+    expect(script).not.toContain('rm -rf');
   });
 });
 
@@ -590,6 +699,9 @@ describe('SessionService orphan reconstruction (BE-7)', () => {
         'porterclaude.managed': 'true',
         'porterclaude.session': 'qa-shared',
         'porterclaude.image-type': 'custom',
+        // inherited from the IMAGE (docker merges image labels into the container's): a
+        // custom ref that points at a recipe image carries it, and it must not win
+        'porterclaude.recipe': 'base',
         'porterclaude.spec-hash': 'old-hash',
       },
       ports: [{ containerPort: 3000, protocol: 'tcp', hostPort: 32774 }],
@@ -608,6 +720,8 @@ describe('SessionService orphan reconstruction (BE-7)', () => {
       'PATH=/opt/porterclaude/bin:/home/dev/.local/bin:/usr/bin:/bin',
       'IMAGE_ONLY=1',
       'PORTERCLAUDE_SESSION=qa-shared',
+      'PORTERCLAUDE_HOST=default',
+      'PORTERCLAUDE_AGENT_IDS=claude',
       'PORTERCLAUDE_TOOLS=/opt/porterclaude',
       'PORTERCLAUDE_HOME=/home/dev',
       'HOME=/home/dev',
@@ -615,8 +729,12 @@ describe('SessionService orphan reconstruction (BE-7)', () => {
       'FOO=bar',
     ],
     mounts: [
-      { type: 'volume', name: 'porterclaude-claude', destination: '/home/dev/.claude', readOnly: false },
-      { type: 'volume', name: 'porterclaude-claude-home', destination: '/home/dev/.claude-home', readOnly: false },
+      {
+        type: 'volume',
+        name: 'porterclaude-auth-claude',
+        destination: '/home/dev/.porterclaude/agents/claude',
+        readOnly: false,
+      },
       { type: 'volume', name: 'porterclaude-tools', destination: '/opt/porterclaude', readOnly: true },
       { type: 'volume', name: 'porterclaude-ws-qa-shared', destination: '/workspace', readOnly: false },
       { type: 'bind', source: '/srv/media', destination: '/media', readOnly: true },
@@ -641,6 +759,14 @@ describe('SessionService orphan reconstruction (BE-7)', () => {
     sb.images.set('alpine:3.20', imageInspect({ tags: ['alpine:3.20'], env: ['IMAGE_ONLY=1'] }));
     return made;
   }
+
+  it('keeps a custom session custom even when the IMAGE carries a porterclaude.recipe label', async () => {
+    // docker merges the image labels into the container's, so a custom ref that happens to
+    // be a recipe image reports porterclaude.recipe - the image-type label decides
+    const { service } = makeOrphanService();
+    const [view] = await service.list();
+    expect(view?.image).toEqual({ type: 'custom', ref: 'alpine:3.20' });
+  });
 
   it('reconstructs env, ports, limits, extra mounts, network and the restart policy', async () => {
     const { service } = makeOrphanService();
@@ -798,5 +924,362 @@ describe('SessionService custom-image bootstrap (BE-6)', () => {
       String((c.args[1] as string[])[2]).includes('chmod u+rwx'),
     );
     expect(chowns).toHaveLength(0);
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// v0.2: N hosts. Session NAMES stay globally unique, everything else is per host.
+// ---------------------------------------------------------------------------
+describe('SessionService across hosts', () => {
+  const EDGE = 'edge';
+
+  function makeHosts(opts: { edge?: ReturnType<typeof stubBackend> | null; sessions?: ReturnType<typeof sessionConfig>[] } = {}) {
+    const home = stubBackend();
+    const edge = opts.edge === undefined ? stubBackend() : opts.edge;
+    const cfg = stubConfigStore(
+      opts.sessions ?? [sessionConfig({ name: 'web' }), sessionConfig({ name: 'api', hostId: EDGE })],
+    );
+    const hosts = stubHosts([
+      { host: hostConfig(), backend: home.backend },
+      {
+        host: otherHostConfig({ agents: { enabled: ['claude', 'opencode'] } }),
+        backend: edge ? edge.backend : null,
+        // a per-host override: everything this host creates carries its own prefix
+        general: generalConfig({ volumePrefix: 'edge-' }),
+      },
+    ]);
+    const service = new SessionService(serviceDeps({ config: cfg.store, hosts }));
+    home.images.set('porterclaude/node:latest', imageInspect());
+    if (edge) edge.images.set('porterclaude/node:latest', imageInspect());
+    return { service, cfg, home, edge };
+  }
+
+  const edgeContainer = () =>
+    containerSummary({
+      id: 'c-edge',
+      name: 'pc-api',
+      names: ['pc-api'],
+      labels: {
+        'porterclaude.managed': 'true',
+        'porterclaude.session': 'api',
+        'porterclaude.host': EDGE,
+        'porterclaude.agents': 'claude,opencode',
+      },
+    });
+
+  it('lists the sessions of every host with their host name', async () => {
+    const { service, home, edge } = makeHosts();
+    home.containers.push(containerSummary());
+    edge!.containers.push(edgeContainer());
+
+    const views = await service.list();
+    expect(views.map((v) => v.name)).toEqual(['api', 'web']);
+    expect(views.find((v) => v.name === 'api')).toMatchObject({
+      hostId: EDGE,
+      hostName: 'Edge box',
+      hostMissing: false,
+      status: 'running',
+      resolvedAgents: ['claude', 'opencode'],
+    });
+    expect(views.find((v) => v.name === 'web')).toMatchObject({
+      hostId: 'default',
+      hostName: 'Local docker',
+      resolvedAgents: ['claude'],
+    });
+  });
+
+  it('filters by hostId and only talks to that host', async () => {
+    const { service, home, edge } = makeHosts();
+    home.containers.push(containerSummary());
+    edge!.containers.push(edgeContainer());
+
+    const views = await service.list({ hostId: EDGE });
+    expect(views.map((v) => v.name)).toEqual(['api']);
+    expect(home.calls).not.toContain('listContainers');
+  });
+
+  it('degrades only the sessions of a failing host', async () => {
+    const failing = stubBackend({
+      listContainers: async () => {
+        throw new DockerApiError('connect ECONNREFUSED', 502);
+      },
+    });
+    const { service, home } = makeHosts({ edge: failing });
+    home.containers.push(containerSummary());
+
+    const views = await service.list();
+    const api = views.find((v) => v.name === 'api');
+    const web = views.find((v) => v.name === 'web');
+    expect(api?.status).toBe('absent');
+    expect(api?.warnings.join(' ')).toContain('docker backend unavailable');
+    // the other host is completely unaffected
+    expect(web?.status).toBe('running');
+    expect(web?.warnings).toEqual([]);
+  });
+
+  it('still deletes a session whose host is gone (nothing to talk to)', async () => {
+    const cfg = stubConfigStore([sessionConfig({ name: 'orphaned', hostId: 'deleted-host' })]);
+    const sb = stubBackend();
+    const hosts = stubHosts([{ host: hostConfig(), backend: sb.backend }]);
+    const service = new SessionService(serviceDeps({ config: cfg.store, hosts }));
+
+    await service.remove('orphaned', { removeVolumes: true });
+    expect(cfg.sessions.has('orphaned')).toBe(false);
+    // ...and nothing was attempted on the surviving host
+    expect(sb.calls).not.toContain('removeContainer');
+    expect(sb.calls).not.toContain('removeVolume');
+  });
+
+  it('marks a session whose host is gone as hostMissing and read-only', async () => {
+    const cfg = stubConfigStore([sessionConfig({ name: 'orphaned', hostId: 'deleted-host' })]);
+    const sb = stubBackend();
+    const hosts = stubHosts([{ host: hostConfig(), backend: sb.backend }]);
+    const service = new SessionService(serviceDeps({ config: cfg.store, hosts }));
+
+    const [view] = await service.list();
+    expect(view).toMatchObject({
+      name: 'orphaned',
+      hostId: 'deleted-host',
+      hostName: 'deleted-host',
+      hostMissing: true,
+      status: 'absent',
+      resolvedAgents: [],
+    });
+    expect(view?.warnings.join(' ')).toContain('no longer exists');
+  });
+
+  it('creates on the requested host, with that host s settings and backend', async () => {
+    const { service, home, edge } = makeHosts({ sessions: [] });
+
+    await service.create(sessionInput({ name: 'api', hostId: EDGE }));
+
+    expect(edge!.calls).toContain('createContainer');
+    expect(home.calls).not.toContain('createContainer');
+    const volumes = edge!.log
+      .filter((c) => c.method === 'createVolume')
+      .map((c) => (c.args[0] as { name: string }).name);
+    // the host override applies to every volume it creates, and BOTH its agents get one
+    expect(volumes).toEqual(['edge-auth-claude', 'edge-auth-opencode', 'edge-ws-api']);
+    const spec = edge!.log.find((c) => c.method === 'createContainer')!.args[0] as {
+      labels?: Record<string, string>;
+    };
+    expect(spec.labels?.[CONTAINER_LABELS.host]).toBe(EDGE);
+    expect(spec.labels?.[CONTAINER_LABELS.agents]).toBe('claude,opencode');
+  });
+
+  it('creates on the DEFAULT host when the input omits one', async () => {
+    const { service, home, edge } = makeHosts({ sessions: [] });
+    await service.create(sessionInput({ name: 'api' }));
+    expect(home.calls).toContain('createContainer');
+    expect(edge!.calls).not.toContain('createContainer');
+  });
+
+  // session names are unique ACROSS hosts - that is what lets the terminal websocket route
+  // session -> host with nothing but the name (api.md v0.2)
+  it('409s a name that is already used on ANOTHER host', async () => {
+    const { service } = makeHosts();
+    await expect(service.create(sessionInput({ name: 'web', hostId: EDGE }))).rejects.toMatchObject({
+      code: 'conflict',
+    });
+  });
+
+  it('409s a name taken by a container of the target host', async () => {
+    const { service, edge } = makeHosts({ sessions: [] });
+    edge!.containers.push(edgeContainer());
+    await expect(service.create(sessionInput({ name: 'api', hostId: EDGE }))).rejects.toMatchObject({
+      code: 'conflict',
+    });
+  });
+
+  it('404s an unknown host on create', async () => {
+    const { service } = makeHosts({ sessions: [] });
+    await expect(service.create(sessionInput({ name: 'api', hostId: 'nope' }))).rejects.toMatchObject({
+      code: 'not_found',
+    });
+  });
+
+  it('422s a PUT that moves the session to another host (the host is immutable)', async () => {
+    const { service } = makeHosts();
+    await expect(
+      service.update('web', sessionInput({ name: 'web', hostId: EDGE })),
+    ).rejects.toMatchObject({ code: 'validation_error' });
+  });
+
+  it('accepts a PUT that repeats the stored hostId', async () => {
+    const { service, home } = makeHosts();
+    home.containers.push(containerSummary());
+    await expect(service.update('web', sessionInput({ name: 'web', hostId: 'default' }))).resolves.toMatchObject({
+      hostId: 'default',
+    });
+  });
+
+  it('uses the session host for start/stop/logs, never the default one', async () => {
+    const { service, home, edge } = makeHosts();
+    edge!.containers.push(edgeContainer());
+    await service.stop('api');
+    expect(edge!.calls).toContain('stopContainer');
+    expect(home.calls).not.toContain('stopContainer');
+
+    await service.logs('api', { tail: 5 });
+    expect(edge!.calls).toContain('containerLogs');
+  });
+
+  it('requireRunningContainer answers the session host', async () => {
+    const { service, edge } = makeHosts();
+    edge!.containers.push(edgeContainer());
+    await expect(service.requireRunningContainer('api')).resolves.toMatchObject({
+      containerId: 'c-edge',
+      hostId: EDGE,
+    });
+  });
+
+  it('reconciles every host, and only one when asked', async () => {
+    const { service, home, edge } = makeHosts();
+    home.containers.push(containerSummary());
+    edge!.containers.push(edgeContainer());
+    edge!.containers.push(
+      containerSummary({
+        id: 'c-ghost',
+        name: 'pc-ghost',
+        names: ['pc-ghost'],
+        state: 'exited',
+        labels: { 'porterclaude.managed': 'true', 'porterclaude.session': 'ghost', 'porterclaude.host': EDGE },
+      }),
+    );
+
+    const all = await service.reconcile();
+    expect(all).toMatchObject({ known: 2, running: 2, orphans: ['ghost'], missing: [] });
+
+    const onlyHome = await service.reconcile({ hostId: 'default' });
+    expect(onlyHome).toMatchObject({ known: 1, running: 1, orphans: [], missing: [] });
+  });
+
+  it('skips an unreachable host during reconcile instead of failing', async () => {
+    const failing = stubBackend({
+      listContainers: async () => {
+        throw new DockerApiError('connect ECONNREFUSED', 502);
+      },
+    });
+    const { service, home } = makeHosts({ edge: failing });
+    home.containers.push(containerSummary());
+    const report = await service.reconcile();
+    // the dead host contributes nothing at all - not even its stored session as "missing"
+    expect(report).toMatchObject({ running: 1, orphans: [], missing: [] });
+  });
+
+  it('adopts an orphan with the host and agents from its labels', async () => {
+    const { service, cfg, edge } = makeHosts({ sessions: [] });
+    edge!.containers.push(edgeContainer());
+
+    const report = await service.reconcile({ adopt: true });
+    expect(report.adopted).toEqual(['api']);
+    const stored = cfg.sessions.get('api');
+    expect(stored?.hostId).toBe(EDGE);
+    expect(stored?.agents).toEqual(['claude', 'opencode']);
+  });
+
+  it('falls back to the listing host when a v0.1 container carries no host label', async () => {
+    const { service, cfg, edge } = makeHosts({ sessions: [] });
+    edge!.containers.push(
+      containerSummary({
+        id: 'c-old',
+        name: 'pc-legacy',
+        names: ['pc-legacy'],
+        labels: { 'porterclaude.managed': 'true', 'porterclaude.session': 'legacy' },
+      }),
+    );
+    await service.reconcile({ adopt: true });
+    const stored = cfg.sessions.get('legacy');
+    expect(stored?.hostId).toBe(EDGE);
+    // no agents label: the session inherits whatever the host enables
+    expect(stored?.agents).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.2: which agents a session mounts
+// ---------------------------------------------------------------------------
+describe('SessionService.resolveAgents', () => {
+  it('inherits the host set, honours an explicit list and drops unknown ids', async () => {
+    const host = hostConfig({ agents: { enabled: ['claude', 'opencode'] } });
+    const { service } = makeService({ host, sessions: [] });
+
+    expect(service.resolveAgents(sessionConfig({ name: 'a' })).map((a) => a.id)).toEqual([
+      'claude',
+      'opencode',
+    ]);
+    expect(
+      service.resolveAgents(sessionConfig({ name: 'b', agents: ['opencode'] })).map((a) => a.id),
+    ).toEqual(['opencode']);
+    expect(
+      service.resolveAgents(sessionConfig({ name: 'c', agents: ['opencode', 'ghost'] })).map((a) => a.id),
+    ).toEqual(['opencode']);
+    expect(service.resolveAgents(sessionConfig({ name: 'd', agents: [] }))).toEqual([]);
+  });
+
+  it('sorts by id so the spec hash does not depend on the config order', async () => {
+    const host = hostConfig({ agents: { enabled: ['opencode', 'claude'] } });
+    const { service } = makeService({ host, sessions: [] });
+    expect(service.resolveAgents(sessionConfig({ name: 'a' })).map((a) => a.id)).toEqual([
+      'claude',
+      'opencode',
+    ]);
+  });
+
+  // B-2: resolvedAgents is "what the container really mounts" (api.md), so a host-level
+  // enable does NOT appear in it until the session is recreated - the terminal would refuse
+  // that agent with 4410, and the UI must not offer a pane for it.
+  it('makes a session that mounts a new agent report needsRecreate without claiming it', async () => {
+    const stored = sessionConfig({ name: 'web' });
+    const spec = buildContainerSpec({
+      agents: claudeAgent,
+      session: stored,
+      general: generalConfig(),
+      resolvedImage: 'porterclaude/node:latest',
+      imageType: 'recipe',
+    });
+    // the container was created with claude only; the host now also enables opencode
+    const { service, sb } = makeService({
+      sessions: [stored],
+      host: hostConfig({ agents: { enabled: ['claude', 'opencode'] } }),
+    });
+    sb!.containers.push(
+      containerSummary({
+        labels: {
+          ...containerSummary().labels,
+          [CONTAINER_LABELS.agents]: spec.labels?.[CONTAINER_LABELS.agents] ?? '',
+          [CONTAINER_LABELS.specHash]: spec.labels?.[CONTAINER_LABELS.specHash] ?? '',
+        },
+      }),
+    );
+    const [view] = await service.list();
+    expect(view?.resolvedAgents).toEqual(['claude']);
+    expect(view?.needsRecreate).toBe(true);
+  });
+
+  it('falls back to the configured agents for a v0.1 container (no label, no env)', async () => {
+    const { service, sb } = makeService({
+      sessions: [sessionConfig({ name: 'web' })],
+      host: hostConfig({ agents: { enabled: ['claude', 'opencode'] } }),
+    });
+    sb!.containers.push(containerSummary());
+    const [view] = await service.list();
+    expect(view?.resolvedAgents).toEqual(['claude', 'opencode']);
+  });
+
+  it('requireRunningContainer reports the agents of the container, not of the config', async () => {
+    const { service, sb } = makeService({
+      sessions: [sessionConfig({ name: 'web' })],
+      host: hostConfig({ agents: { enabled: ['claude', 'opencode'] } }),
+    });
+    sb!.containers.push(
+      containerSummary({
+        labels: { ...containerSummary().labels, [CONTAINER_LABELS.agents]: 'claude' },
+      }),
+    );
+    await expect(service.requireRunningContainer('web')).resolves.toMatchObject({
+      containerAgents: ['claude'],
+    });
   });
 });

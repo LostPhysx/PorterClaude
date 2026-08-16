@@ -192,8 +192,9 @@ export async function loadGoldenLayout() {
  * Normalise a pane state coming from a (possibly v1) layout blob or from openTerminal().
  * v0.1 wrote `shell:'claude'`; that migrates to `{shell:'agent', agentId:'claude'}`, which
  * keeps the pane NAME (`<session>-claude-<n>`) and therefore the tmux session.
- * TODO(F2): an `agent` state without a valid agentId (api.js AGENT_ID_RE) is unusable -
- * return null so the pane renders the "unusable terminal state" placeholder.
+ * An `agent` state without a valid agent id (api.js AGENT_ID_RE, enforced by
+ * formatShellParam/parseShellParam) is unusable and returns null - the caller either drops
+ * it from the migrated tree or renders the "unusable terminal state" placeholder.
  * @param {any} raw @returns {PaneState|null}
  */
 function normalizeState(raw) {
@@ -202,7 +203,9 @@ function normalizeState(raw) {
   if (!session) return null;
   // parseShellParam accepts 'bash' | 'sh' | 'agent:<id>' | 'claude' (v0.1 alias)
   let wire = String(raw.shell || 'bash');
-  if (raw.shell === 'agent' && raw.agentId) {
+  if (raw.shell === 'agent') {
+    // `shell:'agent'` alone carries no agent id: it only means anything together with one.
+    if (!raw.agentId) return null;
     try {
       wire = formatShellParam('agent', raw.agentId);
     } catch {
@@ -211,6 +214,7 @@ function normalizeState(raw) {
   }
   const parsed = parseShellParam(wire);
   if (!parsed) return null;
+  if (parsed.shell === 'agent' && !parsed.agentId) return null;
   let name = typeof raw.name === 'string' ? raw.name : '';
   if (!name) {
     try {
@@ -244,10 +248,9 @@ function nextFreeName(session, slug) {
 }
 
 /**
- * Tab title.
- * TODO(F2): agent panes show the agent NAME (agentLabel), not the id; bash/sh keep the shell
- * word. When sessions of MORE THAN ONE host are on screen, prefix the host name:
- * `prod/web · Claude Code`. Keep it short - GoldenLayout tabs are narrow.
+ * Tab title: `<session> · <agent name|shell>[ n][ mark]`, prefixed with `<host>/` while panes
+ * of MORE THAN ONE host are open (`prod/web · Claude Code`). Kept short - GoldenLayout tabs
+ * are narrow.
  * @param {PaneState} state @param {string} [status]
  */
 function titleFor(state, status) {
@@ -258,7 +261,37 @@ function titleFor(state, status) {
   else if (status === 'fatal') mark = ' ⚠';
   else if (status === 'closed') mark = ' ●';
   const what = state.shell === 'agent' ? agentLabel(state.agentId) : state.shell;
-  return `${state.session} · ${what}${suffix}${mark}`;
+  return `${paneHostPrefix(state)}${state.session} · ${what}${suffix}${mark}`;
+}
+
+/** The host a pane belongs to: what `ready` reported, else what the session says. */
+function paneHostId(state) {
+  if (state && typeof state.hostId === 'string' && state.hostId) return state.hostId;
+  const view = sessionByName(state && state.session);
+  return hostIdOf(view);
+}
+
+/** `"<host>/"` while panes of more than one host are open, '' otherwise. */
+function paneHostPrefix(state) {
+  const ids = new Set();
+  for (const entry of panes.values()) ids.add(paneHostId(entry.state));
+  ids.add(paneHostId(state));
+  if (ids.size < 2) return '';
+  const id = paneHostId(state);
+  if (!id) return '';
+  const view = railSessions.find((s) => hostIdOf(s) === id) || null;
+  return `${(view && hostNameOf(view)) || id}/`;
+}
+
+/** Repaint every tab title (the host prefix depends on the whole set of open panes). */
+function refreshTitles() {
+  for (const entry of panes.values()) {
+    try {
+      entry.container.setTitle(titleFor(entry.state, entry.pane.status));
+    } catch {
+      /* the container is gone */
+    }
+  }
 }
 
 function dotClass(status) {
@@ -276,6 +309,87 @@ function dotClass(status) {
 
 function sessionByName(name) {
   return railSessions.find((s) => s && s.name === name) || null;
+}
+
+// ---------------------------------------------------------------------------
+// hosts, as seen from the sessions
+//
+// code.js deliberately does NOT import hosts.js: every host fact it needs (`hostId`,
+// `hostName`, `hostMissing`) rides on the SessionView, and the only global it wants - which
+// host is the default one, so its rail group comes first - is in the settings summary
+// (`settings.hosts.defaultHostId`) and on the `hosts:changed` bus event.
+// ---------------------------------------------------------------------------
+
+/** @type {string} last `hosts:changed` defaultHostId ('' = unknown) */
+let defaultHostIdHint = '';
+
+/** @returns {string} the default host id, '' when it cannot be told */
+function currentDefaultHostId() {
+  if (defaultHostIdHint) return defaultHostIdHint;
+  for (const settings of settingsSources()) {
+    const hosts = settings && settings.hosts;
+    if (hosts && typeof hosts.defaultHostId === 'string' && hosts.defaultHostId) {
+      return hosts.defaultHostId;
+    }
+  }
+  return '';
+}
+
+/** @param {any} session @returns {string} '' when the server did not say (pre-v0.2 payload) */
+function hostIdOf(session) {
+  return session && typeof session.hostId === 'string' ? session.hostId : '';
+}
+
+/** @param {any} session @returns {string} the host's display name, never '' */
+function hostNameOf(session) {
+  if (session && typeof session.hostName === 'string' && session.hostName) return session.hostName;
+  return hostIdOf(session) || 'unknown host';
+}
+
+/**
+ * @typedef {Object} HostGroup
+ * @property {string} id       hostId ('' when the payload carries none)
+ * @property {string} name     display name
+ * @property {boolean} missing the host was deleted with force=1 (SessionView.hostMissing)
+ * @property {any[]} sessions
+ */
+
+/**
+ * The distinct hosts present in `sessions`: the default host first, then by name; hosts that
+ * no longer exist last. Session order inside a group is the order sessions.js delivered.
+ * @param {any[]} sessions @returns {HostGroup[]}
+ */
+function hostGroups(sessions) {
+  /** @type {Map<string, HostGroup>} */
+  const map = new Map();
+  for (const session of Array.isArray(sessions) ? sessions : []) {
+    if (!session) continue;
+    const id = hostIdOf(session);
+    let group = map.get(id);
+    if (!group) {
+      group = { id, name: hostNameOf(session), missing: session.hostMissing === true, sessions: [] };
+      map.set(id, group);
+    }
+    if (session.hostMissing === true) group.missing = true;
+    group.sessions.push(session);
+  }
+  const dflt = currentDefaultHostId();
+  return [...map.values()].sort((a, b) => {
+    if (a.missing !== b.missing) return a.missing ? 1 : -1;
+    if (!a.missing && dflt && a.id !== b.id) {
+      if (a.id === dflt) return -1;
+      if (b.id === dflt) return 1;
+    }
+    return a.name.localeCompare(b.name) || a.id.localeCompare(b.id);
+  });
+}
+
+/** The sessions the rail/select currently show (the host filter narrows them). */
+function filteredSessions(sessions) {
+  const items = Array.isArray(sessions) ? sessions : [];
+  const host = codeHostFilter();
+  if (!host) return items;
+  return items.filter((s) => hostIdOf(s) === host);
 }
 
 function currentTheme() {
@@ -421,17 +535,51 @@ export function persist() {
 const persistSoon = debounce(() => persist(), 250);
 
 /**
- * Migrate a v1 layout blob to v2 in place: every `componentState` goes through
- * normalizeState(), i.e. `shell:'claude'` becomes `{shell:'agent', agentId:'claude'}` while
- * `name` is left untouched (that is the tmux identity).
- * TODO(F2): walk `blob.root` recursively (`content[]` arrays + `componentState` objects),
- * rewrite the states, set `v: LAYOUT_VERSION`, and return the blob. A state that does not
- * normalise is DROPPED from the tree, not kept as a broken pane.
+ * Migrate one item of a (possibly v1) layout tree.
+ *
+ * Every `componentState` goes through normalizeState(), i.e. v0.1's `shell:'claude'` becomes
+ * `{shell:'agent', agentId:'claude'}` while `name` is left BYTE-IDENTICAL - the name is the
+ * tmux identity (`pc_<name>`), so an upgraded browser reattaches to the shells that are
+ * already running instead of spawning new ones.
+ *
+ * A component whose state does not normalise is dropped, and so is a container that is left
+ * without any content by that (GoldenLayout renders an empty stack as a dead tab bar).
+ * @param {any} item @returns {any|null} the same object, or null when it must be dropped
+ */
+function migrateLayoutItem(item) {
+  if (!item || typeof item !== 'object') return null;
+  if (Object.prototype.hasOwnProperty.call(item, 'componentState')) {
+    // Only our own component carries a PaneState; anything else is passed through untouched.
+    const type = item.componentType ?? item.componentName;
+    if (type === undefined || type === COMPONENT_TERMINAL) {
+      const state = normalizeState(item.componentState);
+      if (!state) return null;
+      item.componentState = state;
+    }
+  }
+  if (Array.isArray(item.content)) {
+    const had = item.content.length;
+    item.content = item.content
+      .map((child) => migrateLayoutItem(child))
+      .filter((child) => child !== null);
+    if (had > 0 && item.content.length === 0) return null;
+  }
+  return item;
+}
+
+/**
+ * Migrate a v1 layout blob to v2 in place (see {@link migrateLayoutItem}) and stamp the new
+ * version. Returns null when nothing survived - the caller then treats the blob as absent.
+ * Migrating a v2 blob is a no-op, so this is safe to run more than once.
  * @param {LayoutBlob} blob
  * @returns {LayoutBlob|null}
  */
 export function migrateLayoutBlob(blob) {
-  // TODO(F2)
+  if (!blob || typeof blob !== 'object' || !blob.root || typeof blob.root !== 'object') return null;
+  const root = migrateLayoutItem(blob.root.root);
+  if (!root) return null;
+  blob.root.root = root;
+  blob.v = LAYOUT_VERSION;
   return blob;
 }
 
@@ -615,7 +763,9 @@ function buildTerminalComponent(container, rawState) {
   }
   // A restored layout may contain a duplicate name (e.g. two blobs merged): keep names unique
   // because they are the tmux identity.
-  if (panes.has(state.name)) state.name = nextFreeName(state.session, state.shell);
+  if (panes.has(state.name)) {
+    state.name = nextFreeName(state.session, terminalSlug(state.shell, state.agentId));
+  }
 
   const root = document.createElement('div');
   root.className = 'pc-pane';
@@ -625,12 +775,31 @@ function buildTerminalComponent(container, rawState) {
     session: state.session,
     shell: state.shell,
     agentId: state.agentId ?? null,
+    // agents.js owns the display names; terminal.js only needs the one of THIS pane (for the
+    // 4410 note), which keeps it free of an import of its own.
+    agentName: state.shell === 'agent' ? agentLabel(state.agentId) : null,
     name: state.name,
     theme: currentTheme(),
     // 4410 agent_not_available: the pane offers "Open bash instead" and calls this.
     onOpenBash: () => openTerminal(state.session, 'bash'),
-    onStatus: (status) => {
+    onStatus: (status, info) => {
+      // The server is authoritative about where the session runs and which agent it started
+      // (api.md `ready`): remember both, they drive the host prefix of the tab titles.
+      let changed = false;
+      if (info && typeof info.hostId === 'string' && info.hostId && info.hostId !== state.hostId) {
+        state.hostId = info.hostId;
+        changed = true;
+      }
+      if (info && state.shell === 'agent' && typeof info.agentId === 'string'
+          && info.agentId && info.agentId !== state.agentId) {
+        state.agentId = info.agentId;
+        changed = true;
+      }
       try { container.setTitle(titleFor(state, status)); } catch { /* container gone */ }
+      if (changed) {
+        refreshTitles();
+        persistSoon();
+      }
       updateStatus();
     },
     onTitle: (title) => { root.title = title; },
@@ -641,6 +810,8 @@ function buildTerminalComponent(container, rawState) {
 
   panes.set(state.name, { pane, container, state });
   container.setTitle(titleFor(state, 'connecting'));
+  // This pane may be the second host on screen: every other title needs its prefix now.
+  refreshTitles();
   pane.attach(root);
 
   const fitSoon = () => requestAnimationFrame(() => pane.fit());
@@ -653,6 +824,8 @@ function buildTerminalComponent(container, rawState) {
     // loadLayout()/clear(), and `suspended` covers the auth-loss teardown.
     pane.dispose({ kill: !suspendPersist && !suspended });
     panes.delete(state.name);
+    // The last pane of a host may have gone: the remaining titles lose their host prefix.
+    refreshTitles();
     toggleEmpty();
     updateStatus();
     persistSoon();
@@ -687,8 +860,25 @@ export function openTerminal(session, shellParam) {
   const parsed = parseShellParam(shellParam) || { shell: 'bash', agentId: null };
   const wanted = parsed.shell;
   const agentId = parsed.agentId;
-  // TODO(F2): refuse an agent the session does not mount (see the doc comment above).
   const view = sessionByName(session);
+  if (view && view.hostMissing === true) {
+    toast(
+      `The host of "${session}" no longer exists — recreate the session on a host that does.`,
+      { variant: 'warning', title: 'Host gone' },
+    );
+    return;
+  }
+  // Refuse an agent this session does not mount: the server would close 4410 and the pane
+  // would only be able to repeat the reason - saying it here can name the fix instead.
+  if (wanted === 'agent' && view && Array.isArray(view.resolvedAgents)
+      && !view.resolvedAgents.includes(agentId)) {
+    toast(
+      `"${agentLabel(agentId)}" is not mounted into "${session}" — enable it on the host ` +
+      '(Settings → Agents), run "Install / update on this host", then recreate the session.',
+      { variant: 'warning', title: 'Agent not available' },
+    );
+    return;
+  }
   if (view && view.status !== 'running') {
     toast(`Session "${session}" is not running - starting it…`, { variant: 'info' });
     api.sessions
@@ -741,66 +931,131 @@ function codeHostFilter() {
 }
 
 /**
- * TODO(F2): fill #code-host-filter with one option per DISTINCT hostId present in
- * `railSessions` (label = the session's `hostName`), plus a leading "All hosts" option.
- * Hide the whole select while only one host is present (a single-host install must look
- * exactly like v0.1). Persist the choice in LS_CODE_HOST and re-render rail + select.
- * @param {any[]} sessions
+ * Fill #code-host-filter with one option per DISTINCT host present in `sessions` (label =
+ * `hostName`), behind a leading "All hosts" option. The select is HIDDEN while only one host
+ * is present - a single-host install has to look exactly like v0.1.
+ * The stored choice is dropped as soon as that host has no sessions any more.
+ * @param {any[]} sessions the UNFILTERED rail sessions
  */
 function renderHostFilter(sessions) {
-  void sessions;
-  void codeHostFilter;
-  // TODO(F2)
+  const select = /** @type {HTMLSelectElement|null} */ (byId('code-host-filter'));
+  if (!select) return;
+  const groups = hostGroups(sessions).filter((g) => g.id);
+  const multi = groups.length > 1;
+  select.classList.toggle('d-none', !multi);
+  if (!multi) {
+    select.textContent = '';
+    if (codeHostFilter()) storage.set(LS_CODE_HOST, '');
+    return;
+  }
+  let wanted = codeHostFilter();
+  if (wanted && !groups.some((g) => g.id === wanted)) {
+    wanted = '';
+    storage.set(LS_CODE_HOST, '');
+  }
+  select.textContent = '';
+  const all = document.createElement('option');
+  all.value = '';
+  all.textContent = 'All hosts';
+  select.appendChild(all);
+  for (const group of groups) {
+    const opt = document.createElement('option');
+    opt.value = group.id;
+    opt.textContent = group.missing ? `${group.name} (host gone)` : group.name;
+    select.appendChild(opt);
+  }
+  select.value = wanted;
 }
 
 /**
- * Paint #session-rail-list. All API strings are HTML-escaped.
+ * One `.pc-rail-item` row. All API strings are HTML-escaped.
+ * Quick actions: bash and the session's FIRST resolved agent (`data-open="agent:<id>"`); a
+ * session without an agent shows bash only, one whose host is gone shows both disabled.
+ * @param {any} s SessionView
+ */
+function railItemHtml(s) {
+  const name = escapeHtml(s.name);
+  const stopped = s.status !== 'running';
+  const missing = s.hostMissing === true;
+  // INT-01: never show the raw image id here - only whether a newer build is waiting.
+  const stale = imageOutdated(s);
+  const title = escapeHtml(
+    `${s.name} - ${s.status}${s.displayName ? ` (${s.displayName})` : ''}` +
+    (missing ? ' - the host of this session no longer exists' : '') +
+    (stale ? ' - image updated, recreate to pick it up' : ''),
+  );
+  const staleIcon = stale
+    ? '<i class="bi bi-arrow-repeat text-warning ms-1" title="image updated \u2014 recreate the container to pick it up" aria-label="image updated - recreate"></i>'
+    : '';
+  const missingIcon = missing
+    ? '<i class="bi bi-exclamation-triangle text-danger ms-1" title="the host of this session no longer exists" aria-label="host gone"></i>'
+    : '';
+  const disabled = missing ? ' disabled' : '';
+  const agentId = firstAgentOf(s);
+  const agentButton = agentId
+    ? `<button type="button" class="btn btn-sm btn-link p-0 ms-1"${disabled} data-open="${escapeHtml(formatShellParam('agent', agentId))}" data-session="${name}" title="Open ${escapeHtml(agentLabel(agentId))}" aria-label="Open ${escapeHtml(agentLabel(agentId))} in ${name}"><i class="bi ${escapeHtml(agentIcon(agentId))}"></i></button>`
+    : '';
+  return (
+    `<div class="pc-rail-item${stopped ? ' is-stopped' : ''}${missing ? ' is-missing' : ''}" data-session="${name}" title="${title}">` +
+    `<span class="pc-dot ${dotClass(s.status)}"></span>` +
+    `<span class="pc-rail-name text-truncate flex-grow-1">${name}${staleIcon}${missingIcon}</span>` +
+    '<span class="pc-rail-actions">' +
+    `<button type="button" class="btn btn-sm btn-link p-0"${disabled} data-open="bash" data-session="${name}" title="Open bash" aria-label="Open bash in ${name}"><i class="bi bi-terminal"></i></button>` +
+    `${agentButton}</span></div>`
+  );
+}
+
+/**
+ * The agent a rail row offers as its quick action: the session's FIRST resolved agent.
+ * @param {any} s SessionView @returns {string} '' when the session mounts none
+ */
+function firstAgentOf(s) {
+  const list = s && Array.isArray(s.resolvedAgents) ? s.resolvedAgents : [];
+  const id = list.find((a) => typeof a === 'string' && a);
+  return id || '';
+}
+
+/**
+ * Paint #session-rail-list, grouped by host.
  *
- * TODO(F2) v0.2: GROUP BY HOST. With more than one host, emit one
- *   `<div class="pc-rail-group" data-host="<hostId>">`
- *      `<div class="pc-rail-group-head">` + hostName + a muted session count + `</div>`
- *      ...one `.pc-rail-item` per session of that host...
- *   `</div>`
- * (hosts sorted by name, the default host first; sessions sorted as today). With a single
- * host, render the flat list exactly as v0.1 did - no group header at all.
- * A session with `hostMissing === true` renders in a group headed "host gone" and its quick
- * actions are disabled.
- * The per-row quick actions become: bash (`data-open="bash"`) and the session's FIRST agent
- * (`data-open="agent:<id>"`, icon agentIcon(id), title "Open <agentLabel(id)>"); a session
- * without agents shows only bash.
+ * With more than one host, every host gets a `.pc-rail-group[data-host]` with a
+ * `.pc-rail-group-head` (host name + session count), the default host first, the rest by name
+ * and a deleted host ("host gone") last. With exactly ONE host the flat v0.1 list is rendered
+ * - no group header at all, so a single-host install is visually identical to v0.1.
+ * @param {any[]} sessions the UNFILTERED rail sessions (#code-host-filter is applied here)
  */
 function renderRail(sessions) {
   const list = byId('session-rail-list');
   if (!list) return;
-  const items = Array.isArray(sessions) ? sessions : [];
-  if (!items.length) {
+  const all = Array.isArray(sessions) ? sessions : [];
+  if (!all.length) {
     list.innerHTML =
       '<div class="p-2 small text-secondary">No sessions yet. Create one in the <a href="#/sessions">Sessions</a> tab.</div>';
     return;
   }
-  list.innerHTML = items
-    .map((s) => {
-      const name = escapeHtml(s.name);
-      const stopped = s.status !== 'running';
-      // INT-01: never show the raw image id here - only whether a newer build is waiting.
-      const stale = imageOutdated(s);
-      const title = escapeHtml(
-        `${s.name} - ${s.status}${s.displayName ? ` (${s.displayName})` : ''}` +
-        (stale ? ' - image updated, recreate to pick it up' : ''),
-      );
-      const staleIcon = stale
-        ? '<i class="bi bi-arrow-repeat text-warning ms-1" title="image updated \u2014 recreate the container to pick it up" aria-label="image updated - recreate"></i>'
-        : '';
+  const grouped = hostGroups(all).length > 1;
+  const items = filteredSessions(all);
+  if (!items.length) {
+    list.innerHTML =
+      '<div class="p-2 small text-secondary">No sessions on this host. Pick <em>All hosts</em> above to see the others.</div>';
+    return;
+  }
+  if (!grouped) {
+    list.innerHTML = items.map((s) => railItemHtml(s)).join('');
+    return;
+  }
+  list.innerHTML = hostGroups(items)
+    .map((group) => {
+      const count = group.sessions.length;
       return (
-        `<div class="pc-rail-item${stopped ? ' is-stopped' : ''}" data-session="${name}" title="${title}">` +
-        `<span class="pc-dot ${dotClass(s.status)}"></span>` +
-        `<span class="pc-rail-name text-truncate flex-grow-1">${name}${staleIcon}</span>` +
-        '<span class="pc-rail-actions">' +
-        `<button type="button" class="btn btn-sm btn-link p-0" data-open="bash" data-session="${name}" title="Open bash" aria-label="Open bash in ${name}"><i class="bi bi-terminal"></i></button>` +
-        // TODO(F2): the second quick action is the session's first resolvedAgent, not
-        // "claude": data-open="agent:<id>", icon agentIcon(id), title "Open <label>".
-        `<button type="button" class="btn btn-sm btn-link p-0 ms-1" data-open="agent:claude" data-session="${name}" title="Open the agent" aria-label="Open the agent in ${name}"><i class="bi ${escapeHtml(agentIcon('claude'))}"></i></button>` +
-        '</span></div>'
+        `<div class="pc-rail-group${group.missing ? ' is-missing' : ''}" data-host="${escapeHtml(group.id)}">` +
+        '<div class="pc-rail-group-head">' +
+        `<span class="pc-rail-group-name text-truncate">${escapeHtml(group.name)}</span>` +
+        (group.missing ? '<span class="pc-rail-group-gone">host gone</span>' : '') +
+        `<span class="pc-rail-group-count">${count}</span>` +
+        '</div>' +
+        group.sessions.map((s) => railItemHtml(s)).join('') +
+        '</div>'
       );
     })
     .join('');
@@ -808,14 +1063,16 @@ function renderRail(sessions) {
 
 /**
  * Mirror the sessions into #code-session-select (running first, remembering the choice).
- * TODO(F2) v0.2: honour the host filter, and when more than one host is present render the
- * option label as `<session> - <hostName>` so two hosts with similar names stay tellable
- * apart. Changing the selection must also re-render the agent menu (renderAgentMenu).
+ * The host filter narrows it exactly like the rail, and with more than one host the option
+ * label becomes `<session> — <hostName>` so two hosts with similar session names stay
+ * tellable apart. The agent menu belongs to the selected session, so it is rebuilt too.
+ * @param {any[]} sessions the UNFILTERED rail sessions
  */
 function renderSessionSelect(sessions) {
   const select = /** @type {HTMLSelectElement|null} */ (byId('code-session-select'));
   if (!select) return;
-  const items = (Array.isArray(sessions) ? sessions : []).slice().sort((a, b) => {
+  const multiHost = hostGroups(sessions).length > 1;
+  const items = filteredSessions(sessions).slice().sort((a, b) => {
     const ar = a.status === 'running' ? 0 : 1;
     const br = b.status === 'running' ? 0 : 1;
     if (ar !== br) return ar - br;
@@ -829,40 +1086,76 @@ function renderSessionSelect(sessions) {
     opt.textContent = 'no sessions';
     select.appendChild(opt);
     select.disabled = true;
+    renderAgentMenu();
     return;
   }
   select.disabled = false;
   for (const s of items) {
     const opt = document.createElement('option');
     opt.value = s.name;
-    opt.textContent = s.status === 'running' ? s.name : `${s.name} (${s.status})`;
+    const host = multiHost ? ` — ${hostNameOf(s)}` : '';
+    opt.textContent = `${s.name}${host}${s.status === 'running' ? '' : ` (${s.status})`}`;
     select.appendChild(opt);
   }
   const wanted = items.some((s) => s.name === previous) ? previous : items[0].name;
   select.value = wanted;
   storage.set(LS_LAST_SESSION, wanted);
+  renderAgentMenu();
 }
 
 /**
- * Fill #new-agent-menu from the SELECTED session's `resolvedAgents`:
- *   `<li><button class="dropdown-item" type="button" data-agent="<id>">`
- *   `<i class="bi <agentIcon(id)> me-2"></i><agentLabel(id)></button></li>`
- * TODO(F2): when the session has no agent, render a single disabled item
- * "no coding agent in this session" plus a link item "Settings -> Agents"; when no session
- * is selected at all, disable #btn-new-agent. Rebuild this on SESSIONS_CHANGED,
- * AGENTS_CHANGED and on every #code-session-select change - it is what makes a freshly
- * synced agent appear without a reload.
+ * Fill #new-agent-menu from the SELECTED session's `resolvedAgents` - one
+ * `<button class="dropdown-item" data-agent="<id>">` per agent, with its icon and display
+ * name. A session that mounts none shows a disabled note plus a link to Settings → Agents;
+ * with no session at all #btn-new-agent is disabled.
+ * Rebuilt on SESSIONS_CHANGED, AGENTS_CHANGED and on every #code-session-select change -
+ * that is what makes a freshly synced agent appear without a reload.
  */
 function renderAgentMenu() {
-  void agentLabel;
-  void agentIcon;
-  // TODO(F2)
+  const menu = byId('new-agent-menu');
+  const button = /** @type {HTMLButtonElement|null} */ (byId('btn-new-agent'));
+  if (!menu) return;
+  const name = selectedSession();
+  const session = name ? sessionByName(name) : null;
+  const agents = session && Array.isArray(session.resolvedAgents)
+    ? session.resolvedAgents.filter((id) => typeof id === 'string' && id)
+    : [];
+  if (button) button.disabled = !name;
+  if (!name) {
+    menu.innerHTML =
+      '<li><span class="dropdown-item disabled">no session selected</span></li>';
+    return;
+  }
+  if (!agents.length) {
+    menu.innerHTML =
+      '<li><span class="dropdown-item disabled">no coding agent in this session</span></li>' +
+      '<li><hr class="dropdown-divider"></li>' +
+      '<li><a class="dropdown-item" href="#/settings">Enable one under Settings → Agents</a></li>';
+    return;
+  }
+  menu.innerHTML = agents
+    .map((id) => (
+      '<li><button class="dropdown-item" type="button" ' +
+      `data-agent="${escapeHtml(id)}">` +
+      `<i class="bi ${escapeHtml(agentIcon(id))} me-2"></i>${escapeHtml(agentLabel(id))}` +
+      '</button></li>'
+    ))
+    .join('');
 }
 
+/**
+ * The session new terminals open on: the picked option, else the remembered one, else the
+ * first running session - always one the host filter actually shows.
+ * @returns {string} '' when no session is visible at all
+ */
 function selectedSession() {
   const select = /** @type {HTMLSelectElement|null} */ (byId('code-session-select'));
-  const value = select && select.value ? select.value : storage.get(LS_LAST_SESSION, '');
-  return value || (railSessions.find((s) => s.status === 'running') || {}).name || '';
+  const visible = filteredSessions(railSessions);
+  if (!visible.length) return '';
+  for (const candidate of [select && !select.disabled ? select.value : '', storage.get(LS_LAST_SESSION, '')]) {
+    if (candidate && visible.some((s) => s.name === candidate)) return candidate;
+  }
+  return (visible.find((s) => s.status === 'running') || visible[0] || {}).name || '';
 }
 
 function wireToolbar() {
@@ -872,16 +1165,31 @@ function wireToolbar() {
   const sh = byId('btn-new-sh');
   if (sh) sh.addEventListener('click', openFrom('sh'));
 
-  // TODO(F2): #new-agent-menu is a delegated click target - `[data-agent]` opens
-  // openTerminal(selectedSession(), formatShellParam('agent', id)). Also wire
-  // #code-host-filter (change -> storage.set(LS_CODE_HOST, value) + re-render rail/select).
+  // #new-agent-menu is rebuilt on every change, so its items are handled by delegation.
   const agentMenu = byId('new-agent-menu');
   if (agentMenu) {
     agentMenu.addEventListener('click', (event) => {
       const item = event.target.closest('[data-agent]');
       if (!item) return;
       event.preventDefault();
-      openTerminal(selectedSession(), formatShellParam('agent', item.getAttribute('data-agent')));
+      const id = item.getAttribute('data-agent') || '';
+      let wire;
+      try {
+        wire = formatShellParam('agent', id);
+      } catch (err) {
+        toastError(err, 'Unusable agent id');
+        return;
+      }
+      openTerminal(selectedSession(), wire);
+    });
+  }
+
+  const hostFilter = /** @type {HTMLSelectElement|null} */ (byId('code-host-filter'));
+  if (hostFilter) {
+    hostFilter.addEventListener('change', () => {
+      storage.set(LS_CODE_HOST, hostFilter.value || '');
+      renderRail(railSessions);
+      renderSessionSelect(railSessions);
     });
   }
 
@@ -896,7 +1204,13 @@ function wireToolbar() {
   }
 
   const select = /** @type {HTMLSelectElement|null} */ (byId('code-session-select'));
-  if (select) select.addEventListener('change', () => storage.set(LS_LAST_SESSION, select.value));
+  if (select) {
+    select.addEventListener('change', () => {
+      storage.set(LS_LAST_SESSION, select.value);
+      // the Agent dropdown belongs to the SELECTED session
+      renderAgentMenu();
+    });
+  }
 
   const list = byId('session-rail-list');
   if (list) {
@@ -915,6 +1229,7 @@ function wireToolbar() {
       if (select2 && name) {
         select2.value = name;
         storage.set(LS_LAST_SESSION, name);
+        renderAgentMenu();
       }
     });
     list.addEventListener('dblclick', (event) => {
@@ -960,11 +1275,29 @@ async function init(ctx) {
     renderRail(railSessions);
     renderSessionSelect(railSessions);
     renderAgentMenu();
+    // a session may just have learned its host name -> the tab prefixes change with it
+    refreshTitles();
+  });
+  // Which host is the DEFAULT one only decides the order of the rail groups; hosts.js is
+  // never imported (see "hosts, as seen from the sessions" above).
+  bus.on(EVENTS.HOSTS_CHANGED, ({ defaultHostId }) => {
+    defaultHostIdHint = typeof defaultHostId === 'string' ? defaultHostId : '';
+    renderHostFilter(railSessions);
+    renderRail(railSessions);
+    renderSessionSelect(railSessions);
   });
   // v0.2: `shell` is the wire value ('bash' | 'sh' | 'agent:<id>'); 'claude' still parses.
   bus.on(EVENTS.OPEN_TERMINAL, ({ session, shell }) => openTerminal(session, shell || 'bash'));
   // A newly installed/renamed agent must reach the menu and the tab titles without a reload.
-  bus.on(EVENTS.AGENTS_CHANGED, () => renderAgentMenu());
+  bus.on(EVENTS.AGENTS_CHANGED, () => {
+    renderRail(railSessions);
+    renderAgentMenu();
+    // open panes keep the label they were built with; refresh it for their 4410 note
+    for (const entry of panes.values()) {
+      if (entry.state.shell === 'agent') entry.pane.agentName = agentLabel(entry.state.agentId);
+    }
+    refreshTitles();
+  });
   bus.on(EVENTS.THEME_CHANGED, ({ theme }) => {
     for (const entry of panes.values()) entry.pane.setTheme(theme);
   });

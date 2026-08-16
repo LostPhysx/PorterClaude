@@ -106,27 +106,33 @@ function watchSystemTheme() {
 
 /**
  * Paint #backend-badge from `SanitizedSettings.hosts`
- * (`{count, defaultHostId, socketAvailable, socketHostId}`) - the element id is unchanged,
- * its meaning is not: it summarises the HOSTS now.
- *
- * TODO(F1): render
- *   count === 0  -> warning  "no host configured"          (links to #/settings)
- *   count === 1  -> success  "host: <name>"                (hostLabel(defaultHostId))
- *   count > 1    -> primary  "<count> hosts - default: <name>"
- * and set a `title` listing every host name with its status once HOSTS_CHANGED has landed
- * (getHosts()). Never block on a probe: this reads the cache only.
+ * (`{count, defaultHostId, socketAvailable, socketHostId}`) plus the host cache - the
+ * element id is unchanged, its meaning is not: it summarises the HOSTS now. Reads caches
+ * only, never a probe.
  * @param {any|null} settings SanitizedSettings
  */
 function updateHostsBadge(settings) {
   const el = byId('backend-badge');
   if (!el) return;
-  void getHosts;
-  void hostLabel;
-  void getDefaultHostId;
-  const count = settings && settings.hosts ? Number(settings.hosts.count || 0) : 0;
-  // TODO(F1): the full wording above; this placeholder keeps the shell honest meanwhile.
-  el.className = count > 0 ? 'badge text-bg-secondary text-decoration-none' : 'badge text-bg-warning text-decoration-none';
-  el.textContent = count > 0 ? `hosts: ${count}` : 'no host configured';
+  const cached = getHosts();
+  const count = cached.length || (settings && settings.hosts ? Number(settings.hosts.count || 0) : 0);
+  const defaultId =
+    getDefaultHostId() || (settings && settings.hosts ? settings.hosts.defaultHostId : null) || null;
+
+  let variant = 'text-bg-warning';
+  let text = 'no host configured';
+  if (count === 1) {
+    variant = 'text-bg-success';
+    text = `host: ${hostLabel(defaultId || (cached[0] && cached[0].id) || '')}`;
+  } else if (count > 1) {
+    variant = 'text-bg-primary';
+    text = `${count} hosts · default: ${hostLabel(defaultId || '')}`;
+  }
+  el.className = `badge ${variant} text-decoration-none`;
+  el.textContent = text;
+  el.title = cached.length
+    ? cached.map((h) => `${h.name} (${h.id}): ${h.status || 'unknown'}`).join('\n')
+    : 'no Docker host is configured yet - open Settings and add one';
 }
 
 // ---------------------------------------------------------------------------
@@ -406,6 +412,9 @@ export async function boot() {
       applyTheme(settings.ui.theme);
     }
   });
+
+  // the chip follows every host list/CRUD (hosts.js emits it)
+  bus.on(EVENTS.HOSTS_CHANGED, () => updateHostsBadge(appSettings));
 
   bus.on(EVENTS.AUTH_REQUIRED, () => {
     if (loginVisible) return;

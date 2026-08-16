@@ -2,12 +2,15 @@
 // Persists <DATA_DIR>/config.json atomically (tmp file in the same dir + rename), serialises
 // writes through an internal promise chain, and emits 'change' after every successful write.
 import { EventEmitter } from 'node:events';
+import fsSync from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { AppConfigSchema, CONFIG_VERSION, defaultConfig } from './schema.js';
+import { AppConfigSchema, CONFIG_VERSION, CONFIG_VERSION_V1, defaultConfig } from './schema.js';
 import type { AppConfig, GeneralConfig, SanitizedSettings } from './schema.js';
 import type { SessionConfig } from '../sessions/model.js';
 import type { HostConfig, PortainerCredentialConfig } from '../hosts/model.js';
+import { LEGACY_HOST_ID } from '../hosts/model.js';
+import { DEFAULT_ENABLED_AGENT_IDS } from '../agents/builtin.js';
 import type { AgentDefinition } from '../agents/model.js';
 import type { SecretBox } from './crypto.js';
 import { hashPassword } from './crypto.js';
@@ -45,7 +48,6 @@ export class ConfigStore extends EventEmitter {
   private current: AppConfig | null = null;
   /** serialises every write so two concurrent update() calls cannot interleave */
   private queue: Promise<unknown> = Promise.resolve();
-  private decryptWarned = false;
 
   constructor(private readonly deps: ConfigStoreDeps) {
     super();
@@ -141,9 +143,6 @@ export class ConfigStore extends EventEmitter {
    *
    * A file that is already v2 passes through. A file from a NEWER version is used as-is
    * with a warning (same rule as v0.1).
-   *
-   * TODO(B1): implement. config-store.test.ts must cover a v1 portainer file, a v1 socket
-   * file, a v1 file with sessions (incl. shareHistory:false) and an empty v1 file.
    */
   private migrate(raw: unknown): unknown {
     if (!raw || typeof raw !== 'object') return raw;
@@ -151,8 +150,101 @@ export class ConfigStore extends EventEmitter {
     const version = typeof obj.version === 'number' ? obj.version : 0;
     if (version > CONFIG_VERSION) {
       this.deps.log.warn({ version }, 'config.json was written by a newer version; using it as-is');
+      return obj;
     }
-    return obj;
+    if (version >= CONFIG_VERSION) return obj;
+
+    // ---- v1 (or a pre-versioned file) -> v2 --------------------------------
+    this.backupV1(obj);
+
+    const next: Record<string, unknown> = { ...obj };
+    delete next.backend;
+    next.version = CONFIG_VERSION;
+
+    const now = new Date().toISOString();
+    const backend = (obj.backend ?? {}) as Record<string, unknown>;
+    const kind = typeof backend.kind === 'string' ? backend.kind : 'none';
+    const portainer = (backend.portainer ?? {}) as Record<string, unknown>;
+    const socket = (backend.socket ?? {}) as Record<string, unknown>;
+
+    const hosts: Record<string, unknown>[] = [];
+    const credentials: Record<string, unknown>[] = [];
+
+    const makeHost = (name: string, connection: Record<string, unknown>): Record<string, unknown> => ({
+      id: LEGACY_HOST_ID,
+      name,
+      connection,
+      overrides: {},
+      agents: { enabled: [...DEFAULT_ENABLED_AGENT_IDS] },
+      notes: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    if (kind === 'portainer') {
+      const url = typeof portainer.url === 'string' ? portainer.url : '';
+      credentials.push({
+        id: 'portainer-1',
+        name: hostnameOf(url) || 'portainer',
+        url,
+        // already encrypted with the same master key: copied verbatim, never re-encrypted
+        apiKeyEnc: typeof portainer.apiKeyEnc === 'string' ? portainer.apiKeyEnc : null,
+        insecureTls: portainer.insecureTls === true,
+        createdAt: now,
+        updatedAt: now,
+      });
+      hosts.push(
+        makeHost('Default', {
+          type: 'portainer',
+          credentialId: 'portainer-1',
+          endpointId: typeof portainer.endpointId === 'number' ? portainer.endpointId : 0,
+        }),
+      );
+    } else if (kind === 'socket') {
+      const socketPath =
+        typeof socket.socketPath === 'string' && socket.socketPath
+          ? socket.socketPath
+          : '/var/run/docker.sock';
+      hosts.push(makeHost('Local docker', { type: 'socket', socketPath }));
+    }
+    // kind === 'none': no host at all - the first-run state is preserved as such.
+
+    next.hosts = hosts;
+    next.defaultHostId = hosts[0]?.id ?? null;
+    const existingCredentials = (obj.credentials ?? {}) as Record<string, unknown>;
+    next.credentials = { ...existingCredentials, portainer: credentials };
+
+    if (Array.isArray(obj.sessions)) {
+      next.sessions = obj.sessions.map((entry) => {
+        if (!entry || typeof entry !== 'object') return entry;
+        const session = entry as Record<string, unknown>;
+        return {
+          ...session,
+          // the schema defaults would do the same; writing them makes the file self-describing
+          hostId: typeof session.hostId === 'string' ? session.hostId : LEGACY_HOST_ID,
+          agents: Array.isArray(session.agents) ? session.agents : null,
+        };
+      });
+    }
+
+    this.deps.log.info(
+      { hosts: hosts.length, credentials: credentials.length, from: version || CONFIG_VERSION_V1 },
+      'migrated config.json to version 2',
+    );
+    return next;
+  }
+
+  /** `<configFile>.v1.bak`, written once (best effort) before the first v2 write. */
+  private backupV1(obj: Record<string, unknown>): void {
+    const target = `${this.deps.paths.configFile}.v1.bak`;
+    try {
+      fsSync.writeFileSync(target, `${JSON.stringify(obj, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
+      this.deps.log.info({ backup: target }, 'kept a copy of the v1 config before migrating');
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') {
+        this.deps.log.warn({ err: (err as Error).message }, 'could not write the v1 config backup');
+      }
+    }
   }
 
   /**
@@ -164,11 +256,74 @@ export class ConfigStore extends EventEmitter {
    * The created host becomes defaultHostId and enables DEFAULT_ENABLED_AGENT_IDS. The env
    * is never re-applied once a host exists - the UI is the source of truth then.
    *
-   * TODO(B1): implement (v0.1 seeded backend.*; the variable names stay the same so
-   * existing deploy/.env files keep working).
+   * The variable names are the v0.1 ones so existing deploy/.env files keep working.
    */
   private applyEnvSeeds(draft: AppConfig): void {
-    void draft;
+    const { env, secrets, log } = this.deps;
+    if (draft.hosts.length > 0) return;
+
+    const wantPortainer =
+      env.PORTERCLAUDE_BACKEND === 'portainer' || (!!env.PORTAINER_URL && !!env.PORTAINER_API_KEY);
+    const wantSocket = env.PORTERCLAUDE_BACKEND === 'socket';
+    const now = new Date().toISOString();
+
+    if (wantPortainer) {
+      const url = (env.PORTAINER_URL ?? '').replace(/\/+$/, '');
+      if (!url || !env.PORTAINER_API_KEY) {
+        log.warn(
+          'PORTERCLAUDE_BACKEND=portainer needs PORTAINER_URL and PORTAINER_API_KEY; skipping the seed',
+        );
+        return;
+      }
+      const credentialId = 'portainer-1';
+      draft.credentials.portainer = [
+        {
+          id: credentialId,
+          name: hostnameOf(url) || 'portainer',
+          url,
+          apiKeyEnc: secrets.encrypt(env.PORTAINER_API_KEY),
+          insecureTls: false,
+          createdAt: now,
+          updatedAt: now,
+        },
+      ];
+      draft.hosts = [
+        {
+          id: LEGACY_HOST_ID,
+          name: 'Default',
+          connection: {
+            type: 'portainer',
+            credentialId,
+            endpointId: env.PORTAINER_ENDPOINT_ID ?? 0,
+          },
+          overrides: {},
+          agents: { enabled: [...DEFAULT_ENABLED_AGENT_IDS] },
+          notes: null,
+          createdAt: now,
+          updatedAt: now,
+        },
+      ];
+      draft.defaultHostId = LEGACY_HOST_ID;
+      log.info({ hostId: LEGACY_HOST_ID }, 'seeded the first portainer host from the environment');
+      return;
+    }
+
+    if (wantSocket) {
+      draft.hosts = [
+        {
+          id: LEGACY_HOST_ID,
+          name: 'Local docker',
+          connection: { type: 'socket', socketPath: env.DOCKER_SOCKET },
+          overrides: {},
+          agents: { enabled: [...DEFAULT_ENABLED_AGENT_IDS] },
+          notes: null,
+          createdAt: now,
+          updatedAt: now,
+        },
+      ];
+      draft.defaultHostId = LEGACY_HOST_ID;
+      log.info({ hostId: LEGACY_HOST_ID }, 'seeded the first socket host from the environment');
+    }
   }
 
   /** Current config (deep-frozen snapshot; never mutate). */
@@ -325,9 +480,6 @@ export class ConfigStore extends EventEmitter {
   /**
    * Secret-free projection for GET /api/settings. v0.2: there is no backend section any
    * more - hosts (and their credentials) live at GET /api/hosts and /api/credentials.
-   *
-   * TODO(B1): set hosts.socketHostId to the id of the single host whose connection.type is
-   * 'socket' (null when there is none).
    */
   sanitized(extra: { socketAvailable: boolean }): SanitizedSettings {
     const cfg = this.get();
@@ -339,7 +491,7 @@ export class ConfigStore extends EventEmitter {
         count: cfg.hosts.length,
         defaultHostId: cfg.defaultHostId,
         socketAvailable: extra.socketAvailable,
-        socketHostId: null,
+        socketHostId: cfg.hosts.find((h) => h.connection.type === 'socket')?.id ?? null,
       },
     };
   }
@@ -376,5 +528,14 @@ export class ConfigStore extends EventEmitter {
       }
     });
     return removed;
+  }
+}
+
+/** Hostname of a url, used for the auto-generated credential name; '' when unparsable. */
+function hostnameOf(url: string): string {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return '';
   }
 }

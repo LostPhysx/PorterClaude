@@ -193,8 +193,19 @@ async function changePassword(event) {
 // sub-tabs
 // ---------------------------------------------------------------------------
 
-/** The panel module behind each sub-tab (all implement { init, show, hide }). */
-const PANELS = { hosts: hostsPanel, agents: agentsPanel, images: imagesPanel };
+/**
+ * The panel module behind each sub-tab (all implement { init, show, hide }).
+ *
+ * Resolved LAZILY on purpose: hosts.js imports GENERAL_FIELDS from this module (the per-host
+ * "overrides" form is the same field list as Settings -> General), which makes
+ * settings.js <-> hosts.js a module cycle. Building the map at module-evaluation time would
+ * read the panel bindings of a module whose body may not have run yet; every call site here
+ * runs long after the graph is fully evaluated.
+ * @returns {Record<string, {init:Function, show:Function, hide:Function}>}
+ */
+function panels() {
+  return { hosts: hostsPanel, agents: agentsPanel, images: imagesPanel };
+}
 
 /**
  * Sub-tab switcher for #settings-subtabs / .pc-subview. Exactly one panel is "shown" at a
@@ -209,7 +220,7 @@ export function showSubtab(name) {
   document.querySelectorAll('.pc-subview[data-subtab]').forEach((pane) => {
     pane.classList.toggle('d-none', pane.getAttribute('data-subtab') !== currentSubtab);
   });
-  for (const [key, panel] of Object.entries(PANELS)) {
+  for (const [key, panel] of Object.entries(panels())) {
     if (key === currentSubtab) panel.show();
     else panel.hide();
   }
@@ -245,7 +256,7 @@ const settingsView = {
     const passwordForm = byId('password-form');
     if (passwordForm) passwordForm.addEventListener('submit', (e) => { void changePassword(e); });
 
-    for (const [key, panel] of Object.entries(PANELS)) {
+    for (const [key, panel] of Object.entries(panels())) {
       try {
         await panel.init(ctx);
       } catch (err) {
@@ -268,7 +279,7 @@ const settingsView = {
     setTimeout(() => showSubtab(currentSubtab), 0);
   },
   hide() {
-    for (const panel of Object.values(PANELS)) panel.hide();
+    for (const panel of Object.values(panels())) panel.hide();
   },
   refresh() {
     void reload().catch(() => {});

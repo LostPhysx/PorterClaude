@@ -1,17 +1,22 @@
-# PorterClaude — generic compose. OWNER: O1.
-# This is the file a stranger copy-pastes: one service, both Docker backends, no host-specific
-# assumptions. The reference deployment (nginx-proxy + acme-companion) lives in deploy/.
-# See docs/DEPLOYMENT.md.
+# PorterClaude — generic compose. OWNER: O2.
+# This is the file a stranger copy-pastes: one service, one optional docker socket, no
+# host-specific assumptions. The reference deployment (nginx-proxy + acme-companion) lives
+# in deploy/. See docs/DEPLOYMENT.md.
 #
 #   docker compose up -d          then open http://localhost:8080 and log in with APP_PASSWORD
 #
-# Pick ONE backend:
-#   socket mode    — mount /var/run/docker.sock (below) and add the docker group to group_add.
+# EVERYTHING ELSE IS CONFIGURED IN THE APP: docker hosts (local socket and/or Portainer
+# endpoints), coding agents, images and sessions. There is no environment variable for a
+# second host, for an agent or for an image — see docs/DEPLOYMENT.md and docs/AGENTS.md.
+#
+# The environment variables below only SEED THE FIRST HOST, and only while no host exists
+# yet (an unattended-install convenience; once /data holds a host they are ignored):
+#   local socket   — mount /var/run/docker.sock (below) and add the docker group to group_add.
 #                    The app runs as uid 10001, so without group_add it cannot read the socket
-#                    and Settings will report "socket detected: false".
+#                    and the host reports itself unavailable.
 #                        docker gid:  stat -c %g /var/run/docker.sock
-#   portainer mode — drop the socket mount entirely and set PORTAINER_URL / PORTAINER_API_KEY /
-#                    PORTAINER_ENDPOINT_ID (or just configure it in Settings, which stores the
+#   portainer      — drop the socket mount entirely and set PORTAINER_URL / PORTAINER_API_KEY /
+#                    PORTAINER_ENDPOINT_ID (or just add the host in Settings, which stores the
 #                    key encrypted in /data). Nothing else is needed.
 #
 # Behind a reverse proxy: terminals use WebSockets, so the proxy must forward the `Upgrade`
@@ -31,11 +36,11 @@ services:
     environment:
       APP_PASSWORD: ${APP_PASSWORD:-change-me}
       # APP_SECRET: ...                       # optional; auto-generated into /data/secret.key
-      # PORTERCLAUDE_BACKEND: socket          # socket | portainer (also selectable in Settings)
-      # --- portainer mode -------------------------------------------------------------
+      # PORTERCLAUDE_BACKEND: socket          # socket | portainer — seeds the FIRST host only
+      # --- seeding a portainer host ---------------------------------------------------
       # PORTAINER_URL: https://portainer.example.com
-      # PORTAINER_API_KEY: ...                # seeds Settings once; stored encrypted in /data
-      # PORTAINER_ENDPOINT_ID: 2
+      # PORTAINER_API_KEY: ...                # seeds one credential; stored encrypted in /data
+      # PORTAINER_ENDPOINT_ID: 2              # more hosts: Settings -> Hosts -> Import endpoints
       # --------------------------------------------------------------------------------
       # LOG_LEVEL: info
       # TRUST_PROXY: 1                        # set when running behind a reverse proxy
@@ -43,13 +48,15 @@ services:
       # SESSION_TTL_DAYS: 30
     volumes:
       - porterclaude-data:/data               # MUST persist: holds secret.key + config.json
-      - /var/run/docker.sock:/var/run/docker.sock   # socket mode only; drop for Portainer mode
+      - /var/run/docker.sock:/var/run/docker.sock   # only for a local-socket host; drop otherwise
     # group_add:                              # the app runs as uid 10001 and needs the docker
     #   - "999"                               # group to use the socket: stat -c %g /var/run/docker.sock
     # healthcheck comes from the image (HEALTHCHECK on /api/health) — no override needed,
     # and it must NOT be replaced by a curl/wget command: neither exists in the image.
 
 volumes:
-  # Losing this volume logs everyone out and makes the stored Portainer API key
+  # Losing this volume logs everyone out and makes the stored Portainer API keys
   # undecryptable (it holds /data/secret.key) — back it up, do not prune it.
+  # NOTE: the agent logins do NOT live here. They live on each managed docker host, in the
+  # per-agent volumes porterclaude-auth-<agentId> (docs/DEPLOYMENT.md, "Volumes").
   porterclaude-data:

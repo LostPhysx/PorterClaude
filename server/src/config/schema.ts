@@ -12,7 +12,7 @@
 //     `sharedClaudeHomeVolume` are kept but are LEGACY (only the one-time claude auth import
 //     reads them, see backend.md v0.2 §12.4).
 // The v1 -> v2 migration is lossless and writes `<DATA_DIR>/config.json.v1.bak` first
-// (ConfigStore.migrate, TODO(B1)).
+// (ConfigStore.migrate).
 import { z } from 'zod';
 import { GENERAL_FIELD_SCHEMAS, stored } from './fields.js';
 import { SessionConfigSchema } from '../sessions/model.js';

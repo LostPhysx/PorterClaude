@@ -9,7 +9,12 @@
 # The app runs as uid 10001 (non-root). To use /var/run/docker.sock it must be in the
 # socket's group, hence `group_add` below:
 #     ssh <docker-host> stat -c %g /var/run/docker.sock     # -> put that gid in DOCKER_GID
-# Portainer mode (PORTERCLAUDE_BACKEND=portainer) needs no socket and no group_add at all.
+# A Portainer-only install (PORTERCLAUDE_BACKEND=portainer) needs no socket and no group_add.
+#
+# PORTERCLAUDE_BACKEND below only SEEDS THE FIRST HOST, and only while /data holds none.
+# Everything after that — more docker hosts (Settings -> Hosts, incl. Portainer credentials
+# and endpoint import), the coding agents installed on each host, images and sessions — is
+# configured in the app. See docs/DEPLOYMENT.md and docs/AGENTS.md.
 services:
   porterclaude:
     image: ${APP_IMAGE:-ghcr.io/lostphysx/porterclaude:latest}
@@ -21,13 +26,15 @@ services:
       VIRTUAL_HOST: ${APP_HOSTNAME}
       LETSENCRYPT_HOST: ${APP_HOSTNAME}
       VIRTUAL_PORT: 8080
-      PORTERCLAUDE_BACKEND: socket
+      PORTERCLAUDE_BACKEND: socket        # seeds the first host as the local docker socket
       TRUST_PROXY: "1"
       COOKIE_SECURE: auto
       LOG_LEVEL: ${LOG_LEVEL:-info}
     volumes:
-      # MUST persist: holds secret.key (encrypts the stored Portainer key) + config.json.
-      # Losing it logs everyone out and makes the stored key undecryptable.
+      # MUST persist: holds secret.key (encrypts the stored Portainer keys) + config.json
+      # (hosts, agents, sessions). Losing it logs everyone out and makes the stored keys
+      # undecryptable. The AGENT LOGINS are not in here: they live on each managed docker
+      # host, in the per-agent volumes porterclaude-auth-<agentId>.
       - porterclaude-data:/data
       - /var/run/docker.sock:/var/run/docker.sock
     group_add:

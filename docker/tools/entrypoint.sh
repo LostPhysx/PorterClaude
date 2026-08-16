@@ -1,8 +1,5 @@
 #!/bin/sh
-# TODO(O1): remove this line once the bodies below are implemented — it only silences the
-# "assigned but never used / arguments never passed" warnings a skeleton necessarily has.
-# shellcheck disable=SC2034,SC2119,SC2120,SC2317
-# PorterClaude — session bootstrap. OWNER: O1. RUNTIME. PLANNER SKELETON for v0.2.
+# PorterClaude — session bootstrap. OWNER: O1. RUNTIME. v0.2.
 # Spec: docs/design/orchestration.md §14 (v0.2), §4.4 (v0.1 background).
 #
 # v0.2: this is the entrypoint of EVERY managed session (recipe AND custom image), not just
@@ -176,28 +173,101 @@ for_each_link() {
   _cb="$1"
   _links="${PORTERCLAUDE_AGENT_LINKS:-}"
   [ -n "$_links" ] || return 0
-  # TODO(O1): split $_links on ';', then each entry on '|', and call "$_cb" target source
-  #           kind. Use `IFS=';'` in a subshell-free way (set -- $_links after IFS change)
-  #           so it works in dash/ash; restore IFS afterwards. Skip entries whose target or
-  #           source is empty, and normalise an unknown kind to 'dir'.
-  :
+  _oldifs="$IFS"
+  IFS=';'
+  # shellcheck disable=SC2086  # deliberate field splitting on ';'
+  set -- $_links
+  IFS="$_oldifs"
+  for _entry in "$@"; do
+    [ -n "$_entry" ] || continue
+    # an entry is `target|source|kind`; anything else is ignored rather than guessed
+    case "$_entry" in
+      *'|'*'|'*) ;;
+      *) warn "ignoring the malformed agent link '$_entry'"; continue ;;
+    esac
+    _lt="${_entry%%|*}"
+    _lrest="${_entry#*|}"
+    _ls="${_lrest%%|*}"
+    _lk="${_lrest#*|}"
+    [ -n "$_lt" ] && [ -n "$_ls" ] || continue
+    case "$_lk" in
+      file) _lk='file' ;;
+      *)    _lk='dir' ;;
+    esac
+    "$_cb" "$_lt" "$_ls" "$_lk"
+  done
+  return 0
 }
 
 # link_one <target> <source> <kind> : create ONE agent symlink (best effort).
 #   * mkdir -p the parent of <target>
 #   * kind=dir  : mkdir -p <source>
-#     kind=file : seed <source> when absent — `{}` when its basename ends in `.json`,
-#                 otherwise an empty file (agents rewrite these atomically, so the file must
-#                 exist inside the volume before the link is used)
+#     kind=file : seed <source> when absent — `{}` when its basename ends in `.json`, `.yml`
+#                 or `.yaml`, otherwise an empty file (agents rewrite these atomically, so
+#                 the file must exist inside the volume before the link is used)
+#
+#                 QA OPS-2: a ZERO-BYTE config is not a neutral default for a structured
+#                 format. aider's shared `~/.aider.conf.yml` was seeded empty, so every
+#                 session got `yaml.load(...) returned type NoneType instead of dict` and
+#                 `aider` exited 2. `{}` is an empty mapping in JSON *and* YAML (JSON is a
+#                 YAML subset), so it is the correct empty seed for all three suffixes. An
+#                 already-seeded empty file is repaired the same way — a 0-byte file holds
+#                 no user data, and volumes seeded by an earlier build must heal themselves.
 #   * an existing regular file/directory at <target> is PARKED ASIDE (park_aside), never
 #     deleted; an existing symlink pointing elsewhere is replaced
 #   * ln -s <source> <target>
 # A read-only or not-yet-chowned auth volume must only produce a warning: the server chowns
 # <home>/.porterclaude and re-runs us with --porterclaude-bootstrap.
 link_one() {
-  # TODO(O1)
   _t="$1"; _s="$2"; _k="$3"
-  warn "link_one is not implemented yet ($_t -> $_s, $_k)"
+
+  _tp="$(dirname "$_t")"
+  if [ ! -d "$_tp" ]; then
+    mkdir -p "$_tp" 2>/dev/null || {
+      warn "cannot create $_tp — skipping the link $_t"
+      return 0
+    }
+  fi
+
+  mkdir -p "$(dirname "$_s")" 2>/dev/null || :
+  if [ "$_k" = "dir" ]; then
+    if [ ! -d "$_s" ]; then
+      mkdir -p "$_s" 2>/dev/null || {
+        warn "cannot create the link source $_s (the agent volume is not writable for this uid yet)"
+        return 0
+      }
+    fi
+  else
+    # `{}` parses as an empty mapping in JSON and in YAML; anything else gets a 0-byte file
+    _seed=''
+    case "$_s" in
+      *.json|*.yml|*.yaml) _seed='{}' ;;
+    esac
+    if [ ! -e "$_s" ]; then
+      if [ -n "$_seed" ]; then
+        printf '%s\n' "$_seed" > "$_s" 2>/dev/null
+      else
+        : > "$_s" 2>/dev/null
+      fi || {
+        warn "cannot seed the link source $_s (the agent volume is not writable for this uid yet)"
+        return 0
+      }
+    elif [ -n "$_seed" ] && [ -f "$_s" ] && [ ! -s "$_s" ]; then
+      # left behind by an entrypoint that seeded structured configs empty (QA OPS-2)
+      printf '%s\n' "$_seed" > "$_s" 2>/dev/null \
+        || warn "cannot repair the empty link source $_s"
+    fi
+  fi
+
+  if [ -L "$_t" ] && [ "$(readlink "$_t" 2>/dev/null || echo)" = "$_s" ]; then
+    return 0
+  fi
+  park_aside "$_t" || return 0
+  if ln -s "$_s" "$_t" 2>/dev/null; then
+    log "linked $_t -> $_s"
+  else
+    warn "cannot link $_t -> $_s"
+  fi
   return 0
 }
 
@@ -232,21 +302,65 @@ owner_of() {
 # agents_owner : "uid:gid" that should own everything we write into the agent volumes —
 # the first non-root owner among <home>/.porterclaude/agents/*, else $RECIPE_OWNER.
 agents_owner() {
-  # TODO(O1): iterate "$HOME"/.porterclaude/agents/*, use owner_of, skip empty and 0:*,
-  #           print the first match; fall back to $RECIPE_OWNER.
+  for _ad in "$HOME"/.porterclaude/agents/*; do
+    [ -e "$_ad" ] || continue
+    _ao="$(owner_of "$_ad")"
+    [ -n "$_ao" ] || continue
+    case "$_ao" in
+      0:*) continue ;;
+    esac
+    printf '%s' "$_ao"
+    return 0
+  done
   printf '%s' "$RECIPE_OWNER"
 }
 
 # claim_agents : root only. chown -R the agent root and every link target to agents_owner,
 # then tighten obvious credential files (0600 on */\.credentials.json, auth.json, *.key).
 # Non-root sessions only warn when an agent dir belongs to a foreign uid (they cannot fix it).
+claim_link_target() {
+  # $1 = target, $2 = source, $3 = kind — chown the symlink itself (-h) and, when the source
+  # sits outside the agent root, the source too.
+  [ -n "${CLAIM_OWNER:-}" ] || return 0
+  if [ -L "$1" ]; then
+    chown -h "$CLAIM_OWNER" "$1" 2>/dev/null || :
+  fi
+  case "$2" in
+    "$AGENT_ROOT"/*) ;;
+    *) chown -R "$CLAIM_OWNER" "$2" 2>/dev/null || : ;;
+  esac
+  return 0
+}
+
 claim_agents() {
+  AGENT_ROOT="$HOME/.porterclaude"
   if ! am_root; then
-    # TODO(O1): warn once when <home>/.porterclaude/agents/<id> belongs to another uid —
-    #           that is the "your image runs as the wrong user" diagnosis.
+    _me="$(id -u 2>/dev/null || echo)"
+    for _cd in "$AGENT_ROOT"/agents/*; do
+      [ -d "$_cd" ] || continue
+      _co="$(owner_of "$_cd")"
+      [ -n "$_co" ] || continue
+      case "$_co" in
+        "$_me":*) continue ;;
+      esac
+      warn "$_cd belongs to uid ${_co%%:*} but this session runs as uid ${_me:-?} —"
+      warn "the agent may not be able to write its login; start the session as that uid"
+      break
+    done
     return 0
   fi
-  # TODO(O1)
+
+  [ -d "$AGENT_ROOT" ] || mkdir -p "$AGENT_ROOT/agents" 2>/dev/null || return 0
+  CLAIM_OWNER="$(agents_owner)"
+  chown -R "$CLAIM_OWNER" "$AGENT_ROOT" 2>/dev/null \
+    || warn "cannot chown $AGENT_ROOT to $CLAIM_OWNER"
+  for_each_link claim_link_target
+
+  # credentials must not be world readable — every session of this host shares the volume,
+  # but the container may still be shared with a non-agent process
+  find "$AGENT_ROOT" -type f \
+    \( -name '.credentials.json' -o -name 'credentials.json' -o -name 'auth.json' -o -name '*.key' \) \
+    -exec chmod 0600 {} \; 2>/dev/null || :
   return 0
 }
 
@@ -258,7 +372,33 @@ claim_agents() {
 install_agent_wrappers() {
   am_root || return 0
   [ -d "$TOOLS/bin" ] || return 0
-  # TODO(O1)
+  if [ ! -d /usr/local/bin ]; then
+    mkdir -p /usr/local/bin 2>/dev/null || return 0
+  fi
+  for _sh in "$TOOLS"/bin/*; do
+    [ -f "$_sh" ] || continue
+    [ -x "$_sh" ] || continue
+    _wn="$(basename "$_sh")"
+    case "$_wn" in
+      pc-agent|pc-*) continue ;;
+    esac
+    _wp="/usr/local/bin/$_wn"
+    if [ -e "$_wp" ] && ! grep -q 'porterclaude agent wrapper' "$_wp" 2>/dev/null; then
+      continue
+    fi
+    # never shadow a tool the image itself provides somewhere else on PATH
+    _res="$(command -v "$_wn" 2>/dev/null || echo)"
+    case "$_res" in
+      ''|"$TOOLS"/*|"$_wp") ;;
+      *) continue ;;
+    esac
+    {
+      printf '#!/bin/sh\n'
+      printf '# porterclaude agent wrapper (generated by entrypoint.sh)\n'
+      printf 'exec "%s" "$@"\n' "$_sh"
+    } > "$_wp" 2>/dev/null && chmod 0755 "$_wp" 2>/dev/null \
+      || warn "cannot write the wrapper $_wp"
+  done
   return 0
 }
 
@@ -295,6 +435,19 @@ link_to() {
   ln -s "$tgt" "$lnk" 2>/dev/null || warn "cannot link $lnk -> $tgt"
 }
 
+# bridge_one_link <target> <source> <kind> : the same relative path below $IMAGE_HOME,
+# pointing at the SAME source inside the agent volume.
+bridge_one_link() {
+  case "$1" in
+    "$HOME"/*) _brel="${1#"$HOME"/}" ;;
+    *)         return 0 ;;
+  esac
+  _bt="$IMAGE_HOME/$_brel"
+  mkdir -p "$(dirname "$_bt")" 2>/dev/null || return 0
+  link_to "$_bt" "$2"
+  return 0
+}
+
 # Anything resolving `~` through the passwd entry (su -, sudo -i, os.homedir(), bash tilde
 # expansion) must land on the same agent state. For every link target below $HOME, create the
 # same relative path below $IMAGE_HOME pointing at the SAME source.
@@ -313,9 +466,8 @@ bridge_image_home() {
     return 0
   fi
   log "bridging the image home $IMAGE_HOME -> $HOME (shared agent logins)"
-  # TODO(O1): for_each_link <cb> where <cb> maps a target under $HOME to
-  #           "$IMAGE_HOME/${target#$HOME/}" and calls link_to <that> <source>.
-  #           Also bridge "$IMAGE_HOME/.porterclaude" -> "$HOME/.porterclaude".
+  for_each_link bridge_one_link
+  link_to "$IMAGE_HOME/.porterclaude" "$HOME/.porterclaude"
   return 0
 }
 

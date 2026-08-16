@@ -168,6 +168,37 @@
 .pc-rail-group-head .pc-rail-group-count { margin-left: auto; opacity: .7; }
 .pc-rail-group.is-missing .pc-rail-group-head { color: var(--bs-danger-text-emphasis); }
 
+/* the host name may be longer than the rail; the count must stay readable */
+.pc-rail-group-head .pc-rail-group-name { min-width: 0; }
+.pc-rail-group-head .pc-rail-group-count {
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+}
+/* "host gone": the group of the sessions of a host that was deleted with force=1 */
+.pc-rail-group-head .pc-rail-group-gone {
+  flex: 0 0 auto;
+  padding: 0 .3rem;
+  border-radius: .2rem;
+  background: var(--bs-danger-bg-subtle);
+  color: var(--bs-danger-text-emphasis);
+  text-transform: none;
+  letter-spacing: 0;
+}
+.pc-rail-group.is-missing .pc-rail-group-head { background: var(--bs-danger-bg-subtle); }
+.pc-rail-item.is-missing { opacity: .75; cursor: default; }
+/* a session whose host is gone can only be destroyed - its quick actions are inert */
+.pc-rail-item.is-missing .pc-rail-actions .btn:disabled {
+  opacity: .35;
+  pointer-events: none;
+}
+
 .pc-code-toolbar #code-host-filter { max-width: 12rem; }
 #new-agent-menu { --bs-dropdown-font-size: .85rem; }
 #new-agent-menu .dropdown-item i { width: 1rem; }
+/* the menu is built from the selected session, so it can be empty: the note below explains
+   the enable -> sync -> recreate chain instead of showing nothing at all */
+#new-agent-menu .dropdown-item.disabled { font-style: italic; white-space: normal; }
+#new-agent-menu .dropdown-item { display: flex; align-items: center; }
+#new-agent-menu .dropdown-divider { margin: .25rem 0; }
+/* #btn-new-agent is disabled while no session is selected - keep it visibly inert */
+#btn-new-agent:disabled { opacity: .5; }
