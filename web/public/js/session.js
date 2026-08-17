@@ -1,23 +1,27 @@
-// OWNER: F2. One xterm.js terminal bound to one /api/terminals websocket.
-// Wire protocol: docs/design/api.md "WebSocket: terminals" + server/src/terminals/protocol.ts.
+// OWNER: F2. One SESSION: an xterm.js terminal bound to one /api/sessions websocket.
+// Wire protocol: docs/design/api.md "WebSocket: sessions" + server/src/sessions/protocol.ts.
 // F1 must not edit this file.
 //
+// v0.3 vocabulary (docs/design/users.md section 0): a CONTAINER is the long-lived project
+// box, a SESSION is one shell connection into it. The xterm WIDGET this module drives is
+// still a terminal, so `Terminal`/`FitAddon`/`WebLinksAddon` keep their names.
+//
 // Globals provided by index.html classic scripts: Terminal, FitAddon, WebLinksAddon.
-import { api, terminalWsUrl, formatShellParam, TERMINAL_NAME_RE, AGENT_ID_RE } from './api.js';
+import { api, sessionWsUrl, formatShellParam, SESSION_NAME_RE, AGENT_ID_RE } from './api.js';
 import { bus, EVENTS } from './bus.js';
 
-/** Close codes (mirror of server/src/terminals/protocol.ts TERMINAL_CLOSE). FROZEN. */
+/** Close codes (mirror of server/src/sessions/protocol.ts SESSION_CLOSE). FROZEN. */
 export const CLOSE = Object.freeze({
   normal: 1000,
   /** client -> server: the user closed this pane, kill its tmux session (INT-06) */
   paneClosed: 4001,
   badRequest: 4400,
   unauthorized: 4401,
-  sessionNotFound: 4404,
-  sessionNotRunning: 4409,
-  /** v0.2: the agent is unknown or not mounted into this session - TERMINAL, never retry */
+  containerNotFound: 4404,
+  containerNotRunning: 4409,
+  /** v0.2: the agent is unknown or not mounted into this container - TERMINAL, never retry */
   agentNotAvailable: 4410,
-  /** v0.2: the session's host is gone / unsupported - TERMINAL, never retry */
+  /** v0.2: the container's host is gone / unsupported - TERMINAL, never retry */
   hostUnavailable: 4411,
   backendError: 4502,
   internal: 4500,
@@ -46,19 +50,19 @@ export const STABLE_MS = 10000;
 /**
  * Exec exit statuses that mean "the container went away under us" rather than "the shell
  * exited": 128+SIGKILL and 128+SIGTERM, i.e. what `docker stop` / `docker kill` produce.
- * For these the pane must offer "Start session" instead of claiming the shell exited
- * (INT-05; api.md "WebSocket: terminals").
+ * For these the pane must offer "Start container" instead of claiming the shell exited
+ * (INT-05; api.md "WebSocket: sessions").
  */
 export const CONTAINER_SIGNAL_EXITS = Object.freeze([137, 143]);
 
 /**
  * After such an exit (and after any close that leaves the pane on a dead shell) the pane
- * confirms the session state with GET /api/sessions/<name>. Stopping a container needs
+ * confirms the container state with GET /api/containers/<name>. Stopping a container needs
  * ~170 ms to land, far longer than the exec takes to die, so a single read right after the
  * socket closed still answers "running" - poll for a short while instead (INT-05).
  */
-export const SESSION_STATE_POLL_MS = 3000;
-export const SESSION_STATE_POLL_INTERVAL_MS = 250;
+export const CONTAINER_STATE_POLL_MS = 3000;
+export const CONTAINER_STATE_POLL_INTERVAL_MS = 250;
 
 /** @typedef {'bash'|'sh'|'agent'} Shell */
 /** @typedef {'connecting'|'open'|'closed'|'reconnecting'|'fatal'} PaneStatus */
@@ -68,13 +72,13 @@ const ANSI_RED = '\x1b[31m';
 const ANSI_RESET = '\x1b[0m';
 
 /**
- * The middle part of a pane name. FROZEN (v0.2): an AGENT pane uses the AGENT ID, so a
- * claude pane is still called `<session>-claude-<n>` - exactly the v0.1 name, which is what
+ * The middle part of a session name. FROZEN (v0.2): an AGENT pane uses the AGENT ID, so a
+ * claude pane is still called `<container>-claude-<n>` - exactly the v0.1 name, which is what
  * lets an upgraded layout reattach to its existing tmux sessions.
  * @param {Shell} shell @param {string|null} [agentId]
  * @returns {string}
  */
-export function terminalSlug(shell, agentId = null) {
+export function sessionSlug(shell, agentId = null) {
   if (shell === 'agent') {
     if (!agentId || !AGENT_ID_RE.test(String(agentId))) throw new Error(`invalid agent id: ${agentId}`);
     return String(agentId);
@@ -83,15 +87,15 @@ export function terminalSlug(shell, agentId = null) {
 }
 
 /**
- * Build the stable pane name that drives the tmux session (`pc_<name>`).
+ * Build the stable session name that drives the tmux session (`pc_<name>`).
  * FROZEN: code.js persists this in the layout, so the algorithm must stay stable.
- * @param {string} session @param {string} slug terminalSlug(shell, agentId)
- * @param {number} n 1-based per session+slug
+ * @param {string} container @param {string} slug sessionSlug(shell, agentId)
+ * @param {number} n 1-based per container+slug
  * @returns {string} e.g. "web-claude-2"
  */
-export function makeTerminalName(session, slug, n) {
-  const name = `${session}-${slug}-${n}`.toLowerCase();
-  if (!TERMINAL_NAME_RE.test(name)) throw new Error(`invalid terminal name: ${name}`);
+export function makeSessionName(container, slug, n) {
+  const name = `${container}-${slug}-${n}`.toLowerCase();
+  if (!SESSION_NAME_RE.test(name)) throw new Error(`invalid session name: ${name}`);
   return name;
 }
 
@@ -106,10 +110,10 @@ function jitter(ms) {
 }
 
 /**
- * A terminal pane: xterm instance + websocket + reconnect state machine.
+ * One session pane: xterm instance + websocket + reconnect state machine.
  *
  * Lifecycle used by code.js:
- *   const pane = new TerminalPane({ session, shell, name });
+ *   const pane = new SessionPane({ container, shell, name });
  *   pane.attach(paneRootEl);    // creates the xterm + note strip, opens the socket
  *   pane.fit();                 // on GoldenLayout resize (debounced by code.js)
  *   pane.focus();
@@ -120,27 +124,28 @@ function jitter(ms) {
  *     <div class="pc-pane-notes">    <- warning / reconnect / error strips
  *     <div class="pc-pane-term">     <- xterm mounts here
  */
-export class TerminalPane {
+export class SessionPane {
   /**
-   * @param {{session:string, shell:Shell, agentId?:string|null, agentName?:string|null,
+   * @param {{container:string, shell:Shell, agentId?:string|null, agentName?:string|null,
    *          name:string, theme?:'dark'|'light',
    *          onStatus?:(status:PaneStatus, info?:object)=>void,
    *          onTitle?:(title:string)=>void,
    *          onRequestClose?:()=>void,
    *          onOpenBash?:()=>void}} opts
-   *        v0.2: `agentId` is REQUIRED when `shell === 'agent'`; `agentName` is its display
-   *        name (agents.js `agentLabel`, passed in by code.js so this module keeps its tiny
-   *        dependency set) and `onOpenBash` is the action the pane offers after close 4410
-   *        (agent_not_available).
+   *        `container` is the container the shell runs in, `name` this session's stable
+   *        (tmux) name. v0.2: `agentId` is REQUIRED when `shell === 'agent'`; `agentName` is
+   *        its display name (agents.js `agentLabel`, passed in by code.js so this module keeps
+   *        its tiny dependency set) and `onOpenBash` is the action the pane offers after close
+   *        4410 (agent_not_available).
    */
   constructor(opts) {
-    this.session = opts.session;
+    this.container = opts.container;
     this.shell = opts.shell;
     /** @type {string|null} set exactly when shell === 'agent' (v0.2) */
     this.agentId = opts.agentId ?? null;
     /** @type {string|null} display name of that agent, for the notes this pane renders */
     this.agentName = opts.agentName || null;
-    /** @type {string|null} the host the server resolved this session to (from `ready`) */
+    /** @type {string|null} the host the server resolved this container to (from `ready`) */
     this.hostId = null;
     this.name = opts.name;
     this.onStatus = opts.onStatus ?? (() => {});
@@ -155,7 +160,7 @@ export class TerminalPane {
     this.term = null;
     this.fitAddon = null;
     this.tmux = null;
-    this.terminalId = null;
+    this.sessionId = null;
     this.reattached = false;
     this.disposed = false;
     this._retryDelay = RECONNECT_MIN_MS;
@@ -259,11 +264,11 @@ export class TerminalPane {
     const { cols, rows } = this._size();
     let ws;
     try {
-      ws = new WebSocket(terminalWsUrl({
-        session: this.session,
+      ws = new WebSocket(sessionWsUrl({
+        container: this.container,
         // v0.2 wire value: 'bash' | 'sh' | 'agent:<agentId>' (api.js formatShellParam)
         shell: formatShellParam(this.shell, this.agentId),
-        name: this.name,
+        session: this.name,
         cols,
         rows,
       }));
@@ -318,8 +323,8 @@ export class TerminalPane {
   handleServerMessage(msg) {
     switch (msg.type) {
       case 'ready': {
-        this.terminalId = msg.terminalId ?? null;
-        // v0.2: the server reports which HOST it routed the session to and which AGENT it
+        this.sessionId = msg.sessionId ?? null;
+        // v0.2: the server reports which HOST it routed the container to and which AGENT it
         // actually started - both are what the pane hands back through onStatus.
         this.hostId = typeof msg.hostId === 'string' ? msg.hostId : null;
         if (typeof msg.agentId === 'string') this.agentId = msg.agentId;
@@ -327,11 +332,11 @@ export class TerminalPane {
         this.reattached = msg.reattached === true;
         this._retryDelay = RECONNECT_MIN_MS;
         this._clearNote('conn');
-        // a reconnect / "Start session" succeeded: nothing from the dead shell is current
+        // a reconnect / "Start container" succeeded: nothing from the dead shell is current
         this._exitCode = null;
         this._signalExit = null;
         this._exitBanner = null;
-        // The container was stopped and started again while this pane was open: everything
+        // The container was stopped and started again while this session was open: everything
         // on screen belongs to a dead shell (and would keep showing a stale exit banner),
         // so start from a clean buffer. INT-05.
         if (this._resetOnReady) {
@@ -363,7 +368,7 @@ export class TerminalPane {
         if (msg.message) this._writeDim(String(msg.message));
         break;
       case 'error':
-        this._lastError = String(msg.message || msg.code || 'terminal error');
+        this._lastError = String(msg.message || msg.code || 'session error');
         this.term?.writeln(`\r\n${ANSI_RED}${this._lastError}${ANSI_RESET}`);
         break;
       case 'exit': {
@@ -371,7 +376,7 @@ export class TerminalPane {
         this._exitCode = code;
         // 137/143 = 128+SIGKILL/SIGTERM: the container was stopped under this shell, the user
         // did not type `exit`. No exit banner is ever printed for those - the close handler
-        // shows the "session is not running" note with its Start action instead (INT-05).
+        // shows the "container is not running" note with its Start action instead (INT-05).
         this._signalExit = code !== null && CONTAINER_SIGNAL_EXITS.includes(code) ? code : null;
         break;
       }
@@ -508,7 +513,7 @@ export class TerminalPane {
       this._clearNote('conn');
       if (this._signalExit !== null) {
         // The exec died with its container (137/143), so never claim the shell exited: show
-        // the "not running / Start session" note right away and confirm it in the background
+        // the "not running / Start container" note right away and confirm it in the background
         // (INT-05). The server closes 4409 for this; 1000 is the racing case.
         this._showNotRunningNote();
         void this._confirmSignalExit();
@@ -517,7 +522,7 @@ export class TerminalPane {
       this._writeBanner(
         `[process exited${this._exitCode === null ? '' : ` (${this._exitCode})`}] press Enter to restart`,
       );
-      void this._noteIfSessionStopped();
+      void this._noteIfContainerStopped();
       return;
     }
 
@@ -525,22 +530,22 @@ export class TerminalPane {
       this._setStatus('fatal');
       this._renderNote('conn', {
         variant: 'danger',
-        text: 'your session expired — sign in again',
+        text: 'your login expired — sign in again',
       });
       bus.emit(EVENTS.AUTH_REQUIRED, {});
       return;
     }
 
     // v0.2 TERMINAL conditions - never auto-reconnect, never call the API again
-    // (api.md "WebSocket: terminals"): the pane states the reason and offers a way out.
+    // (api.md "WebSocket: sessions"): the pane states the reason and offers a way out.
     if (code === CLOSE.agentNotAvailable) {
       this._setStatus('fatal');
       const label = this.agentName || this.agentId || 'this coding agent';
       this._renderNote('conn', {
         variant: 'danger',
-        text: `the agent "${label}" is not available in this session${detail ? ` (${detail})` : ''}` +
+        text: `the agent "${label}" is not available in this container${detail ? ` (${detail})` : ''}` +
           ' — enable it on the host under Settings → Agents, run "Sync tools",' +
-          ' then recreate the session',
+          ' then recreate the container',
         actions: [
           { label: 'Open bash instead', onClick: () => this.onOpenBash() },
           { label: 'Close pane', onClick: () => this.onRequestClose() },
@@ -551,8 +556,8 @@ export class TerminalPane {
 
     if (code === CLOSE.hostUnavailable) {
       this._setStatus('fatal');
-      // `ready` may already have told us which host this session runs on; name it when so.
-      const where = this.hostId ? `host "${this.hostId}"` : 'the host of this session';
+      // `ready` may already have told us which host this container runs on; name it when so.
+      const where = this.hostId ? `host "${this.hostId}"` : 'the host of this container';
       this._renderNote('conn', {
         variant: 'danger',
         text: `${where} is unavailable${detail ? ` (${detail})` : ''}` +
@@ -562,12 +567,12 @@ export class TerminalPane {
       return;
     }
 
-    if (code === CLOSE.sessionNotFound) {
-      // The container/session is gone for good: do not retry forever (frontend.md 5.6).
+    if (code === CLOSE.containerNotFound) {
+      // The container is gone for good: do not retry forever (frontend.md 5.6).
       this._setStatus('fatal');
       this._renderNote('conn', {
         variant: 'danger',
-        text: detail || `session "${this.session}" no longer exists`,
+        text: detail || `container "${this.container}" no longer exists`,
         actions: [
           { label: 'Retry', onClick: () => this.connect() },
           { label: 'Close pane', onClick: () => this.onRequestClose() },
@@ -576,13 +581,13 @@ export class TerminalPane {
       return;
     }
 
-    if (code === CLOSE.sessionNotRunning) {
+    if (code === CLOSE.containerNotRunning) {
       this._signalExit = null;
       this._resetOnReady = true;
       // a "[process exited]" line printed a moment ago was wrong: overwrite it
-      this._replaceBanner(detail || `session "${this.session}" is not running`);
-      this._scheduleReconnect(detail || `session "${this.session}" is not running`, [
-        { label: 'Start session', onClick: () => this._startSession() },
+      this._replaceBanner(detail || `container "${this.container}" is not running`);
+      this._scheduleReconnect(detail || `container "${this.container}" is not running`, [
+        { label: 'Start container', onClick: () => this._startContainer() },
       ]);
       return;
     }
@@ -602,13 +607,13 @@ export class TerminalPane {
 
   /**
    * Distinguish "the upgrade was refused because we are logged out" from "the server is
-   * unreachable". GET /api/auth/session is public, so it never triggers an auth loop.
+   * unreachable". GET /api/auth/me is public, so it never triggers an auth loop.
    * @param {string} reason
    */
   async _checkAuthThenReconnect(reason) {
     let loggedOut = false;
     try {
-      const res = await api.auth.session();
+      const res = await api.auth.me();
       loggedOut = !!res && res.authenticated === false;
     } catch {
       loggedOut = false; // server unreachable -> treat as a transient failure
@@ -616,7 +621,7 @@ export class TerminalPane {
     if (this.disposed) return;
     if (loggedOut) {
       this._setStatus('fatal');
-      this._renderNote('conn', { variant: 'danger', text: 'your session expired - sign in again' });
+      this._renderNote('conn', { variant: 'danger', text: 'your login expired - sign in again' });
       bus.emit(EVENTS.AUTH_REQUIRED, {});
       return;
     }
@@ -624,13 +629,13 @@ export class TerminalPane {
   }
 
   /**
-   * Defence in depth for "the session was stopped while this pane was open": the server
+   * Defence in depth for "the container was stopped while this session was open": the server
    * closes 4409 in that case, but a racing stop (or an older server) can still close 1000,
-   * which alone would only say "[process exited]". Confirm the session state and, when it is
+   * which alone would only say "[process exited]". Confirm the container state and, when it is
    * not running, show the same note the 4409 path shows - replacing the exit line. INT-05.
    */
-  async _noteIfSessionStopped() {
-    const stopped = await this._sessionStopped();
+  async _noteIfContainerStopped() {
+    const stopped = await this._containerStopped();
     // only decorate the close we are still sitting in
     if (this.disposed || this.ws || !this._awaitEnter) return;
     if (stopped !== true) return;
@@ -643,7 +648,7 @@ export class TerminalPane {
    * note would be a lie - drop it and reconnect, tmux still has the pane. INT-05.
    */
   async _confirmSignalExit() {
-    const stopped = await this._sessionStopped();
+    const stopped = await this._containerStopped();
     if (this.disposed || this.ws || !this._awaitEnter) return;
     if (stopped !== false) return; // not running, or no answer: keep the note
     this._resetOnReady = false;
@@ -652,17 +657,17 @@ export class TerminalPane {
   }
 
   /**
-   * Poll GET /api/sessions/<name> until it reports a non-running state, for at most
-   * SESSION_STATE_POLL_MS. The first answer after a stop is regularly a stale "running".
+   * Poll GET /api/containers/<name> until it reports a non-running state, for at most
+   * CONTAINER_STATE_POLL_MS. The first answer after a stop is regularly a stale "running".
    * @returns {Promise<boolean|null>} true = not running, false = running, null = cannot tell
    */
-  async _sessionStopped() {
-    const deadline = Date.now() + SESSION_STATE_POLL_MS;
+  async _containerStopped() {
+    const deadline = Date.now() + CONTAINER_STATE_POLL_MS;
     for (;;) {
       let status = null;
       try {
-        const res = await api.sessions.get(this.session);
-        const view = (res && res.session) || null;
+        const res = await api.containers.get(this.container);
+        const view = (res && res.container) || null;
         status = view && typeof view.status === 'string' ? view.status : null;
       } catch {
         return null; // offline / 401 / gone: cannot tell
@@ -670,22 +675,22 @@ export class TerminalPane {
       if (this.disposed || !status) return null;
       if (status !== 'running') return true;
       if (Date.now() >= deadline) return false;
-      await sleep(SESSION_STATE_POLL_INTERVAL_MS);
+      await sleep(CONTAINER_STATE_POLL_INTERVAL_MS);
       if (this.disposed) return null;
     }
   }
 
-  /** The pane's "session ... is not running / Start session" state (INT-05). */
+  /** The pane's "container ... is not running / Start container" state (INT-05). */
   _showNotRunningNote() {
     this._signalExit = null;
     // the container is down: whatever is on screen died with it
     this._resetOnReady = true;
-    const text = `session "${this.session}" is not running`;
+    const text = `container "${this.container}" is not running`;
     this._replaceBanner(text);
     this._renderNote('conn', {
       variant: 'warning',
       text,
-      actions: [{ label: 'Start session', onClick: () => this._startSession() }],
+      actions: [{ label: 'Start container', onClick: () => this._startContainer() }],
     });
   }
 
@@ -707,20 +712,20 @@ export class TerminalPane {
     this.term?.write(`\x1b[A\r\x1b[2K${ANSI_DIM}${text}${ANSI_RESET}\r\n`);
   }
 
-  /** Ask the API to start the session, then reconnect immediately on success. */
-  async _startSession() {
-    this._renderNote('conn', { variant: 'warning', text: `starting session "${this.session}"…` });
+  /** Ask the API to start the container, then reconnect immediately on success. */
+  async _startContainer() {
+    this._renderNote('conn', { variant: 'warning', text: `starting container "${this.container}"…` });
     this._signalExit = null;
     this._exitBanner = null;
     this._resetOnReady = true;
     try {
-      await api.sessions.start(this.session);
+      await api.containers.start(this.container);
       this._retryDelay = RECONNECT_MIN_MS;
       this._clearRetryTimer();
       this.connect();
     } catch (err) {
-      this._scheduleReconnect((err && err.message) || 'could not start the session', [
-        { label: 'Start session', onClick: () => this._startSession() },
+      this._scheduleReconnect((err && err.message) || 'could not start the container', [
+        { label: 'Start container', onClick: () => this._startContainer() },
       ]);
     }
   }

@@ -13,16 +13,24 @@
 //     reads them, see backend.md v0.2 §12.4).
 // The v1 -> v2 migration is lossless and writes `<DATA_DIR>/config.json.v1.bak` first
 // (ConfigStore.migrate).
+//
+// v0.3 (CONFIG_VERSION 3) — the phase R rename (docs/design/users.md §7):
+//   * `sessions[]` (the long-lived container)    -> `containers[]`; nothing else moves.
+// The v2 -> v3 migration writes `<DATA_DIR>/config.json.v2.bak` first, and a v1 file chains
+// v1 -> v2 -> v3 in one pass (ConfigStore.migrate).
 import { z } from 'zod';
 import { GENERAL_FIELD_SCHEMAS, stored } from './fields.js';
-import { SessionConfigSchema } from '../sessions/model.js';
+import { ContainerConfigSchema } from '../containers/model.js';
 import { HostConfigSchema, HostIdSchema, PortainerCredentialConfigSchema } from '../hosts/model.js';
 import { AgentDefinitionSchema } from '../agents/model.js';
 
-export const CONFIG_VERSION = 2;
+export const CONFIG_VERSION = 3;
 
 /** the version this config was migrated FROM (v1 = the v0.1 single-backend shape) */
 export const CONFIG_VERSION_V1 = 1;
+
+/** the version this config was migrated FROM (v2 = the v0.2 shape, `sessions[]` = containers) */
+export const CONFIG_VERSION_V2 = 2;
 
 export const AuthConfigSchema = z.object({
   /** scrypt hash string "scrypt:<N>:<r>:<p>:<saltB64>:<hashB64>"; null until first boot seeds it */
@@ -36,7 +44,7 @@ export const AuthConfigSchema = z.object({
 // General settings
 //
 // Every one of these values ends up in a docker API call (container name, volume name,
-// mount target). An unchecked value therefore fails deep inside docker on the NEXT session
+// mount target). An unchecked value therefore fails deep inside docker on the NEXT container
 // create — a 502 far away from the request that caused it — instead of at the settings
 // call, so they are validated where they enter the system (config/fields.ts holds the
 // validators; PUT /api/settings/general and HostOverridesSchema reuse them).
@@ -46,7 +54,7 @@ export const AuthConfigSchema = z.object({
 // ---------------------------------------------------------------------------
 
 export const GeneralConfigSchema = z.object({
-  /** host directory used when a session asks for a bind workspace without an absolute path */
+  /** host directory used when a container asks for a bind workspace without an absolute path */
   workspacesRoot: stored(GENERAL_FIELD_SCHEMAS.workspacesRoot, '/srv/porterclaude/workspaces'),
   /** prefix of every volume PorterClaude creates: ws-/hist-/auth-/tools */
   volumePrefix: stored(GENERAL_FIELD_SCHEMAS.volumePrefix, 'porterclaude-'),
@@ -56,10 +64,14 @@ export const GeneralConfigSchema = z.object({
   toolsVolume: stored(GENERAL_FIELD_SCHEMAS.toolsVolume, 'porterclaude-tools'),
   defaultRecipe: stored(GENERAL_FIELD_SCHEMAS.defaultRecipe, 'node'),
   containerPrefix: stored(GENERAL_FIELD_SCHEMAS.containerPrefix, 'pc-'),
-  /** attach every session container to this docker network (null = default bridge) */
+  /**
+   * attach every managed container to this docker network (null = default bridge).
+   * The KEY keeps its v0.2 name: it is persisted in config.json and renaming it needs its
+   * own migration step (out of scope for phase R). Only the UI label says "container".
+   */
   sessionNetwork: stored(GENERAL_FIELD_SCHEMAS.sessionNetwork, null),
   imageNamespace: stored(GENERAL_FIELD_SCHEMAS.imageNamespace, 'porterclaude'),
-  /** home dir inside session containers; agent + workspace mounts are derived from it */
+  /** home dir inside managed containers; agent + workspace mounts are derived from it */
   containerHome: stored(GENERAL_FIELD_SCHEMAS.containerHome, '/home/dev'),
   workspaceMount: stored(GENERAL_FIELD_SCHEMAS.workspaceMount, '/workspace'),
   toolsMount: stored(GENERAL_FIELD_SCHEMAS.toolsMount, '/opt/porterclaude'),
@@ -88,14 +100,14 @@ export const AppConfigSchema = z.object({
   /**
    * Stable identity of THIS PorterClaude install (v0.2). Generated once on first boot and
    * never changed; every container and volume this install creates carries it as
-   * `porterclaude.instance=<id>`, and session discovery ignores containers that carry a
+   * `porterclaude.instance=<id>`, and container discovery ignores containers that carry a
    * DIFFERENT one (backend.md §13). That is what keeps two installs on one shared engine
    * from listing — and adopting, recreating or destroying — each other's containers.
    * `null` only until ConfigStore.init() fills it in; no migration needed, a config written
    * by v0.1/v0.2.0 simply gets one on the next boot.
    */
   // `.catch(null)`: a hand-edited id that breaks the pattern must regenerate on the next
-  // boot, never quarantine config.json (hosts, credentials and sessions with it).
+  // boot, never quarantine config.json (hosts, credentials and containers with it).
   instanceId: z.string().regex(INSTANCE_ID_RE).nullable().catch(null).default(null),
   auth: AuthConfigSchema.default({}),
   /** every managed docker engine; empty on a fresh install */
@@ -105,7 +117,7 @@ export const AppConfigSchema = z.object({
   credentials: CredentialsConfigSchema.default({}),
   agents: AgentsConfigSchema.default({}),
   general: GeneralConfigSchema.default({}),
-  sessions: z.array(SessionConfigSchema).default([]),
+  containers: z.array(ContainerConfigSchema).default([]),
   ui: UiConfigSchema.default({}),
 });
 

@@ -1,17 +1,22 @@
 // FROZEN (planner-authored, fully implemented). The ONLY cross-package channel between
-// F1 (shell/settings/sessions) and F2 (code/terminals). Nobody needs to edit this file:
+// F1 (shell/settings/containers) and F2 (code/sessions). Nobody needs to edit this file:
 // event names and payloads are a contract. Add events only via docs/design/frontend.md.
+//
+// v0.3 vocabulary (docs/design/users.md section 0): a CONTAINER is the long-lived project
+// box, a SESSION is one shell connection into it. `sessions:changed` therefore no longer
+// means "the container list changed" - that is `containers:changed` now.
 //
 // Usage:
 //   import { bus, EVENTS } from './bus.js';
-//   const off = bus.on(EVENTS.SESSIONS_CHANGED, ({ sessions }) => { ... });
-//   bus.emit(EVENTS.SESSIONS_CHANGED, { sessions });
+//   const off = bus.on(EVENTS.CONTAINERS_CHANGED, ({ containers }) => { ... });
+//   bus.emit(EVENTS.CONTAINERS_CHANGED, { containers });
 
 /** @typedef {Record<string, any>} Payload */
 
 export const EVENTS = Object.freeze({
-  /** emitted by sessions.js (F1) after every list/poll/CRUD. payload: { sessions: SessionView[] } */
-  SESSIONS_CHANGED: 'sessions:changed',
+  /** emitted by containers.js (F1) after every list/poll/CRUD.
+   *  payload: { containers: ContainerView[] } */
+  CONTAINERS_CHANGED: 'containers:changed',
   /** emitted by api.js (F1) on any 401 from a non-auth endpoint. payload: {} */
   AUTH_REQUIRED: 'auth:required',
   /** emitted by app.js (F1) once the user is authenticated (first load and after login). payload: {} */
@@ -28,15 +33,16 @@ export const EVENTS = Object.freeze({
   AGENTS_CHANGED: 'agents:changed',
   /** emitted by app.js (F1) when the effective theme changes. payload: { theme: 'dark'|'light' } */
   THEME_CHANGED: 'theme:changed',
-  /** emitted by app.js (F1) on every route change. payload: { view: 'code'|'sessions'|'settings' } */
+  /** emitted by app.js (F1) on every route change. payload: { view: 'code'|'containers'|'settings' } */
   VIEW_CHANGED: 'view:changed',
-  /** emitted by sessions.js (F1) "open terminal" action -> code.js (F2) opens a pane.
-   *  v0.2 payload: { session: string, shell: 'bash'|'sh'|'agent:<agentId>' }
+  /** emitted by containers.js (F1) "open session" action -> code.js (F2) opens a pane.
+   *  v0.3 payload: { container: string, shell: 'bash'|'sh'|'agent:<agentId>' }
    *  (the WIRE value, api.js `formatShellParam`; the legacy 'claude' is still tolerated
    *   by code.js but never emitted). */
-  OPEN_TERMINAL: 'code:open-terminal',
-  /** emitted by code.js (F2) when a pane count changes. payload: { count: number } */
-  TERMINALS_CHANGED: 'terminals:changed',
+  OPEN_SESSION: 'code:open-session',
+  /** emitted by code.js (F2) when the open SESSION (pane) count changes.
+   *  payload: { count: number } */
+  SESSIONS_CHANGED: 'sessions:changed',
 });
 
 class Bus {

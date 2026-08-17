@@ -33,7 +33,7 @@ const RemoveQuery = z.object({ force: boolish });
  * POST   /api/hosts/test             HostTestInput -> BackendTestResult (always 200, nothing saved)
  * GET    /api/hosts/:hostId          -> { host: HostView }   (always probes)
  * PUT    /api/hosts/:hostId          HostUpdateInput -> { host: HostView }
- * DELETE /api/hosts/:hostId?force=1  -> 204   (409 while sessions reference it)
+ * DELETE /api/hosts/:hostId?force=1  -> 204   (409 while containers reference it)
  * POST   /api/hosts/:hostId/default  -> { host: HostView, defaultHostId }
  * POST   /api/hosts/:hostId/test     -> BackendTestResult (always 200)
  * GET    /api/hosts/:hostId/info     -> { info: DockerInfo }

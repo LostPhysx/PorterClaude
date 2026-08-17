@@ -3,7 +3,7 @@
 # Runs under Git Bash on Windows and on Linux. Full spec: docs/design/orchestration.md §7.
 #
 # SCOPE: this ships the PorterClaude APP CONTAINER to one Portainer host. It knows nothing
-# about the docker hosts PorterClaude itself manages, about coding agents or about session
+# about the docker hosts PorterClaude itself manages, about coding agents or about container
 # images — those are app configuration (Settings, docs/DEPLOYMENT.md, docs/AGENTS.md). The
 # rendered stack only seeds the FIRST host (PORTERCLAUDE_BACKEND=socket in
 # deploy/docker-compose.yml), and only while the /data volume holds none.

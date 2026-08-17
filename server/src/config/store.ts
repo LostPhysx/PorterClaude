@@ -1,13 +1,19 @@
-// OWNER: B1. Public API FROZEN — B2 uses get(), general(), sessions helpers and update().
+// OWNER: B1. Public API FROZEN — B2 uses get(), general(), containers helpers and update().
 // Persists <DATA_DIR>/config.json atomically (tmp file in the same dir + rename), serialises
 // writes through an internal promise chain, and emits 'change' after every successful write.
 import { EventEmitter } from 'node:events';
 import fsSync from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { AppConfigSchema, CONFIG_VERSION, CONFIG_VERSION_V1, defaultConfig } from './schema.js';
+import {
+  AppConfigSchema,
+  CONFIG_VERSION,
+  CONFIG_VERSION_V1,
+  CONFIG_VERSION_V2,
+  defaultConfig,
+} from './schema.js';
 import type { AppConfig, GeneralConfig, SanitizedSettings } from './schema.js';
-import type { SessionConfig } from '../sessions/model.js';
+import type { ContainerConfig } from '../containers/model.js';
 import type { HostConfig, PortainerCredentialConfig } from '../hosts/model.js';
 import { LEGACY_HOST_ID } from '../hosts/model.js';
 import { DEFAULT_ENABLED_AGENT_IDS } from '../agents/builtin.js';
@@ -63,7 +69,7 @@ export class ConfigStore extends EventEmitter {
   }
 
   /**
-   * Read config.json (or create it from defaults), migrate old versions (v1 -> v2, see
+   * Read config.json (or create it from defaults), migrate old versions (v1 -> v2 -> v3, see
    * `migrate`), then apply env seeds: APP_PASSWORD (only when no password is set),
    * PORTERCLAUDE_BACKEND / PORTAINER_* (only when NO host exists yet). Must be called
    * exactly once at boot.
@@ -134,7 +140,7 @@ export class ConfigStore extends EventEmitter {
    * Drop stored custom agents that no longer satisfy `AgentDefinitionSchema` (a definition
    * written before the path rules of `AgentPathSchema` existed, e.g. a `sharedPaths` entry
    * with a `..` segment). Without this the whole config.json would fail to parse and be
-   * renamed to .corrupt-<ts> - losing hosts, credentials and sessions because of ONE bad
+   * renamed to .corrupt-<ts> - losing hosts, credentials and containers because of ONE bad
    * agent. The offending definition is logged and simply not loaded.
    */
   private dropInvalidCustomAgents(raw: unknown): unknown {
@@ -176,15 +182,23 @@ export class ConfigStore extends EventEmitter {
    *   4. backend.kind === 'none' -> hosts = [] (the first-run state is preserved as such);
    *   5. every created host gets agents:{ enabled: DEFAULT_ENABLED_AGENT_IDS } and
    *      overrides:{}; defaultHostId = the created host id (or null);
-   *   6. every stored session gets hostId: LEGACY_HOST_ID and agents: null (the schema
+   *   6. every stored container gets hostId: LEGACY_HOST_ID and agents: null (the schema
    *      defaults do the same, but writing them makes the file self-describing);
    *   7. general is carried over unchanged - including sharedClaudeVolume /
    *      sharedClaudeHomeVolume, which the one-time claude auth import still needs;
    *   8. backend is DROPPED from the parsed shape (the .v1.bak file keeps it) and
    *      version becomes 2.
    *
-   * A file that is already v2 passes through. A file from a NEWER version is used as-is
-   * with a warning (same rule as v0.1).
+   * v2 -> v3 (v0.3 phase R: "session" the container becomes "container"):
+   *   1. write <configFile>.v2.bak (best effort, once) - same shape as the v1 backup;
+   *   2. `sessions[]` is renamed to `containers[]` verbatim (no entry is touched) and
+   *      version becomes 3.
+   *
+   * The steps are GUARDED INDIVIDUALLY, not short-circuited on the file's version: a v1 file
+   * must chain v1 -> v2 -> v3 in ONE pass, and the v3 step must see the object the v1 step
+   * produced (which is where the v1 step wrote `sessions`). A file that is already v3 passes
+   * through untouched (and writes no backup). A file from a NEWER version is used as-is with
+   * a warning (same rule as v0.1).
    */
   private migrate(raw: unknown): unknown {
     if (!raw || typeof raw !== 'object') return raw;
@@ -196,83 +210,105 @@ export class ConfigStore extends EventEmitter {
     }
     if (version >= CONFIG_VERSION) return obj;
 
-    // ---- v1 (or a pre-versioned file) -> v2 --------------------------------
-    this.backupV1(obj);
-
     const next: Record<string, unknown> = { ...obj };
-    delete next.backend;
-    next.version = CONFIG_VERSION;
 
-    const now = new Date().toISOString();
-    const backend = (obj.backend ?? {}) as Record<string, unknown>;
-    const kind = typeof backend.kind === 'string' ? backend.kind : 'none';
-    const portainer = (backend.portainer ?? {}) as Record<string, unknown>;
-    const socket = (backend.socket ?? {}) as Record<string, unknown>;
+    // ---- v1 (or a pre-versioned file) -> v2 --------------------------------
+    if (version < CONFIG_VERSION_V2) {
+      this.backupV1(obj);
 
-    const hosts: Record<string, unknown>[] = [];
-    const credentials: Record<string, unknown>[] = [];
+      delete next.backend;
+      next.version = CONFIG_VERSION_V2;
 
-    const makeHost = (name: string, connection: Record<string, unknown>): Record<string, unknown> => ({
-      id: LEGACY_HOST_ID,
-      name,
-      connection,
-      overrides: {},
-      agents: { enabled: [...DEFAULT_ENABLED_AGENT_IDS] },
-      notes: null,
-      createdAt: now,
-      updatedAt: now,
-    });
+      const now = new Date().toISOString();
+      const backend = (obj.backend ?? {}) as Record<string, unknown>;
+      const kind = typeof backend.kind === 'string' ? backend.kind : 'none';
+      const portainer = (backend.portainer ?? {}) as Record<string, unknown>;
+      const socket = (backend.socket ?? {}) as Record<string, unknown>;
 
-    if (kind === 'portainer') {
-      const url = typeof portainer.url === 'string' ? portainer.url : '';
-      credentials.push({
-        id: 'portainer-1',
-        name: hostnameOf(url) || 'portainer',
-        url,
-        // already encrypted with the same master key: copied verbatim, never re-encrypted
-        apiKeyEnc: typeof portainer.apiKeyEnc === 'string' ? portainer.apiKeyEnc : null,
-        insecureTls: portainer.insecureTls === true,
+      const hosts: Record<string, unknown>[] = [];
+      const credentials: Record<string, unknown>[] = [];
+
+      const makeHost = (name: string, connection: Record<string, unknown>): Record<string, unknown> => ({
+        id: LEGACY_HOST_ID,
+        name,
+        connection,
+        overrides: {},
+        agents: { enabled: [...DEFAULT_ENABLED_AGENT_IDS] },
+        notes: null,
         createdAt: now,
         updatedAt: now,
       });
-      hosts.push(
-        makeHost('Default', {
-          type: 'portainer',
-          credentialId: 'portainer-1',
-          endpointId: typeof portainer.endpointId === 'number' ? portainer.endpointId : 0,
-        }),
+
+      if (kind === 'portainer') {
+        const url = typeof portainer.url === 'string' ? portainer.url : '';
+        credentials.push({
+          id: 'portainer-1',
+          name: hostnameOf(url) || 'portainer',
+          url,
+          // already encrypted with the same master key: copied verbatim, never re-encrypted
+          apiKeyEnc: typeof portainer.apiKeyEnc === 'string' ? portainer.apiKeyEnc : null,
+          insecureTls: portainer.insecureTls === true,
+          createdAt: now,
+          updatedAt: now,
+        });
+        hosts.push(
+          makeHost('Default', {
+            type: 'portainer',
+            credentialId: 'portainer-1',
+            endpointId: typeof portainer.endpointId === 'number' ? portainer.endpointId : 0,
+          }),
+        );
+      } else if (kind === 'socket') {
+        const socketPath =
+          typeof socket.socketPath === 'string' && socket.socketPath
+            ? socket.socketPath
+            : '/var/run/docker.sock';
+        hosts.push(makeHost('Local docker', { type: 'socket', socketPath }));
+      }
+      // kind === 'none': no host at all - the first-run state is preserved as such.
+
+      next.hosts = hosts;
+      next.defaultHostId = hosts[0]?.id ?? null;
+      const existingCredentials = (obj.credentials ?? {}) as Record<string, unknown>;
+      next.credentials = { ...existingCredentials, portainer: credentials };
+
+      if (Array.isArray(obj.sessions)) {
+        next.sessions = obj.sessions.map((entry) => {
+          if (!entry || typeof entry !== 'object') return entry;
+          const container = entry as Record<string, unknown>;
+          return {
+            ...container,
+            // the schema defaults would do the same; writing them makes the file self-describing
+            hostId: typeof container.hostId === 'string' ? container.hostId : LEGACY_HOST_ID,
+            agents: Array.isArray(container.agents) ? container.agents : null,
+          };
+        });
+      }
+
+      this.deps.log.info(
+        { hosts: hosts.length, credentials: credentials.length, from: version || CONFIG_VERSION_V1 },
+        'migrated config.json to version 2',
       );
-    } else if (kind === 'socket') {
-      const socketPath =
-        typeof socket.socketPath === 'string' && socket.socketPath
-          ? socket.socketPath
-          : '/var/run/docker.sock';
-      hosts.push(makeHost('Local docker', { type: 'socket', socketPath }));
-    }
-    // kind === 'none': no host at all - the first-run state is preserved as such.
-
-    next.hosts = hosts;
-    next.defaultHostId = hosts[0]?.id ?? null;
-    const existingCredentials = (obj.credentials ?? {}) as Record<string, unknown>;
-    next.credentials = { ...existingCredentials, portainer: credentials };
-
-    if (Array.isArray(obj.sessions)) {
-      next.sessions = obj.sessions.map((entry) => {
-        if (!entry || typeof entry !== 'object') return entry;
-        const session = entry as Record<string, unknown>;
-        return {
-          ...session,
-          // the schema defaults would do the same; writing them makes the file self-describing
-          hostId: typeof session.hostId === 'string' ? session.hostId : LEGACY_HOST_ID,
-          agents: Array.isArray(session.agents) ? session.agents : null,
-        };
-      });
     }
 
-    this.deps.log.info(
-      { hosts: hosts.length, credentials: credentials.length, from: version || CONFIG_VERSION_V1 },
-      'migrated config.json to version 2',
-    );
+    // ---- v2 -> v3: sessions[] (the long-lived container) -> containers[] ----
+    // Runs on the INTERMEDIATE object, i.e. after the v1 step wrote `next.sessions`.
+    if (version < CONFIG_VERSION) {
+      this.backupV2(next);
+
+      next.containers = next.sessions ?? [];
+      delete next.sessions;
+      next.version = CONFIG_VERSION;
+
+      this.deps.log.info(
+        {
+          containers: Array.isArray(next.containers) ? next.containers.length : 0,
+          from: version || CONFIG_VERSION_V1,
+        },
+        'migrated config.json to version 3 (sessions[] -> containers[])',
+      );
+    }
+
     return next;
   }
 
@@ -285,6 +321,19 @@ export class ConfigStore extends EventEmitter {
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'EEXIST') {
         this.deps.log.warn({ err: (err as Error).message }, 'could not write the v1 config backup');
+      }
+    }
+  }
+
+  /** `<configFile>.v2.bak`, written once (best effort) before the first v3 write. */
+  private backupV2(obj: Record<string, unknown>): void {
+    const target = `${this.deps.paths.configFile}.v2.bak`;
+    try {
+      fsSync.writeFileSync(target, `${JSON.stringify(obj, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
+      this.deps.log.info({ backup: target }, 'kept a copy of the v2 config before migrating');
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') {
+        this.deps.log.warn({ err: (err as Error).message }, 'could not write the v2 config backup');
       }
     }
   }
@@ -547,34 +596,34 @@ export class ConfigStore extends EventEmitter {
     };
   }
 
-  // --- sessions (used by B2's SessionService; B1 only provides storage) -----
+  // --- containers (used by B2's ContainerService; B1 only provides storage) -
 
-  listSessions(): SessionConfig[] {
-    return this.get().sessions.map((s) => structuredClone(s) as SessionConfig);
+  listContainers(): ContainerConfig[] {
+    return this.get().containers.map((c) => structuredClone(c) as ContainerConfig);
   }
 
-  getSession(name: string): SessionConfig | null {
-    const found = this.get().sessions.find((s) => s.name === name);
-    return found ? (structuredClone(found) as SessionConfig) : null;
+  getContainer(name: string): ContainerConfig | null {
+    const found = this.get().containers.find((c) => c.name === name);
+    return found ? (structuredClone(found) as ContainerConfig) : null;
   }
 
   /** Insert or replace by name; persists. */
-  async putSession(cfg: SessionConfig): Promise<SessionConfig> {
+  async putContainer(cfg: ContainerConfig): Promise<ContainerConfig> {
     await this.update((draft) => {
-      const idx = draft.sessions.findIndex((s) => s.name === cfg.name);
-      if (idx >= 0) draft.sessions[idx] = cfg;
-      else draft.sessions.push(cfg);
+      const idx = draft.containers.findIndex((c) => c.name === cfg.name);
+      if (idx >= 0) draft.containers[idx] = cfg;
+      else draft.containers.push(cfg);
     });
-    return this.getSession(cfg.name) as SessionConfig;
+    return this.getContainer(cfg.name) as ContainerConfig;
   }
 
-  /** Returns true when a session was removed. */
-  async deleteSession(name: string): Promise<boolean> {
+  /** Returns true when a container was removed. */
+  async deleteContainer(name: string): Promise<boolean> {
     let removed = false;
     await this.update((draft) => {
-      const idx = draft.sessions.findIndex((s) => s.name === name);
+      const idx = draft.containers.findIndex((c) => c.name === name);
       if (idx >= 0) {
-        draft.sessions.splice(idx, 1);
+        draft.containers.splice(idx, 1);
         removed = true;
       }
     });

@@ -1,4 +1,4 @@
-// OWNER: B1. Thin read-only passthroughs the UI needs outside of Sessions/Images.
+// OWNER: B1. Thin read-only passthroughs the UI needs outside of Containers/Images.
 // v0.2: host-scoped — mounted at /api/hosts/:hostId/docker (routes/index.ts), so the router
 // is created with `mergeParams: true` and resolves the host on every call.
 import { Router } from 'express';
@@ -7,7 +7,7 @@ import { z } from 'zod';
 import type { AppContext } from '../context.js';
 import { asyncHandler } from '../http/async.js';
 import { parseParams, parseQuery } from '../http/validate.js';
-import { CONTAINER_LABELS } from '../sessions/model.js';
+import { CONTAINER_LABELS } from '../containers/model.js';
 import { HostIdParamsSchema } from '../hosts/model.js';
 
 const flag = z

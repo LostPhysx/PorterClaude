@@ -2,6 +2,13 @@
 
 > **v0.2 (hosts + agents): the [v0.2 section](#v02--hosts-and-agents-authoritative-from-here-down)
 > at the bottom supersedes every statement above that it contradicts.**
+>
+> **v0.3 (phase R, the rename): every name in this file is the post-rename one** — the
+> long-lived box is a **container** (`src/containers/**`, was `src/sessions/**`), one shell
+> connection is a **session** (`src/sessions/**`, was `src/terminals/**`), and the cookie is
+> `pc_auth`. `§17` lists what moved; `users.md` §0/§7 is the vocabulary and the rename table.
+> tmux keeps its own word, and `PORTERCLAUDE_SESSION`, `general.sessionNetwork` and
+> `SESSION_TTL_DAYS` deliberately keep theirs (§17).
 
 Companion to [`api.md`](api.md), which is the wire contract. This doc is the internal
 design: module layout, ownership, key flows, error handling, and what QA should test.
@@ -55,7 +62,7 @@ should use `import type` (`isolatedModules` is on).
 | `src/util/ids.ts` | **FROZEN** | `uuid`, `shortId` (implemented) |
 | `src/config/schema.ts` | **FROZEN** | config.json shape + settings payload schemas (implemented) |
 | `src/config/crypto.ts` | B1 | master secret, AES-GCM secret box, scrypt passwords |
-| `src/config/store.ts` | B1 | atomic config store, env seeding, sessions storage |
+| `src/config/store.ts` | B1 | atomic config store, env seeding, containers storage |
 | `src/auth/index.ts` | B1 | `AuthService`, `requireAuth`, `authenticateUpgradeRequest` |
 | `src/auth/routes.ts` | B1 | `/api/auth` |
 | `src/backends/types.ts` | **FROZEN** | `DockerBackend` + all DTOs |
@@ -66,13 +73,13 @@ should use `import type` (`isolatedModules` is on).
 | `src/routes/health.ts` | B1 | `/api/health` |
 | `src/routes/settings.ts` | B1 | `/api/settings` |
 | `src/routes/docker.ts` | B1 | `/api/docker` read-only helpers |
-| `src/sessions/model.ts` | **FROZEN** | zod session model, labels, volume naming (implemented) |
-| `src/sessions/container.ts` | B2 | `SessionConfig` → `CreateContainerSpec`, `specHash` |
-| `src/sessions/service.ts` | B2 | lifecycle, reconcile, `requireRunningContainer` |
-| `src/sessions/routes.ts` | B2 | `/api/sessions` |
-| `src/terminals/protocol.ts` | **FROZEN** | WS wire protocol types + close codes (implemented) |
-| `src/terminals/service.ts` | B2 | exec creation, tmux detection, command matrix |
-| `src/terminals/ws.ts` | B2 | `attachTerminalWs(server, ctx)` |
+| `src/containers/model.ts` | **FROZEN** | zod container model, labels, volume naming (implemented) |
+| `src/containers/container.ts` | B2 | `ContainerConfig` → `CreateContainerSpec`, `specHash` |
+| `src/containers/service.ts` | B2 | lifecycle, reconcile, `requireRunningContainer` |
+| `src/containers/routes.ts` | B2 | `/api/containers` |
+| `src/sessions/protocol.ts` | **FROZEN** | WS wire protocol types + close codes (implemented) |
+| `src/sessions/service.ts` | B2 | exec creation, tmux detection, command matrix |
+| `src/sessions/ws.ts` | B2 | `attachSessionWs(server, ctx)` |
 | `src/images/recipes.ts` | **FROZEN** | recipe registry (implemented) |
 | `src/images/tarContext.ts` | B2 | tar-fs build context + context hashing |
 | `src/images/service.ts` | B2 | builds, jobs, tools volume, custom-image validation |
@@ -83,7 +90,7 @@ listed owner's job, but **no exported name, signature or type may change**. Anyt
 is a cross-topic change: raise it, do not just edit.
 
 Because `routes/index.ts` already imports both coders' routers and `index.ts` already
-knows `attachTerminalWs`, B1 and B2 never touch the same file.
+knows `attachSessionWs`, B1 and B2 never touch the same file.
 
 ## 3. Boot sequence
 
@@ -99,16 +106,16 @@ knows `attachTerminalWs`, B1 and B2 never touch the same file.
    → `backend.*` (when `backend.kind === 'none'`).
 6. `new BackendManager({config, env, log})`; `config.on('change', () => backends.invalidateIfChanged())`
    — the instance is only rebuilt when the *backend* section actually changed (UI layout
-   autosave, session writes and password changes must not tear down a transport that
+   autosave, container writes and password changes must not tear down a transport that
    still carries running builds/pulls/execs).
-7. `new SessionService(deps)`, `new ImageService(deps)`, `new TerminalService(deps, sessions)`.
+7. `new ContainerService(deps)`, `new ImageService(deps)`, `new SessionService(deps, containers)`.
 8. `createAuthService(...)`, assemble `AppContext`.
 9. `createApp(ctx)` → `http.createServer(app)`.
-10. `attachTerminalWs(server, ctx)`.
+10. `attachSessionWs(server, ctx)`.
 11. `server.listen(env.PORT, env.HOST)`.
-12. Best-effort `sessions.reconcile()` — failures are logged, never fatal. **The server must
+12. Best-effort `containers.reconcile()` — failures are logged, never fatal. **The server must
     start with no backend configured**; that is the first-run state.
-13. `SIGINT`/`SIGTERM` → `terminals.closeAll()`, `server.close()`, `backends.close()`,
+13. `SIGINT`/`SIGTERM` → `sessions.closeAll()`, `server.close()`, `backends.close()`,
     exit 0 (force-exit after 10 s).
 
 ## 4. Configuration
@@ -131,7 +138,7 @@ after first boot; env vars only seed it. Shape: `config/schema.ts`.
 ## 5. Auth
 
 Single user, single password. `POST /api/auth/login` verifies against
-`auth.passwordHash`, then sets `pc_session`: a HS256 JWT `{sub:'admin', v:tokenVersion,
+`auth.passwordHash`, then sets `pc_auth`: a HS256 JWT `{sub:'admin', v:tokenVersion,
 iat, exp}` with `SESSION_TTL_DAYS` (default 30), `httpOnly`, `sameSite:'lax'`, `path:'/'`,
 `secure` per `COOKIE_SECURE` (`auto` = the request arrived over https, honouring
 `X-Forwarded-Proto` since `trust proxy` is on).
@@ -145,7 +152,7 @@ WebSocket upgrades reuse the same cookie via `authenticateUpgradeRequest(req, ct
 unauthenticated upgrade is answered with a raw `HTTP/1.1 401` and the socket destroyed —
 the handshake is never completed.
 
-Static files are **not** gated: the SPA loads, calls `GET /api/auth/session` and shows its
+Static files are **not** gated: the SPA loads, calls `GET /api/auth/me` and shows its
 login screen. Nothing sensitive is in the static bundle.
 
 ## 6. Docker backends
@@ -162,7 +169,7 @@ Docker Engine API; only transport, auth and the exec stream differ.
   Node's fetch needs `duplex: 'half'` when the body is a stream.
 * Exec: `POST …/docker/containers/{id}/exec` → `{ Id }`, then connect
   `wss://<portainer-host>/api/websocket/exec?endpointId=<id>&id=<execId>` with the
-  `X-API-Key` header (verified against Portainer EE 2.39 — this is why the terminal runs
+  `X-API-Key` header (verified against Portainer EE 2.39 — this is why a session runs
   through our server and not the browser: browsers cannot set WS headers). Portainer
   starts the exec when the socket opens; **do not** also call `/exec/{id}/start`.
   Resize goes over REST: `POST …/docker/exec/{execId}/resize?h=<rows>&w=<cols>`.
@@ -186,16 +193,16 @@ Docker Engine API; only transport, auth and the exec stream differ.
   old instance never destroys sockets that still carry in-flight requests.
 * Nothing in this layer ever logs the API key or the raw `X-API-Key` header.
 
-## 7. Sessions
+## 7. Containers
 
-Model, labels and volume names: `sessions/model.ts` (frozen).
+Model, labels and volume names: `containers/model.ts` (frozen).
 
 Container layout produced by `buildContainerSpec`:
 
 ```
 name        pc-<slug>                                  (general.containerPrefix)
 labels      porterclaude.managed=true
-            porterclaude.session=<slug>
+            porterclaude.container=<slug>
             porterclaude.image-type=recipe|custom
             porterclaude.recipe=<name>                 (recipes only)
             porterclaude.spec-hash=<sha256>
@@ -219,52 +226,52 @@ resources   cpus -> NanoCpus, memoryMb -> Memory
 Flows
 * **HOME for custom images**: docker inherits `HOME` from the image, which is `/root` for
   the root images people usually pick — claude would then write `~/.claude` and
-  `~/.claude.json` to `/root`, outside the shared volumes, and "log in once, every session
+  `~/.claude.json` to `/root`, outside the shared volumes, and "log in once, every container
   authenticated" would silently not hold. `buildContainerSpec` therefore pins
   `HOME=<containerHome>` for custom images (recipes already have it right). A user-supplied
   `env.HOME` still wins. A root custom image writes into the uid-1000 shared volume as
   root, so `validateCustomImage` warns about it.
-* **non-root custom images** (session `user`, or an image with its own `USER`): docker
+* **non-root custom images** (container `user`, or an image with its own `USER`): docker
   creates the mountpoint parent `<containerHome>` in the container layer as `root:root`,
   so the tools entrypoint - which runs as that unprivileged uid - can write neither
   `/etc/profile.d/porterclaude.sh` nor `$HOME/.profile` / `.bashrc` (no PATH persistence)
   nor the `$HOME/.claude.json` symlink, and the root-only `/usr/local/bin/claude` wrapper
-  is not installed either. Without help such a session has no usable `claude` at all.
+  is not installed either. Without help such a container has no usable `claude` at all.
   The contract is therefore:
   1. `buildContainerSpec` pins `PATH=<toolsMount>/bin:<containerHome>/.local/bin:<image
      PATH>` in the **container env** (the image PATH comes from `inspectImage`; the docker
      default is the fallback). Every `docker exec` inherits it, so no rc file is needed.
-     `SessionView.needsRecreate` recomputes the spec with the image PATH recovered from the
-     container env (`imagePathFromEnv`), otherwise custom sessions would flap.
+     `ContainerView.needsRecreate` recomputes the spec with the image PATH recovered from the
+     container env (`imagePathFromEnv`), otherwise custom containers would flap.
   2. `afterStart` runs `chown <user> <containerHome>` (plus the shared claude dirs when they
      are still root-owned) as **uid 0** via exec - the only way in, since nothing inside the
      container runs as root before the entrypoint - and then re-runs
-     `<toolsMount>/entrypoint.sh --porterclaude-bootstrap` as the session user, which now
+     `<toolsMount>/entrypoint.sh --porterclaude-bootstrap` as the container user, which now
      persists PATH and links `~/.claude.json`. Both steps are best effort.
   3. The same root exec installs the two files the re-bootstrap still cannot write,
-     because it runs as the session user: `/etc/profile.d/porterclaude.sh` (sourced by
+     because it runs as the container user: `/etc/profile.d/porterclaude.sh` (sourced by
      every login shell *after* `/etc/profile` has hard-set PATH — alpine and debian both
-     do — so `bash -l` terminals and tmux panes find `<toolsMount>/bin` even without an rc
+     do — so `bash -l` sessions and tmux panes find `<toolsMount>/bin` even without an rc
      file in `$HOME`) and the `/usr/local/bin/claude` wrapper (so `claude` resolves in an
      exec that starts from the standard PATH). Both are marker-guarded
      (`# porterclaude (generated)`): a `claude` or profile snippet the image itself ships
      is never overwritten, and the PATH export is skipped when the prefix is already
      there. `start` and `restart` re-run all of this (idempotent), which is how a user
-     applies a tools-volume update to a running session.
-  4. `TerminalService.open` additionally passes `PATH` in the exec env and re-exports it
+     applies a tools-volume update to a running container.
+  4. `SessionService.open` additionally passes `PATH` in the exec env and re-exports it
      inside the `sh -lc` command (see section 8), because a login shell re-sources
      `/etc/profile`, which on Debian & co overwrites PATH unconditionally.
 * **private history**: `porterclaude-hist-<slug>` overlays `<home>/.claude/projects`, a
   path *inside* the shared claude volume. If that directory does not exist yet, docker
   creates it as `root:root` while wiring the mount and the fresh history volume is
-  root-owned too — the session cannot write its own history and, worse, the root-owned
+  root-owned too — the container cannot write its own history and, worse, the root-owned
   `projects` directory stays behind in the SHARED volume and breaks history for every other
-  session. `create`/`recreate` therefore run a one-shot root container first
+  container. `create`/`recreate` therefore run a one-shot root container first
   (`porterclaude-histinit-<rand>`, *not* labelled `porterclaude.managed`) which mounts the
   shared volume at its real path (so docker's empty-volume seeding still copies the image's
   uid-1000 ownership) plus the history volume at `/pc-hist`, creates `projects` and chowns
   both to the owner of the shared volume root. It is best effort: a failure becomes a
-  session warning. In addition every start runs a root exec that re-creates/re-chowns
+  container warning. In addition every start runs a root exec that re-creates/re-chowns
   `<home>/.claude/projects`, which self-heals volumes damaged by older builds.
 * **create**: validate name free (config **and** container) → `ensureSharedVolumes()` →
   create the workspace/history volumes → resolve the image (recipe → `<ns>/<recipe>:latest`,
@@ -277,21 +284,21 @@ Flows
   `porterclaude-ws-<slug>` / `porterclaude-hist-<slug>` (never the shared volumes) → drop
   the config entry.
 * **reconcile**: list containers filtered by `porterclaude.managed=true`; match on the
-  `porterclaude.session` label. Containers without a stored config are shown as
+  `porterclaude.container` label. Containers without a stored config are shown as
   `orphan:true` views whose definition is reconstructed from labels + inspect, so losing
-  `/data` does not lose your sessions. The reconstruction is **lossless as far as docker
+  `/data` does not lose your containers. The reconstruction is **lossless as far as docker
   remembers**: name/image/workspace/shareHistory/user plus `env` (Config.Env minus the
   image's own env and minus everything `buildContainerSpec` sets), `ports`
   (HostConfig.PortBindings, runtime bindings as fallback), `extraMounts` (every mount that
   is not one of ours), `limits` (NanoCpus/Memory), `network` (NetworkMode) and `autoStart`
   (RestartPolicy) - because that definition is what a later Recreate/Edit rebuilds from.
   **Adoption** (persisting it) only happens on an explicit user action: `POST
-  /api/sessions/reconcile` (`reconcile({adopt:true})`), or the first
-  `start`/`recreate`/`PUT` on the session. The startup `reconcile()` deliberately does not
+  /api/containers/reconcile` (`reconcile({adopt:true})`), or the first
+  `start`/`recreate`/`PUT` on the container. The startup `reconcile()` deliberately does not
   adopt, so an orphan stays visible as `orphan:true` instead of being silently rewritten
-  into a reconstructed definition. A freshly adopted session does not report
+  into a reconstructed definition. A freshly adopted container does not report
   `needsRecreate` (its definition describes that container by construction). Stored
-  sessions with no container get `status:'absent'`. `needsRecreate` = the container's
+  containers with no container get `status:'absent'`. `needsRecreate` = the container's
   `spec-hash` label differs from the hash of the spec the current config would produce.
 * **git workspace**: the volume is seeded on first start with a `git clone` exec inside the
   container (the recipe images ship git); failures become a `warnings[]` entry, not a 500.
@@ -299,12 +306,12 @@ Flows
 `list()` must degrade gracefully: if the backend is unreachable, return the stored configs
 with `status:'absent'` and a warning instead of failing the whole page.
 
-## 8. Terminals
+## 8. Sessions
 
-`TerminalService.open()` → `ExecStream`; `attachTerminalWs` bridges it to the socket. The
-wire protocol is in `terminals/protocol.ts` and documented in `api.md` §WebSocket.
+`SessionService.open()` → `ExecStream`; `attachSessionWs` bridges it to the socket. The
+wire protocol is in `sessions/protocol.ts` and documented in `api.md` §WebSocket.
 
-Command matrix (`buildTerminalCommand`):
+Command matrix (`buildSessionCommand`):
 
 | tmux | shell | command |
 |---|---|---|
@@ -327,7 +334,7 @@ the tmux probe), not only when tmux is missing.
 * tmux presence is probed with `command -v tmux` through `runExec`, cached ~60 s per
   container id (a `tools` sync or a package install can change it).
 * Exec env: `TERM=xterm-256color`, `COLORTERM=truecolor`, `LANG=C.UTF-8`; `workingDir`
-  `/workspace`; `user` from the session config when set. **Custom images** additionally get
+  `/workspace`; `user` from the container config when set. **Custom images** additionally get
   `PATH=<toolsMount>/bin:<containerHome>/.local/bin:<container PATH>` (read from
   `inspectContainer`, cached per container like the probes), and every `sh -lc` row is
   prefixed with `PATH='<toolsMount>/bin:<containerHome>/.local/bin':$PATH; export PATH; `.
@@ -335,7 +342,7 @@ the tmux probe), not only when tmux is missing.
   resolvable in an image that resets PATH there and cannot write an rc file (section 7).
 * Resize: `{type:'resize'}` → `stream.resize()` → `execResize` (REST on both backends).
 * Backpressure: drop the socket when `ws.bufferedAmount` exceeds 4 MiB.
-* Shutdown: `terminals.closeAll()` closes every exec stream and socket with code 1000.
+* Shutdown: `sessions.closeAll()` closes every exec stream and socket with code 1000.
 
 Known caveat (documented, accepted): with no tmux in a custom image, a browser reload
 starts a fresh shell and kills a running `claude`. The `ready.tmux:false` flag lets the UI
@@ -403,9 +410,9 @@ Unit / integration (vitest, no docker host required):
   login → cookie; password change → the old cookie stops working (supertest agent).
 * `buildContainerSpec`: labels, mounts, custom-image entrypoint, `shareHistory:false`
   extra volume, cpu/memory translation, restart policy. `specHash` stability.
-* `buildTerminalCommand`: all six combinations; a terminal name with quotes/spaces is
+* `buildSessionCommand`: all six combinations; a session (pane) name with quotes/spaces is
   shell-quoted and cannot break out.
-* `SessionService` with a stubbed `DockerBackend`: create/update/remove call the expected
+* `ContainerService` with a stubbed `DockerBackend`: create/update/remove call the expected
   backend methods in the expected order; `list()` marks orphans and `needsRecreate`.
 * `hashContext` determinism.
 * Route table: every path in `api.md` exists (a 404-sweep test is cheap and catches typos).
@@ -413,12 +420,12 @@ Unit / integration (vitest, no docker host required):
 Manual / integration against a real engine (integration QA):
 * Socket mode on a Linux docker host, Portainer mode against the reference instance:
   Settings → test connection → endpoint list → save → containers list.
-* Create a session from the `node` recipe → start → open a `bash` terminal → `claude` →
-  `/login` → open a second session → `claude` is already authenticated.
+* Create a container from the `node` recipe → start → open a `bash` session → `claude` →
+  `/login` → open a second container → `claude` is already authenticated.
 * Reload the browser mid-`claude`: the pane reattaches (tmux) and output continues.
 * Resize the pane → `stty size` inside the container matches.
-* Edit a session (change env/ports) → recreate → the workspace volume still has its files.
-* Kill the container from outside → the Sessions tab shows `exited`; `reconcile` recovers a
+* Edit a container (change env/ports) → recreate → the workspace volume still has its files.
+* Kill the container from outside → the Containers tab shows `exited`; `reconcile` recovers a
   container after deleting `config.json`.
 * Build a recipe from Settings → Images: log lines stream via polling, `built` flips to
   true, `outdated` flips after touching the Dockerfile.
@@ -435,7 +442,7 @@ wins**. The wire contract is `api.md` §"v0.2 — hosts and agents".
 The single global docker backend becomes **N hosts**; Claude Code becomes **N agents**.
 Both are data, not code paths: a host is `{id, name, connection}` and a `HostManager` hands
 out one `DockerBackend` per host; an agent is an `AgentDefinition` and everything that used
-to be claude-specific (installation, shared volume, terminal command, images panel) is
+to be claude-specific (installation, shared volume, session command, images panel) is
 driven by that definition. Nothing is shared between hosts — no volumes, no images, no
 logins, no sync.
 
@@ -453,14 +460,14 @@ logins, no sync.
 | `src/hosts/credentialRoutes.ts` | B1 | `/api/credentials` |
 | `src/agents/model.ts` | **FROZEN** | `AgentDefinition` + the pure layout helpers (volume names, links, history target, slugs) |
 | `src/agents/builtin.ts` | **FROZEN** | the five built-in agents + `DEFAULT_ENABLED_AGENT_IDS` |
-| `src/agents/registry.ts` | B1 | `AgentRegistry`: built-in ∪ custom, per-host/-session resolution, install specs |
+| `src/agents/registry.ts` | B1 | `AgentRegistry`: built-in ∪ custom, per-host/-container resolution, install specs |
 | `src/agents/routes.ts` | B1 | `/api/agents` **and** `/api/hosts/:hostId/agents` |
 | `src/backends/index.ts` | B1 | `createBackend(ResolvedConnection)` + `testConnection` + `listPortainerEndpoints` (BackendManager is gone) |
 | `src/routes/docker.ts` | B1 | host-scoped (`mergeParams`) |
 | `src/routes/settings.ts` | B1 | general/ui/password/vendor only |
 | `src/routes/health.ts` | B1 | `hosts` summary |
-| `src/sessions/*` | B2 | `hostId` + `agents` everywhere (see §13) |
-| `src/terminals/*` | B2 | `shell: 'agent'`, host routing (see §14) |
+| `src/containers/*` | B2 | `hostId` + `agents` everywhere (see §13) |
+| `src/sessions/*` | B2 | `shell: 'agent'`, host routing (see §14) |
 | `src/images/*` | B2 | host-scoped, agent-aware tools sync (see §15) |
 
 `routes/index.ts` (FROZEN) mounts the host-scoped routers **before** `/api/hosts`, so a host
@@ -471,7 +478,7 @@ id can never shadow `/images`, `/docker` or `/agents`.
 ```
 config/fields.ts ─┬─> hosts/model.ts ─┐
                   ├─> agents/model.ts ─┼─> config/schema.ts ─> config/store.ts ─> hosts/manager.ts
-                  └─> sessions/model.ts┘                                   └─> agents/registry.ts
+                  └─> containers/model.ts┘                                   └─> agents/registry.ts
 ```
 
 `hosts/model.ts` must never import `config/schema.ts` (that is why `GENERAL_FIELD_SCHEMAS`
@@ -504,8 +511,8 @@ HostConnection = { type:'socket', socketPath }
 * **`status`** in `HostView` comes from a ≤15 s cached probe; the host list must render for a
   dead engine (`status:'unreachable'`, `error` set) instead of 502ing.
 * **Deleting a host never touches the engine.** Containers, volumes and images stay; only
-  PorterClaude forgets them. `409` while sessions reference it, `force=1` overrides and
-  leaves those sessions with `hostMissing:true`.
+  PorterClaude forgets them. `409` while containers reference it, `force=1` overrides and
+  leaves those containers with `hostMissing:true`.
 
 ## 12.2 Credentials
 
@@ -558,7 +565,7 @@ by target depth, so the nested mount on top of the agent volume is well defined 
 mechanism v0.1 used for `~/.claude/projects` inside the shared claude volume).
 
 **Delivery is uniform** (product owner's call): recipes stop baking claude in; **every**
-session mounts the tools volume read-only at `<toolsMount>` and gets
+container mounts the tools volume read-only at `<toolsMount>` and gets
 `entrypoint ["<toolsMount>/entrypoint.sh"]`. Recipes still run their image `CMD` (the php
 recipe must still start supervisord), but the server has to **repeat it explicitly**: the
 engine only inherits the image `Cmd` when the create request leaves `Entrypoint` unset (moby
@@ -577,16 +584,16 @@ argv it was created with — for the same reason `imageEnvPath` is recovered fro
 | tools → volume | `<toolsMount>/AGENTS.json` | `{ syncedAt, agents:[{id,command,installed,version,error}] }` |
 | tools → volume | `<toolsMount>/agents/<id>/…` | the agent's files; `<toolsMount>/bin/<command>` is the shim on PATH |
 | tools → volume | `<toolsMount>/runtime/node/bin/node`, `<toolsMount>/runtime/python` | runtimes for `npm` / `pip` agents |
-| server → session container | env `PORTERCLAUDE_AGENT_IDS` | comma separated ids mounted into this container |
-| server → session container | env `PORTERCLAUDE_AGENT_LINKS` | `target|source|kind;…` — the symlinks to create |
-| server → session container | env `PORTERCLAUDE_HOST` | the host id (diagnostics) |
+| server → container | env `PORTERCLAUDE_AGENT_IDS` | comma separated ids mounted into this container |
+| server → container | env `PORTERCLAUDE_AGENT_LINKS` | `target|source|kind;…` — the symlinks to create |
+| server → container | env `PORTERCLAUDE_HOST` | the host id (diagnostics) |
 
 The entrypoint SHOULD create the links itself at start (best effort, POSIX sh); the server
 re-runs the same repair from the outside in `afterStart` (root exec), which is what makes it
 work for containers created by an older tools volume and for non-root images.
 
-**Terminals**: `shell=agent:<id>` runs `agentCommandLine(def)` = `command` + `args`, every
-element shell-quoted. An agent that is not in the session's `resolvedAgents` is refused with
+**Sessions**: `shell=agent:<id>` runs `agentCommandLine(def)` = `command` + `args`, every
+element shell-quoted. An agent that is not in the container's `resolvedAgents` is refused with
 `agent_not_available` / close 4410 — starting it anyway would run an *unauthenticated* agent
 with no auth volume and confuse the user. The same 4410 also covers the second half of the
 gate: an agent the container MOUNTS but the host's tools volume never received (enabling does
@@ -607,16 +614,16 @@ chown to the volume owner, drop the marker `.pc-import-v1`. The old volumes are 
 deleted, so a rollback to v0.1 keeps working and the import can be re-run by deleting the
 marker. Without this the deployed instance would silently ask for `/login` again.
 
-## 13 Sessions (v0.2 delta)
+## 13 Containers (v0.2 delta)
 
-* `SessionConfig` gains `hostId` (immutable after create) and `agents: string[] | null`
+* `ContainerConfig` gains `hostId` (immutable after create) and `agents: string[] | null`
   (null = the host's enabled set, resolved at create/recreate time).
-* Session **names are unique across hosts** — that is what lets the terminal WS route
-  `session → host`. `create()` checks the stored sessions of every host plus the containers
+* Container **names are unique across hosts** — that is what lets the session WS route
+  `container → host`. `create()` checks the stored containers of every host plus the containers
   of the target host.
 * `list()` merges every host: one `listManagedContainers` per host, in parallel, each failure
-  degrading only that host's sessions to `status:'absent'` + a warning. `opts.hostId` filters.
-* `SessionView` gains `hostId`, `hostName`, `hostMissing`, `resolvedAgents`.
+  degrading only that host's containers to `status:'absent'` + a warning. `opts.hostId` filters.
+* `ContainerView` gains `hostId`, `hostName`, `hostMissing`, `resolvedAgents`.
 * Volume names are prefixed with `general.volumePrefix` (default `porterclaude-`, i.e. the
   v0.1 names): `<prefix>ws-<slug>`, `<prefix>hist-<slug>` (claude) /
   `<prefix>hist-<slug>-<agentId>`, `<prefix>auth-<agentId>`.
@@ -633,20 +640,20 @@ marker. Without this the deployed instance would silently ask for `/login` again
   `containerPrefix`/`volumePrefix` overrides are advertised for. `config.instanceId`
   (`pc-<12 hex>`, generated once by `ConfigStore.init` and never rewritten) labels every
   container and volume this install creates, and `listManagedContainers` drops everything
-  labelled for another install: `list()`, `reconcile()`, `locate()` (terminals, start,
+  labelled for another install: `list()`, `reconcile()`, `locate()` (sessions, start,
   remove, recreate) only ever see containers with THIS id or with no id at all — the latter
   being a v0.1/v0.2.0 container of this install, since nothing else ever wrote the label.
   Without it each install listed the other's containers as adoptable orphans, with its own
-  `hostName`, its own rewritten `resolvedImage` and a terminal that opened into them.
+  `hostName`, its own rewritten `resolvedImage` and a session that opened into them.
   The one deliberate exception is the create-time name check, which looks at every managed
   container regardless of instance: the name clash is real, and docker's own error is worse.
   No migration: an install that has no id yet gets one on the next boot.
-* Changing a host's enabled agents makes its sessions report `needsRecreate` (the mounts are
+* Changing a host's enabled agents makes its containers report `needsRecreate` (the mounts are
   part of the spec hash). That is intended and documented in the UI.
 
-## 14 Terminals (v0.2 delta)
+## 14 Sessions (v0.2 delta)
 
-* `TerminalService.open({session, shell, agentId, name, cols, rows})` resolves the session's
+* `SessionService.open({container, shell, agentId, name, cols, rows})` resolves the container's
   host first (`requireRunningContainer` now returns `hostId`) and uses that host's backend
   and settings.
 * The command matrix keeps its six rows; the `claude` row became the `agent` row and takes
@@ -654,7 +661,7 @@ marker. Without this the deployed instance would silently ask for `/login` again
 * The tools PATH prefix now applies to **every** image (recipes included), because the agents
   live in the tools volume for both.
 * New close codes 4410 (`agent_not_available`) and 4411 (`host_unavailable`); both are
-  terminal, the client must not reconnect.
+  session, the client must not reconnect.
 
 ## 15 Images and the tools volume (v0.2 delta)
 
@@ -686,8 +693,8 @@ marker. Without this the deployed instance would silently ask for `/login` again
 Unit (vitest, no docker host):
 * `config/fields.ts` + `GeneralSettingsInputSchema` parity guard still compiles (it is a
   compile-time assertion, so a missing validator fails the build).
-* **Migration**: v1 portainer file, v1 socket file, v1 with sessions (incl.
-  `shareHistory:false`), empty v1 → hosts/credentials/defaultHostId/sessions[].hostId, the
+* **Migration**: v1 portainer file, v1 socket file, v1 with containers (incl.
+  `shareHistory:false`), empty v1 → hosts/credentials/defaultHostId/containers[].hostId, the
   `.v1.bak` file exists, and the migrated api key still decrypts.
 * `HostManager`: default resolution, per-host cache identity, `invalidateChanged()` drops
   only the changed host, `settingsFor` merge, socket-host uniqueness, delete rules,
@@ -695,31 +702,96 @@ Unit (vitest, no docker host):
 * `CredentialStore`: `sanitize()` never contains the key (grep the JSON), omitted `apiKey`
   keeps the stored one, delete-while-referenced is a 409.
 * `AgentRegistry`: built-in ∪ custom, id collision 409, duplicate path slug 422,
-  `resolveForSession` (null → host set, explicit list, unknown id dropped).
+  `resolveForContainer` (null → host set, explicit list, unknown id dropped).
 * `agents/model.ts` pure helpers: `agentPathSlug` table (`~/.claude`, `~/.claude.json`,
   `~/.local/share/opencode`, `~/.config/opencode`), `agentLinks`, `agentHistoryTarget`,
   `encode/decodeAgentLinks` round trip.
 * `buildContainerSpec` v0.2: one auth mount per agent, private history nested inside it,
-  tools volume in a recipe session, entrypoint set + `cmd` only for custom, the new labels,
+  tools volume in a recipe container, entrypoint set + `cmd` only for custom, the new labels,
   `PORTERCLAUDE_AGENT_LINKS`, and spec-hash stability vs. change when the agent set changes.
-* `buildTerminalCommand`: the agent rows with a multi-word `agentCommand` and with a hostile
+* `buildSessionCommand`: the agent rows with a multi-word `agentCommand` and with a hostile
   agent name (quoting).
-* `parseTerminalShell`: `bash`, `sh`, `agent:claude`, legacy `claude`, garbage → null.
+* `parseSessionShell`: `bash`, `sh`, `agent:claude`, legacy `claude`, garbage → null.
 * Routes: a 404-sweep over every path in api.md v0.2 (host-scoped ones included), plus
   `/api/hosts/:hostId/...` with an unknown host → 404 and with an incomplete connection → 409.
 
 Integration (real engines — the reference instance is socket mode; add a Portainer host):
 1. Upgrade path: start v0.2 against the existing `/data`, confirm the host `default` appears,
-   the sessions still list, `config.json.v1.bak` exists, and a `tools/sync` imports the
-   claude login (open a terminal: no `/login` prompt).
-2. Add a Portainer credential → import endpoints → a host per endpoint → create a session on
-   the new host → terminal works, and the session list shows both hosts.
+   the containers still list, `config.json.v1.bak` exists, and a `tools/sync` imports the
+   claude login (open a session: no `/login` prompt).
+2. Add a Portainer credential → import endpoints → a host per endpoint → create a container on
+   the new host → session works, and the container list shows both hosts.
 3. Enable `opencode` on one host → sync tools → Images panel shows it installed with a
-   version → recreate a session → `agent:opencode` terminal starts it → login → a SECOND
-   session on the SAME host is authenticated → a session on the OTHER host is NOT.
-4. `shareHistory:false` session on a host with two agents → two history volumes, both
+   version → recreate a container → `agent:opencode` session starts it → login → a SECOND
+   container on the SAME host is authenticated → a container on the OTHER host is NOT.
+4. `shareHistory:false` container on a host with two agents → two history volumes, both
    writable, and the shared auth volume is untouched.
-5. Delete a host with sessions → 409; with `force=1` → the sessions show `hostMissing` and the
-   containers are still running on the engine.
+5. Delete a host with containers → 409; with `force=1` → those entries show `hostMissing` and
+   the containers are still running on the engine.
 6. Kill a host's engine → the host list still renders (`unreachable`), the other host's
-   sessions still work, and a terminal on the dead host closes 4411.
+   containers still work, and a session on the dead host closes 4411.
+
+---
+
+# 17 v0.3 — the rename (phase R)
+
+Pure vocabulary change, no behaviour beyond the deltas listed here. `users.md` §0 defines the
+words, §7 the table.
+
+## 17.1 What moved
+
+| Was | Is | Note |
+|---|---|---|
+| `src/sessions/**` | `src/containers/**` | the long-lived box: `model.ts`, `container.ts`, `service.ts` (`ContainerService`), `routes.ts` (`createContainersRouter`) |
+| `src/terminals/**` | `src/sessions/**` | one shell connection: `protocol.ts`, `service.ts` (`SessionService`), `ws.ts` (`attachSessionWs`) |
+| `AppContext.sessions` | `AppContext.containers` | the container service |
+| `AppContext.terminals` | `AppContext.sessions` | the session service — **`ctx.sessions` changed meaning** |
+| `Session*` types | `Container*` | `ContainerInput`, `ContainerConfig`, `ContainerView`, `ContainerWorkspace`, `ContainerImageRef`, `ContainerPreparation` |
+| `Terminal*` types | `Session*` | `SessionShell`, `SessionQuery`, `SessionRefusal`, `SESSION_CLOSE`, `SessionCloseCode`, `SESSION_HEARTBEAT_*` |
+| `/api/sessions` | `/api/containers` | REST; `POST /reconcile` still registered **before** `/:name` |
+| `/api/terminals?session=&name=` | `/api/sessions?container=&session=` | websocket; close-code numbers unchanged |
+| `GET /api/auth/session` | `GET /api/auth/me` | body `{ authenticated, needsSetup }` unchanged in phase R |
+| cookie `pc_session` | `pc_auth` | `AUTH_COOKIE`; everyone is logged out once |
+| `config.sessions[]` | `config.containers[]` | `CONFIG_VERSION` 2 → 3 |
+| `hostForSession` / `resolveForSession` / `HostView.sessionCount` | `hostForContainer` / `resolveForContainer` / `HostView.containerCount` | |
+
+`/api/sessions` therefore changed owner: it is the **websocket** path now, and a plain
+`GET /api/sessions` must not resolve to an Express route.
+
+## 17.2 The label, and why nothing needs recreating
+
+`buildContainerSpec` writes `porterclaude.container`; the three discovery sites
+(`reconcile`, `matchContainer`, `synthesizeConfig`) read through one helper,
+`containerLabelOf(labels) = labels['porterclaude.container'] ?? labels['porterclaude.session']`,
+so containers created by v0.2 keep working and are relabelled on their next recreate. The
+compatibility read (`LEGACY_CONTAINER_LABEL`) is deleted in v0.4.
+
+`specHash` hashes `env` but **not** `labels`, which is exactly why the label rename is free and
+why the env keys are not renamed: `PORTERCLAUDE_SESSION` (and the values
+`PORTERCLAUDE_AGENT_IDS` / `PORTERCLAUDE_AGENT_LINKS`) would flip the hash of every existing
+container to *needs recreate*, and `PORTERCLAUDE_SESSION` is read by `docker/tools/entrypoint.sh`
+out of a tools volume that upgrades independently of the server.
+
+## 17.3 Config v2 → v3
+
+`ConfigStore.migrate()` gains one step after the v1 → v2 one, on the same intermediate object:
+back up (`config.json.v2.bak`, mode `0600`, flag `wx`), `containers = sessions ?? []`, drop
+`sessions`, `version = 3`. Each step is guarded on its own version, so a v1 file chains
+v1 → v2 → v3 in a single `migrate()` pass. This has to be right: once `AppConfigSchema` has no
+`sessions` key, zod strips it and `containers` falls back to its `[]` default — an unmigrated
+file would parse cleanly and answer "no containers" with no error anywhere.
+
+## 17.4 Deliberately NOT renamed
+
+* tmux's own vocabulary: `tmuxSessionName()`, the `pc_` prefix, `tmux new-session|has-session|kill-session`,
+  and the log/info strings that name a tmux session. Changing any of them strands running shells.
+* `PORTERCLAUDE_SESSION` (§17.2), and the env **values** `PORTERCLAUDE_AGENT_IDS` /
+  `PORTERCLAUDE_AGENT_LINKS` (only the TS constants became `CONTAINER_AGENTS_ENV` /
+  `CONTAINER_AGENT_LINKS_ENV`).
+* `general.sessionNetwork` — a persisted config key that is not in the §7 table; renaming it
+  needs its own migration step. Only the settings **label** changed to "Container network".
+* `SESSION_TTL_DAYS` — read from the deployment's `.env`; it is the login lifetime, and
+  renaming it would silently revert a configured TTL to the 30-day default.
+* "terminal error middleware" / the terminal `app.use()` fallback — Express's word for the
+  last handler in the chain.
+* The xterm.js widget in the browser is still a terminal (§frontend).

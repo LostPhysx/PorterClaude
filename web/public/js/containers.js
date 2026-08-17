@@ -1,19 +1,19 @@
-// OWNER: F1. Sessions tab: table, create/edit modal, lifecycle actions, logs modal.
+// OWNER: F1. Containers tab: table, create/edit modal, lifecycle actions, logs modal.
 //
-// v0.2: a session is pinned to a HOST (chosen on create, IMMUTABLE afterwards) and mounts a
+// v0.2: a container is pinned to a HOST (chosen on create, IMMUTABLE afterwards) and mounts a
 // set of CODING AGENTS (null = every agent the host enables). The table gains a Host column
 // and a host filter; the dialog gains a host picker and an agent picker; every lookup the
 // dialog needs (recipes, images, networks, agents) is host scoped.
 //
 // CROSS-PACKAGE CONTRACT (FROZEN):
 //   * after every successful list()/poll/CRUD, emit
-//     bus.emit(EVENTS.SESSIONS_CHANGED, { sessions }) with the raw, UNFILTERED SessionView[]
+//     bus.emit(EVENTS.CONTAINERS_CHANGED, { containers }) with the raw, UNFILTERED ContainerView[]
 //     from the API - the host filter of this tab is applied when RENDERING only, so F2's rail
 //     never loses a host.
-//   * the row action "Open terminal" must emit
-//     bus.emit(EVENTS.OPEN_TERMINAL, { session: name, shell: 'bash'|'sh'|'agent:<id>' })
+//   * the row action "Open session" must emit
+//     bus.emit(EVENTS.OPEN_SESSION, { container: name, shell: 'bash'|'sh'|'agent:<id>' })
 //     and then navigate to #/code (F2 opens the pane).
-//   * getSessions() must return the last known SessionView[] (F2 uses it on first paint).
+//   * getContainers() must return the last known ContainerView[] (F2 uses it on first paint).
 import { api } from './api.js';
 import { bus, EVENTS } from './bus.js';
 import {
@@ -23,7 +23,7 @@ import {
 import { getHosts, getHost, hostLabel, resolveHostId, hostOptionsHtml } from './hosts.js';
 import { agentLabel } from './agents.js';
 
-/** Poll cadence (mirrors app.js SESSION_POLL_MS; kept local to avoid an import cycle). */
+/** Poll cadence (mirrors app.js CONTAINER_POLL_MS; kept local to avoid an import cycle). */
 export const POLL_MS = 5000;
 /** Backoff cadence after 3 consecutive failures. */
 export const POLL_BACKOFF_MS = 30000;
@@ -33,7 +33,7 @@ const NAME_RE = /^[a-z0-9][a-z0-9-]{0,30}$/;
 const FALLBACK_RECIPES = ['node', 'dotnet', 'php', 'python', 'go', 'base'];
 
 /** @type {any[]} */
-let sessions = [];
+let containers = [];
 /** @type {any} */
 let appCtx = null;
 /** @type {any[]} */
@@ -42,16 +42,16 @@ let recipes = [];
 let imageRefs = [];
 /** @type {string[]} */
 let networks = [];
-/** @type {any|null} session currently open in the modal (null = create) */
+/** @type {any|null} container currently open in the modal (null = create) */
 let editing = null;
 /** @type {Set<string>} rows with a request in flight */
 const busyRows = new Set();
 
-/** localStorage key of the Sessions tab host filter. */
-export const LS_SESSIONS_HOST = `${LS_PREFIX}sessions.host`;
+/** localStorage key of the Containers tab host filter. */
+export const LS_CONTAINERS_HOST = `${LS_PREFIX}sessions.host`;
 /** '' = all hosts. CLIENT-SIDE only (see the contract at the top of this file). */
-let hostFilter = storage.get(LS_SESSIONS_HOST, '') || '';
-/** host id selected in the session dialog; drives every lookup the dialog makes */
+let hostFilter = storage.get(LS_CONTAINERS_HOST, '') || '';
+/** host id selected in the container dialog; drives every lookup the dialog makes */
 let formHostId = '';
 /** @type {any[]} HostAgentView[] of `formHostId` (GET /api/hosts/:hostId/agents) */
 let formAgents = [];
@@ -61,9 +61,9 @@ let pollFailures = 0;
 let initialised = false;
 let logsState = { name: null, timer: null };
 
-/** FROZEN: F2 calls this for its initial rail paint. @returns {any[]} SessionView[] */
-export function getSessions() {
-  return sessions;
+/** FROZEN: F2 calls this for its initial rail paint. @returns {any[]} ContainerView[] */
+export function getContainers() {
+  return containers;
 }
 
 // ---------------------------------------------------------------------------
@@ -79,18 +79,18 @@ export function getSessions() {
 const BARE_DIGEST_RE = /^sha256:[0-9a-f]{12,}$/i;
 
 /**
- * The image ref this session's spec points at *now* (not the id it happens to run).
- * `SessionView.resolvedImage` is that ref (api.md: the raw digest lives in
+ * The image ref this container's spec points at *now* (not the id it happens to run).
+ * `ContainerView.resolvedImage` is that ref (api.md: the raw digest lives in
  * `containerImage`); the recipe catalogue is the fallback for an older server that still
  * reports the digest there.
- * @param {any} session SessionView
+ * @param {any} container ContainerView
  * @returns {string} e.g. "ghcr.io/lostphysx/porterclaude/node:latest", '' when unknown
  */
-export function imageRefFor(session) {
-  if (session && typeof session.imageRef === 'string' && session.imageRef) return session.imageRef;
-  const resolved = String((session && session.resolvedImage) || '');
+export function imageRefFor(container) {
+  if (container && typeof container.imageRef === 'string' && container.imageRef) return container.imageRef;
+  const resolved = String((container && container.resolvedImage) || '');
   if (resolved && !BARE_DIGEST_RE.test(resolved)) return resolved;
-  const image = (session && session.image) || {};
+  const image = (container && container.image) || {};
   if (image.type === 'custom') return image.ref || '';
   const recipe = recipes.find((r) => r.name === image.recipe);
   return (recipe && recipe.imageRef) || '';
@@ -98,25 +98,25 @@ export function imageRefFor(session) {
 
 /**
  * True when recreating the container would pick up a newer image than the one it runs
- * (`SessionView.imageOutdated`). The fallback - `resolvedImage` being a bare digest - is
+ * (`ContainerView.imageOutdated`). The fallback - `resolvedImage` being a bare digest - is
  * what an older server reports for exactly that situation.
- * @param {any} session SessionView
+ * @param {any} container ContainerView
  */
-export function imageOutdated(session) {
-  if (!session) return false;
-  if (typeof session.imageOutdated === 'boolean') return session.imageOutdated;
-  return BARE_DIGEST_RE.test(String(session.resolvedImage || ''));
+export function imageOutdated(container) {
+  if (!container) return false;
+  if (typeof container.imageOutdated === 'boolean') return container.imageOutdated;
+  return BARE_DIGEST_RE.test(String(container.resolvedImage || ''));
 }
 
 /** The secondary line under the image column: a usable ref, never a bare digest. */
-function resolvedImageLabel(session) {
-  return imageRefFor(session);
+function resolvedImageLabel(container) {
+  return imageRefFor(container);
 }
 
 /** `<div>` under the image cell: the ref plus the "recreate to pick it up" badge. */
-function resolvedImageCell(session) {
-  const ref = resolvedImageLabel(session);
-  const badge = imageOutdated(session)
+function resolvedImageCell(container) {
+  const ref = resolvedImageLabel(container);
+  const badge = imageOutdated(container)
     ? '<span class="badge text-bg-warning" title="a newer build of this image exists - recreate the container to pick it up">image updated \u2014 recreate</span>'
     : '';
   if (!ref && !badge) return '';
@@ -124,8 +124,8 @@ function resolvedImageCell(session) {
   return `<div class="small text-secondary d-flex flex-wrap gap-1 align-items-center">${refHtml}${badge}</div>`;
 }
 
-function imageLabel(session) {
-  const image = session.image || {};
+function imageLabel(container) {
+  const image = container.image || {};
   if (image.type === 'recipe') {
     const recipe = recipes.find((r) => r.name === image.recipe);
     return recipe ? `${recipe.title} (${image.recipe})` : `recipe: ${image.recipe}`;
@@ -150,14 +150,14 @@ function volumePrefixOf(hostId) {
 }
 
 /**
- * The workspace volume of a session: the name the server filled in, else the default
+ * The workspace volume of a container: the name the server filled in, else the default
  * `<volumePrefix>ws-<name>` of ITS host.
- * @param {any} session
+ * @param {any} container
  * @returns {string}
  */
-function workspaceVolumeName(session) {
-  const ws = (session && session.workspace) || {};
-  return ws.volume || `${volumePrefixOf(session && session.hostId)}ws-${(session && session.name) || ''}`;
+function workspaceVolumeName(container) {
+  const ws = (container && container.workspace) || {};
+  return ws.volume || `${volumePrefixOf(container && container.hostId)}ws-${(container && container.name) || ''}`;
 }
 
 /**
@@ -170,11 +170,11 @@ function volumeNamePlaceholder(hostId) {
   return `volume name (blank = ${volumePrefixOf(hostId)}ws-<name>)`;
 }
 
-function workspaceLabel(session) {
-  const ws = session.workspace || { type: 'volume' };
+function workspaceLabel(container) {
+  const ws = container.workspace || { type: 'volume' };
   if (ws.type === 'bind') return `bind ${ws.hostPath}`;
   if (ws.type === 'git') return `git ${ws.url}${ws.branch ? `#${ws.branch}` : ''}`;
-  return `volume ${workspaceVolumeName(session)}`;
+  return `volume ${workspaceVolumeName(container)}`;
 }
 
 /**
@@ -205,11 +205,11 @@ export function dedupePorts(list) {
   return [...byPort.values()].filter((p) => p.hostPort || !published.has(`${p.containerPort}/${p.protocol}`));
 }
 
-/** Ports cell markup for one session. Exported for tests. */
-export function portsLabel(session) {
-  const runtime = Array.isArray(session.runtimePorts) && session.runtimePorts.length
-    ? session.runtimePorts
-    : session.ports || [];
+/** Ports cell markup for one container. Exported for tests. */
+export function portsLabel(container) {
+  const runtime = Array.isArray(container.runtimePorts) && container.runtimePorts.length
+    ? container.runtimePorts
+    : container.ports || [];
   const ports = dedupePorts(runtime);
   if (!ports.length) return '<span class="text-secondary">-</span>';
   return ports
@@ -230,20 +230,20 @@ function actionButton(name, action, icon, label, opts = {}) {
   );
 }
 
-function rowActions(session) {
-  const name = session.name;
-  const running = session.status === 'running';
-  const absent = session.status === 'absent';
-  const orphan = !!session.orphan;
-  // v0.2.2: while the server prepares the host for this session (building its image,
+function rowActions(container) {
+  const name = container.name;
+  const running = container.status === 'running';
+  const absent = container.status === 'absent';
+  const orphan = !!container.orphan;
+  // v0.2.2: while the server prepares the host for this container (building its image,
   // syncing the tools volume) every lifecycle button is pointless — the container is
   // created the moment that finishes.
-  const busy = busyRows.has(name) || !!session.preparing;
-  // a session whose host was force-deleted is READ ONLY: only Destroy stays enabled
-  // (api.md "Sessions": hostMissing)
-  const locked = busy || !!session.hostMissing;
+  const busy = busyRows.has(name) || !!container.preparing;
+  // a container whose host was force-deleted is READ ONLY: only Destroy stays enabled
+  // (api.md "Containers": hostMissing)
+  const locked = busy || !!container.hostMissing;
   const parts = [];
-  parts.push(actionButton(name, 'terminal', 'bi-terminal', 'Open terminal', { disabled: locked || !running, variant: 'outline-primary' }));
+  parts.push(actionButton(name, 'session', 'bi-terminal', 'Open session', { disabled: locked || !running, variant: 'outline-primary' }));
   if (running) {
     parts.push(actionButton(name, 'stop', 'bi-stop-circle', 'Stop', { disabled: locked }));
     parts.push(actionButton(name, 'restart', 'bi-arrow-clockwise', 'Restart', { disabled: locked }));
@@ -259,14 +259,14 @@ function rowActions(session) {
 }
 
 /**
- * Status cell. A session the server is still preparing (v0.2.2 `preparing`) shows what it is
+ * Status cell. A container the server is still preparing (v0.2.2 `preparing`) shows what it is
  * waiting for instead of a bare "absent" — that state is transient and self-healing, so it
- * must not read like a broken session.
+ * must not read like a broken container.
  */
-function statusCell(session) {
-  const prep = session.preparing;
+function statusCell(container) {
+  const prep = container.preparing;
   if (!prep) {
-    return `<span class="badge ${statusBadgeClass(session.status)}">${escapeHtml(session.status)}</span>`;
+    return `<span class="badge ${statusBadgeClass(container.status)}">${escapeHtml(container.status)}</span>`;
   }
   const detail = prep.detail || 'preparing the host';
   return (
@@ -277,19 +277,19 @@ function statusCell(session) {
   );
 }
 
-function pills(session) {
+function pills(container) {
   const out = [];
-  if (session.needsRecreate) {
+  if (container.needsRecreate) {
     out.push('<span class="badge text-bg-warning ms-1" title="the stored config no longer matches the running container">config changed</span>');
   }
-  if (session.orphan) {
+  if (container.orphan) {
     out.push('<span class="badge text-bg-info ms-1" title="container carries porterclaude labels but has no stored config">orphan</span>');
   }
-  if (session.hostMissing) {
+  if (container.hostMissing) {
     out.push(
       '<span class="badge text-bg-danger ms-1" title="' +
       escapeHtml(
-        `the host of this session was deleted - it is read-only until a host with id '${session.hostId || ''}' exists again`,
+        `the host of this container was deleted - it is read-only until a host with id '${container.hostId || ''}' exists again`,
       ) +
       '">host gone</span>',
     );
@@ -304,19 +304,19 @@ function multiHost() {
 
 /**
  * The Host cell of a row: the host name (with the id underneath) plus the "host gone" badge
- * of a session whose host was force-deleted. Hidden while a single host exists.
- * @param {any} session SessionView
+ * of a container whose host was force-deleted. Hidden while a single host exists.
+ * @param {any} container ContainerView
  * @returns {string} table-cell HTML (everything escaped)
  */
-export function hostCell(session) {
-  const id = (session && session.hostId) || '';
+export function hostCell(container) {
+  const id = (container && container.hostId) || '';
   const known = getHost(id);
-  const name = (session && session.hostName) || (known ? hostLabel(id) : '') || id || '-';
-  const missing = !!(session && session.hostMissing);
+  const name = (container && container.hostName) || (known ? hostLabel(id) : '') || id || '-';
+  const missing = !!(container && container.hostMissing);
   const badge = missing
     ? '<span class="badge text-bg-danger" title="' +
       escapeHtml(
-        `the host of this session was deleted - it is read-only until a host with id '${id}' exists again`,
+        `the host of this container was deleted - it is read-only until a host with id '${id}' exists again`,
       ) +
       '">host gone</span>'
     : '';
@@ -329,18 +329,18 @@ export function hostCell(session) {
 }
 
 /**
- * The agent chips shown under the session name: one per `resolvedAgents` entry (labelled
+ * The agent chips shown under the container name: one per `resolvedAgents` entry (labelled
  * through agentLabel(), the raw id in the tooltip). `agents === null` is the host default,
  * an explicit list is pinned.
- * @param {any} session SessionView
+ * @param {any} container ContainerView
  * @returns {string}
  */
-export function agentChips(session) {
-  const resolved = Array.isArray(session && session.resolvedAgents) ? session.resolvedAgents : [];
+export function agentChips(container) {
+  const resolved = Array.isArray(container && container.resolvedAgents) ? container.resolvedAgents : [];
   if (!resolved.length) {
     return '<div class="small text-secondary">no agents</div>';
   }
-  const pinned = !!(session && Array.isArray(session.agents));
+  const pinned = !!(container && Array.isArray(container.agents));
   const chips = resolved
     .map(
       (id) =>
@@ -351,23 +351,23 @@ export function agentChips(session) {
 }
 
 /**
- * The rows the table shows: `sessions` filtered by `hostFilter` ('' = all).
+ * The rows the table shows: `containers` filtered by `hostFilter` ('' = all).
  * The bus payload is NEVER filtered - see the contract at the top of this file.
  * @returns {any[]}
  */
-export function visibleSessions() {
-  if (!hostFilter) return sessions;
-  return sessions.filter((s) => s && s.hostId === hostFilter);
+export function visibleContainers() {
+  if (!hostFilter) return containers;
+  return containers.filter((s) => s && s.hostId === hostFilter);
 }
 
 /**
- * Fill #sessions-host-filter. The select is hidden while at most ONE host exists - a
+ * Fill #containers-host-filter. The select is hidden while at most ONE host exists - a
  * single-host install must look exactly like v0.1. A remembered host that disappeared falls
  * back to "all hosts".
  */
 export function renderHostFilter() {
-  const select = byId('sessions-host-filter');
-  const th = byId('sessions-th-host');
+  const select = byId('containers-host-filter');
+  const th = byId('containers-th-host');
   const multi = multiHost();
   if (th) th.classList.toggle('d-none', !multi);
   if (!select) return;
@@ -375,14 +375,14 @@ export function renderHostFilter() {
   if (!multi) {
     if (hostFilter) {
       hostFilter = '';
-      storage.set(LS_SESSIONS_HOST, '');
+      storage.set(LS_CONTAINERS_HOST, '');
     }
     select.innerHTML = '';
     return;
   }
   if (hostFilter && !getHost(hostFilter)) {
     hostFilter = '';
-    storage.set(LS_SESSIONS_HOST, '');
+    storage.set(LS_CONTAINERS_HOST, '');
   }
   select.innerHTML = hostOptionsHtml(hostFilter, { includeAll: true, allLabel: 'All hosts' });
   select.value = hostFilter;
@@ -393,7 +393,7 @@ export function renderHostFilter() {
  * of the error toast a v0.1 build would have produced).
  */
 function renderNoHostNotice() {
-  const alertBox = byId('sessions-alert');
+  const alertBox = byId('containers-alert');
   if (!alertBox || getHosts().length) return;
   renderAlert(
     alertBox,
@@ -402,21 +402,21 @@ function renderNoHostNotice() {
   );
 }
 
-/** Render one <tr> per session into #sessions-tbody. */
+/** Render one <tr> per container into #containers-tbody. */
 function render() {
   renderNoHostNotice();
-  const tbody = byId('sessions-tbody');
-  const empty = byId('sessions-empty');
+  const tbody = byId('containers-tbody');
+  const empty = byId('containers-empty');
   if (!tbody) return;
-  const rows = visibleSessions();
+  const rows = visibleContainers();
   if (!rows.length) {
     tbody.innerHTML = '';
     if (empty) {
       empty.classList.remove('d-none');
       // the filter hiding everything is a different situation from "nothing exists yet"
-      empty.textContent = sessions.length
-        ? `No sessions on ${hostLabel(hostFilter)}.`
-        : 'No sessions yet.';
+      empty.textContent = containers.length
+        ? `No containers on ${hostLabel(hostFilter)}.`
+        : 'No containers yet.';
     }
     return;
   }
@@ -455,24 +455,24 @@ function render() {
 // ---------------------------------------------------------------------------
 
 function publish() {
-  bus.emit(EVENTS.SESSIONS_CHANGED, { sessions });
+  bus.emit(EVENTS.CONTAINERS_CHANGED, { containers });
 }
 
-/** Load GET /api/sessions, store, render, emit SESSIONS_CHANGED. */
+/** Load GET /api/containers, store, render, emit CONTAINERS_CHANGED. */
 export async function reload() {
-  const alertBox = byId('sessions-alert');
+  const alertBox = byId('containers-alert');
   try {
-    const res = await api.sessions.list();
-    sessions = Array.isArray(res && res.sessions) ? res.sessions : [];
+    const res = await api.containers.list();
+    containers = Array.isArray(res && res.containers) ? res.containers : [];
     pollFailures = 0;
     renderAlert(alertBox, '');
     render();
     publish();
-    return sessions;
+    return containers;
   } catch (err) {
     pollFailures += 1;
     if (err && err.code === 'backend_not_configured') {
-      sessions = [];
+      containers = [];
       render();
       publish();
       renderAlert(
@@ -480,10 +480,10 @@ export async function reload() {
         'No Docker host is configured yet. <a href="#/settings" class="alert-link">Open Settings and add a host</a> - the local socket, or imported Portainer endpoints.',
         'warning',
       );
-      return sessions;
+      return containers;
     }
-    if (err && err.status === 401) return sessions;
-    renderAlert(alertBox, `Could not list sessions: ${escapeHtml((err && err.message) || 'unknown error')}`, 'danger');
+    if (err && err.status === 401) return containers;
+    renderAlert(alertBox, `Could not list containers: ${escapeHtml((err && err.message) || 'unknown error')}`, 'danger');
     throw err;
   }
 }
@@ -536,7 +536,7 @@ async function loadRecipes(hostId) {
 }
 
 /**
- * Every lookup the session dialog needs, for ONE host: recipes, image refs, networks and
+ * Every lookup the container dialog needs, for ONE host: recipes, image refs, networks and
  * the host's agents. Re-run whenever #sf-host changes.
  * @param {string} hostId
  */
@@ -617,14 +617,14 @@ function mountRow(mount = {}) {
 }
 
 /**
- * The host row of the session form: a picker on create, disabled (plus a hidden input that
+ * The host row of the container form: a picker on create, disabled (plus a hidden input that
  * keeps the value) with the immutability note on edit.
- * @param {any|null} session
+ * @param {any|null} container
  * @returns {string}
  */
-function hostFieldHtml(session) {
-  const isEdit = !!session;
-  const selected = isEdit ? String(session.hostId || '') : formHostId;
+function hostFieldHtml(container) {
+  const isEdit = !!container;
+  const selected = isEdit ? String(container.hostId || '') : formHostId;
   let options = hostOptionsHtml(selected);
   if (!options) options = '<option value="">no host yet - add one under Settings &rarr; Hosts</option>';
   if (selected && !getHost(selected)) {
@@ -633,8 +633,8 @@ function hostFieldHtml(session) {
       `<option value="${escapeHtml(selected)}" selected>${escapeHtml(selected)} (deleted)</option>` + options;
   }
   const note = isEdit
-    ? 'the host of a session is immutable - create a new session to move it'
-    : 'the engine this session runs on - it cannot be changed later';
+    ? 'the host of a container is immutable - create a new container to move it'
+    : 'the engine this container runs on - it cannot be changed later';
   return (
     '<div class="col-md-6" id="sf-host-fields">' +
     '<label class="form-label" for="sf-host">Host</label>' +
@@ -648,11 +648,11 @@ function hostFieldHtml(session) {
 /**
  * The agent picker: "use the agents enabled on this host" (which is what `agents === null`
  * means) or an explicit list. An empty explicit list is legal - it gives a plain shell.
- * @param {any|null} session
+ * @param {any|null} container
  * @returns {string}
  */
-function agentsFieldHtml(session) {
-  const pinnedList = Array.isArray(session && session.agents) ? session.agents : null;
+function agentsFieldHtml(container) {
+  const pinnedList = Array.isArray(container && container.agents) ? container.agents : null;
   const inherit = !pinnedList;
   const pinned = new Set(pinnedList || []);
   const enabled = formAgents.filter((a) => a && a.enabled);
@@ -662,7 +662,7 @@ function agentsFieldHtml(session) {
   } else if (!enabled.length) {
     body =
       '<div class="col-12 small text-secondary">No agent is enabled on this host - enable one under ' +
-      'Settings &rarr; Agents, install it on the host, then recreate this session.</div>';
+      'Settings &rarr; Agents, install it on the host, then recreate this container.</div>';
   } else {
     body = enabled
       .map((agent) => {
@@ -692,16 +692,16 @@ function agentsFieldHtml(session) {
   );
 }
 
-function sessionFormHtml(session) {
-  const isEdit = !!session;
-  const s = session || {};
+function containerFormHtml(container) {
+  const isEdit = !!container;
+  const s = container || {};
   const image = s.image || { type: 'recipe', recipe: (recipes[0] && recipes[0].name) || 'node' };
   const ws = s.workspace || { type: 'volume' };
   const limits = s.limits || {};
   const recipeOptions = (recipes.length ? recipes : FALLBACK_RECIPES.map((n) => ({ name: n, title: n })))
     .map((r) => {
       const selected = image.type === 'recipe' && image.recipe === r.name ? ' selected' : '';
-      // v0.2.2: not-built is no longer a blocker — creating the session builds it.
+      // v0.2.2: not-built is no longer a blocker — creating the container builds it.
       const built = r.built === false ? ' (builds on first use)' : '';
       return `<option value="${escapeHtml(r.name)}"${selected}>${escapeHtml(r.title || r.name)}${built}</option>`;
     })
@@ -720,7 +720,7 @@ function sessionFormHtml(session) {
     `<div class="col-md-7"><label class="form-label" for="sf-display">Display name</label>
        <input class="form-control" id="sf-display" value="${escapeHtml(s.displayName || '')}" placeholder="optional"></div>` +
 
-    hostFieldHtml(session) +
+    hostFieldHtml(container) +
 
     '<div class="col-12"><hr class="my-1"></div>' +
     '<div class="col-12"><label class="form-label d-block">Image</label>' +
@@ -782,11 +782,11 @@ function sessionFormHtml(session) {
        <datalist id="sf-network-list">${networkList}</datalist></div>` +
     `<div class="col-md-3"><label class="form-label" for="sf-user">User</label>
        <input class="form-control" id="sf-user" value="${escapeHtml(s.user || '')}" placeholder="image default"></div>` +
-    agentsFieldHtml(session) +
+    agentsFieldHtml(container) +
     '<div class="col-12 d-flex gap-4">' +
     '<div class="form-check"><input class="form-check-input" type="checkbox" id="sf-share-history"' +
     `${s.shareHistory === false ? '' : ' checked'}>` +
-    '<label class="form-check-label" for="sf-share-history">Share agent conversation history with the other sessions on this host</label></div>' +
+    '<label class="form-check-label" for="sf-share-history">Share agent conversation history with the other containers on this host</label></div>' +
     '<div class="form-check"><input class="form-check-input" type="checkbox" id="sf-autostart"' +
     `${s.autoStart === false ? '' : ' checked'}>` +
     '<label class="form-check-label" for="sf-autostart">Start automatically</label></div>' +
@@ -799,17 +799,17 @@ function sessionFormHtml(session) {
 }
 
 function setFormError(message) {
-  const el = byId('session-form-error');
+  const el = byId('container-form-error');
   if (el) el.textContent = message || '';
 }
 
 function clearFieldErrors() {
-  const body = byId('session-form-body');
+  const body = byId('container-form-body');
   if (!body) return;
   body.querySelectorAll('.is-invalid').forEach((el) => el.classList.remove('is-invalid'));
 }
 
-/** zod issue path -> input id in the session form. */
+/** zod issue path -> input id in the container form. */
 const FIELD_IDS = {
   name: 'sf-name',
   displayName: 'sf-display',
@@ -839,8 +839,8 @@ function applyValidationError(err) {
   setFormError(mapped ? detail : `${err.message}${detail ? ` (${detail})` : ''}`);
 }
 
-/** Serialise #session-form into a SessionInput object; throws on client-side validation. */
-export function readSessionForm() {
+/** Serialise #container-form into a ContainerInput object; throws on client-side validation. */
+export function readContainerForm() {
   const value = (id) => {
     const el = byId(id);
     return el ? String(el.value || '').trim() : '';
@@ -941,7 +941,7 @@ export function readSessionForm() {
     if (hostId) input.hostId = hostId;
   }
   // `agents: null` = every agent enabled on the host; an explicit (possibly empty) array
-  // pins the session to those ids.
+  // pins the container to those ids.
   if (checked('sf-agents-inherit')) {
     input.agents = null;
   } else {
@@ -988,8 +988,8 @@ async function validateCustomImage() {
   }
 }
 
-function wireSessionForm() {
-  const body = byId('session-form-body');
+function wireContainerForm() {
+  const body = byId('container-form-body');
   if (!body) return;
 
   const toggle = (id, on) => {
@@ -1062,9 +1062,9 @@ function syncAgentsPicker() {
 /**
  * Repaint the host-scoped pickers of the open dialog from the freshly loaded lookups,
  * keeping whatever the user already typed.
- * @param {any|null} session the session the dialog was opened for
+ * @param {any|null} container the container the dialog was opened for
  */
-function repaintLookups(session) {
+function repaintLookups(container) {
   const recipeSelect = byId('sf-recipe');
   if (recipeSelect && recipes.length) {
     const current = recipeSelect.value;
@@ -1087,7 +1087,7 @@ function repaintLookups(session) {
   // the agent picker belongs to the host, so it is rebuilt from scratch - the inherit flag
   // the user set is preserved
   const inherit = byId('sf-agents-inherit');
-  const wasInherit = inherit ? !!inherit.checked : !session || !Array.isArray(session.agents);
+  const wasInherit = inherit ? !!inherit.checked : !container || !Array.isArray(container.agents);
   const checkedIds = new Set();
   document.querySelectorAll('#sf-agents [data-agent]').forEach((el) => {
     if (el.checked) checkedIds.add(el.getAttribute('data-agent'));
@@ -1115,43 +1115,43 @@ function repaintLookups(session) {
           })
           .join('')
       : '<div class="col-12 small text-secondary">No agent is enabled on this host - enable one under ' +
-        'Settings &rarr; Agents, install it on the host, then recreate this session.</div>';
+        'Settings &rarr; Agents, install it on the host, then recreate this container.</div>';
   }
   syncAgentsPicker();
 }
 
 /**
- * Build/populate #session-form-body and show the modal.
- * @param {any|null} session existing SessionView for edit, null for create
+ * Build/populate #container-form-body and show the modal.
+ * @param {any|null} container existing ContainerView for edit, null for create
  */
-export function openSessionModal(session = null) {
-  editing = session;
+export function openContainerModal(container = null) {
+  editing = container;
   // every lookup the dialog makes is scoped to THIS host
-  formHostId = session ? String(session.hostId || '') : resolveHostId(hostFilter || null);
-  const body = byId('session-form-body');
-  const title = byId('session-modal-title');
-  const modalEl = byId('session-modal');
+  formHostId = container ? String(container.hostId || '') : resolveHostId(hostFilter || null);
+  const body = byId('container-form-body');
+  const title = byId('container-modal-title');
+  const modalEl = byId('container-modal');
   if (!body || !modalEl || typeof bootstrap === 'undefined') return;
-  if (title) title.textContent = session ? `Edit session ${session.name}` : 'New session';
+  if (title) title.textContent = container ? `Edit container ${container.name}` : 'New container';
   setFormError('');
-  body.innerHTML = sessionFormHtml(session);
-  wireSessionForm();
+  body.innerHTML = containerFormHtml(container);
+  wireContainerForm();
   bootstrap.Modal.getOrCreateInstance(modalEl).show();
   void loadLookups(formHostId).then(() => {
     // refresh the pickers once the lookups arrive, keeping what the user typed
-    if (editing !== session) return;
-    repaintLookups(session);
+    if (editing !== container) return;
+    repaintLookups(container);
   });
 }
 
-async function saveSession(event) {
+async function saveContainer(event) {
   if (event) event.preventDefault();
-  const button = byId('btn-session-save');
+  const button = byId('btn-container-save');
   setFormError('');
   clearFieldErrors();
   let input;
   try {
-    input = readSessionForm();
+    input = readContainerForm();
   } catch (err) {
     setFormError((err && err.message) || 'Invalid form');
     return;
@@ -1168,18 +1168,18 @@ async function saveSession(event) {
   if (button) button.disabled = true;
   try {
     const saved = editing
-      ? await api.sessions.update(editing.name, input)
-      : await api.sessions.create(input);
-    const modalEl = byId('session-modal');
+      ? await api.containers.update(editing.name, input)
+      : await api.containers.create(input);
+    const modalEl = byId('container-modal');
     if (modalEl && typeof bootstrap !== 'undefined') bootstrap.Modal.getOrCreateInstance(modalEl).hide();
-    // v0.2.2: the server no longer refuses a session whose host is not ready yet — it
+    // v0.2.2: the server no longer refuses a container whose host is not ready yet — it
     // stores the definition and does the missing work (image build, tools sync). Say so
-    // rather than claiming the session is up.
-    const prep = saved && saved.session && saved.session.preparing;
+    // rather than claiming the container is up.
+    const prep = saved && saved.container && saved.container.preparing;
     toast(
       prep
-        ? `Session ${input.name} saved — ${prep.detail}. It starts by itself when that is done.`
-        : `Session ${input.name} ${editing ? 'updated' : 'created'}`,
+        ? `Container ${input.name} saved — ${prep.detail}. It starts by itself when that is done.`
+        : `Container ${input.name} ${editing ? 'updated' : 'created'}`,
       { variant: prep ? 'info' : 'success', delay: prep ? 8000 : undefined },
     );
     editing = null;
@@ -1202,7 +1202,7 @@ async function loadLogs() {
   if (!bodyEl || !logsState.name) return;
   const tail = tailEl ? Number(tailEl.value) || 200 : 200;
   try {
-    const res = await api.sessions.logs(logsState.name, { tail });
+    const res = await api.containers.logs(logsState.name, { tail });
     bodyEl.textContent = (res && res.logs) || '(no output)';
     bodyEl.scrollTop = bodyEl.scrollHeight;
   } catch (err) {
@@ -1210,7 +1210,7 @@ async function loadLogs() {
   }
 }
 
-/** Open #logs-modal for a session. */
+/** Open #logs-modal for a container. */
 export function openLogs(name) {
   const modalEl = byId('logs-modal');
   if (!modalEl || typeof bootstrap === 'undefined') return;
@@ -1238,12 +1238,12 @@ async function withBusy(name, fn) {
   }
 }
 
-async function destroySession(session) {
-  const name = session.name;
+async function destroyContainer(container) {
+  const name = container.name;
   const first = await confirmDialog({
     title: `Destroy ${name}?`,
     body:
-      `This removes the container <code>${escapeHtml(session.containerName || `pc-${name}`)}</code> and the stored definition.` +
+      `This removes the container <code>${escapeHtml(container.containerName || `pc-${name}`)}</code> and the stored definition.` +
       '<div class="form-check mt-3"><input class="form-check-input" type="checkbox" id="confirm-remove-volumes">' +
       '<label class="form-check-label" for="confirm-remove-volumes">also delete the workspace and history volumes</label></div>',
     confirmLabel: 'Destroy',
@@ -1253,38 +1253,38 @@ async function destroySession(session) {
   if (removeVolumes) {
     const second = await confirmDialog({
       title: 'Delete the volumes too?',
-      body: `<strong>${escapeHtml(workspaceVolumeName(session))}</strong> and its per-agent history volumes will be deleted permanently. The shared agent login volumes of the host are never touched.`,
+      body: `<strong>${escapeHtml(workspaceVolumeName(container))}</strong> and its per-agent history volumes will be deleted permanently. The shared agent login volumes of the host are never touched.`,
       confirmLabel: 'Delete everything',
     });
     if (!second) return;
   }
   await withBusy(name, async () => {
     try {
-      await api.sessions.remove(name, { removeVolumes });
-      toast(`Session ${name} destroyed`, { variant: 'success' });
+      await api.containers.remove(name, { removeVolumes });
+      toast(`Container ${name} destroyed`, { variant: 'success' });
       await reload();
     } catch (err) {
-      toastError(err, 'Could not destroy the session');
+      toastError(err, 'Could not destroy the container');
     }
   });
 }
 
 async function runAction(action, name) {
-  const session = sessions.find((s) => s.name === name);
-  if (!session) return;
+  const container = containers.find((s) => s.name === name);
+  if (!container) return;
   switch (action) {
-    case 'terminal':
-      bus.emit(EVENTS.OPEN_TERMINAL, { session: name, shell: 'bash' });
+    case 'session':
+      bus.emit(EVENTS.OPEN_SESSION, { container: name, shell: 'bash' });
       if (appCtx && appCtx.navigate) appCtx.navigate('code');
       return;
     case 'edit':
-      openSessionModal(session);
+      openContainerModal(container);
       return;
     case 'logs':
       openLogs(name);
       return;
     case 'destroy':
-      await destroySession(session);
+      await destroyContainer(container);
       return;
     case 'recreate': {
       const ok = await confirmDialog({
@@ -1301,10 +1301,10 @@ async function runAction(action, name) {
   }
   await withBusy(name, async () => {
     try {
-      if (action === 'start') await api.sessions.start(name);
-      else if (action === 'stop') await api.sessions.stop(name);
-      else if (action === 'restart') await api.sessions.restart(name);
-      else if (action === 'recreate') await api.sessions.recreate(name);
+      if (action === 'start') await api.containers.start(name);
+      else if (action === 'stop') await api.containers.stop(name);
+      else if (action === 'restart') await api.containers.restart(name);
+      else if (action === 'recreate') await api.containers.recreate(name);
       await reload();
     } catch (err) {
       toastError(err, `Could not ${action} ${name}`);
@@ -1316,7 +1316,7 @@ async function reconcile() {
   const btn = byId('btn-reconcile');
   if (btn) btn.disabled = true;
   try {
-    const res = await api.sessions.reconcile();
+    const res = await api.containers.reconcile();
     const report = (res && res.report) || {};
     const adopted = (report.adopted || []).length;
     toast(
@@ -1338,13 +1338,13 @@ async function reconcile() {
 // ---------------------------------------------------------------------------
 
 /** @type {import('./app.js').ViewModule} */
-const sessionsView = {
+const containersView = {
   async init(ctx) {
     if (initialised) return;
     initialised = true;
     appCtx = ctx;
 
-    const tbody = byId('sessions-tbody');
+    const tbody = byId('containers-tbody');
     if (tbody) {
       tbody.addEventListener('click', (e) => {
         const btn = e.target.closest('button[data-action]');
@@ -1353,19 +1353,19 @@ const sessionsView = {
       });
     }
 
-    const newBtn = byId('btn-session-new');
+    const newBtn = byId('btn-container-new');
     if (newBtn) {
       newBtn.addEventListener('click', () => {
-        openSessionModal(null);
+        openContainerModal(null);
       });
     }
-    const refreshBtn = byId('btn-sessions-refresh');
+    const refreshBtn = byId('btn-containers-refresh');
     if (refreshBtn) refreshBtn.addEventListener('click', () => { void reload().catch(() => {}); });
     const reconcileBtn = byId('btn-reconcile');
     if (reconcileBtn) reconcileBtn.addEventListener('click', () => { void reconcile(); });
 
-    const form = byId('session-form');
-    if (form) form.addEventListener('submit', (e) => { void saveSession(e); });
+    const form = byId('container-form');
+    if (form) form.addEventListener('submit', (e) => { void saveContainer(e); });
 
     const logsRefresh = byId('btn-logs-refresh');
     if (logsRefresh) logsRefresh.addEventListener('click', () => { void loadLogs(); });
@@ -1379,8 +1379,8 @@ const sessionsView = {
         logsState.timer = null;
       });
     }
-    const sessionModal = byId('session-modal');
-    if (sessionModal) sessionModal.addEventListener('hidden.bs.modal', () => { editing = null; });
+    const containerModal = byId('container-modal');
+    if (containerModal) containerModal.addEventListener('hidden.bs.modal', () => { editing = null; });
 
     bus.on(EVENTS.AUTH_LOST, () => {
       if (pollTimer) clearTimeout(pollTimer);
@@ -1391,12 +1391,12 @@ const sessionsView = {
       void reload().catch(() => {});
     });
 
-    const hostFilterEl = byId('sessions-host-filter');
+    const hostFilterEl = byId('containers-host-filter');
     if (hostFilterEl) {
       hostFilterEl.addEventListener('change', () => {
         // CLIENT-SIDE only: the bus payload stays unfiltered (F2's rail needs every host)
         hostFilter = hostFilterEl.value || '';
-        storage.set(LS_SESSIONS_HOST, hostFilter);
+        storage.set(LS_CONTAINERS_HOST, hostFilter);
         render();
       });
     }
@@ -1415,11 +1415,11 @@ const sessionsView = {
     void reload().catch(() => {});
   },
   hide() {
-    /* keep the poll alive: F2's rail depends on SESSIONS_CHANGED */
+    /* keep the poll alive: F2's rail depends on CONTAINERS_CHANGED */
   },
   refresh() {
     void reload().catch(() => {});
   },
 };
 
-export default sessionsView;
+export default containersView;

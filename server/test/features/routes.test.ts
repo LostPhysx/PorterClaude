@@ -1,22 +1,22 @@
-// OWNER: B2. The /api/sessions and /api/hosts/:hostId/images route tables (api.md v0.2),
+// OWNER: B2. The /api/containers and /api/hosts/:hostId/images route tables (api.md v0.2),
 // mounted on a bare express app with stubbed services so no B1 runtime code is required.
 // v0.2: images/jobs/tools are HOST SCOPED (the router runs with mergeParams and hands the
-// host id to every ImageService call); sessions stay flat because names are unique.
+// host id to every ImageService call); containers stay flat because names are unique.
 import { describe, expect, it, beforeEach } from 'vitest';
 import express from 'express';
 import request from 'supertest';
 import type { AppContext } from '../../src/context.js';
 import { AppError, toAppError } from '../../src/http/errors.js';
-import { createSessionsRouter } from '../../src/sessions/routes.js';
+import { createContainersRouter } from '../../src/containers/routes.js';
 import { createImagesRouter } from '../../src/images/routes.js';
-import type { SessionView } from '../../src/sessions/model.js';
+import type { ContainerView } from '../../src/containers/model.js';
 
 interface Recorded {
   method: string;
   args: unknown[];
 }
 
-const view = (name: string): SessionView => ({
+const view = (name: string): ContainerView => ({
   name,
   hostId: 'default',
   hostName: 'Local docker',
@@ -72,7 +72,7 @@ function makeApp() {
   };
 
   const ctx = {
-    sessions: {
+    containers: {
       list: async (opts: unknown) => rec('list', [opts], [view('web')]),
       get: async (name: string) => rec('get', [name], view(name)),
       create: async (input: unknown) => rec('create', [input], view('web')),
@@ -119,7 +119,7 @@ function makeApp() {
 
   const app = express();
   app.use(express.json());
-  app.use('/api/sessions', createSessionsRouter(ctx));
+  app.use('/api/containers', createContainersRouter(ctx));
   app.use('/api/hosts/:hostId/images', createImagesRouter(ctx));
   app.use('/api', (_req, res) => {
     res.status(404).json({ error: { code: 'not_found', message: 'no such route' } });
@@ -139,21 +139,21 @@ beforeEach(() => {
   calls = [];
 });
 
-describe('/api/sessions', () => {
-  it('GET / lists sessions', async () => {
-    const res = await request(makeApp()).get('/api/sessions').expect(200);
-    expect(res.body.sessions).toHaveLength(1);
+describe('/api/containers', () => {
+  it('GET / lists containers', async () => {
+    const res = await request(makeApp()).get('/api/containers').expect(200);
+    expect(res.body.containers).toHaveLength(1);
     expect(calls.find((c) => c.method === 'list')?.args[0]).toBeUndefined();
   });
 
   it('GET /?hostId= filters by host (v0.2)', async () => {
-    await request(makeApp()).get('/api/sessions?hostId=edge').expect(200);
+    await request(makeApp()).get('/api/containers?hostId=edge').expect(200);
     expect(calls.find((c) => c.method === 'list')?.args[0]).toEqual({ hostId: 'edge' });
   });
 
   it('POST / passes hostId and agents through (v0.2)', async () => {
     await request(makeApp())
-      .post('/api/sessions')
+      .post('/api/containers')
       .send({ ...body, hostId: 'edge', agents: ['claude', 'opencode'] })
       .expect(201);
     expect(calls.find((c) => c.method === 'create')?.args[0]).toMatchObject({
@@ -164,41 +164,41 @@ describe('/api/sessions', () => {
 
   it('POST / rejects a hostId that is not a slug', async () => {
     const res = await request(makeApp())
-      .post('/api/sessions')
+      .post('/api/containers')
       .send({ ...body, hostId: 'Not A Host' })
       .expect(422);
     expect(res.body.error.code).toBe('validation_error');
   });
 
-  it('POST / creates and answers 201 { session }', async () => {
-    const res = await request(makeApp()).post('/api/sessions').send(body).expect(201);
-    expect(res.body.session.name).toBe('web');
+  it('POST / creates and answers 201 { container }', async () => {
+    const res = await request(makeApp()).post('/api/containers').send(body).expect(201);
+    expect(res.body.container.name).toBe('web');
   });
 
   it('POST / rejects an invalid name with 422 validation_error', async () => {
     const res = await request(makeApp())
-      .post('/api/sessions')
-      .send({ ...body, name: 'QA Session' })
+      .post('/api/containers')
+      .send({ ...body, name: 'QA Container' })
       .expect(422);
     expect(res.body.error.code).toBe('validation_error');
     expect(Array.isArray(res.body.error.details)).toBe(true);
   });
 
   it('POST /reconcile is not shadowed by /:name and adopts (BE-10)', async () => {
-    const res = await request(makeApp()).post('/api/sessions/reconcile').expect(200);
+    const res = await request(makeApp()).post('/api/containers/reconcile').expect(200);
     expect(res.body.report).toEqual({ known: 1, running: 1, orphans: [], adopted: ['ghost'], missing: [] });
     expect(calls.map((c) => c.method)).toEqual(['reconcile']);
     expect(calls[0]?.args[0]).toEqual({ adopt: true });
   });
 
   it('POST /reconcile?hostId= reconciles one host (v0.2)', async () => {
-    await request(makeApp()).post('/api/sessions/reconcile?hostId=edge').expect(200);
+    await request(makeApp()).post('/api/containers/reconcile?hostId=edge').expect(200);
     expect(calls[0]?.args[0]).toEqual({ adopt: true, hostId: 'edge' });
   });
 
   it('POST / rejects an env key that no shell could ever read back (BE-11)', async () => {
     const res = await request(makeApp())
-      .post('/api/sessions')
+      .post('/api/containers')
       .send({ ...body, env: { 'A B': 'x' } })
       .expect(422);
     expect(res.body.error.code).toBe('validation_error');
@@ -206,7 +206,7 @@ describe('/api/sessions', () => {
 
   it('POST / rejects a workspace hostPath with .. segments (INT-03)', async () => {
     const res = await request(makeApp())
-      .post('/api/sessions')
+      .post('/api/containers')
       .send({ ...body, workspace: { type: 'bind', hostPath: '../../../etc' } })
       .expect(422);
     expect(res.body.error.code).toBe('validation_error');
@@ -215,41 +215,41 @@ describe('/api/sessions', () => {
 
   it('POST / accepts a relative workspace hostPath under workspacesRoot', async () => {
     await request(makeApp())
-      .post('/api/sessions')
+      .post('/api/containers')
       .send({ ...body, workspace: { type: 'bind', hostPath: 'proj' } })
       .expect(201);
   });
 
   it('GET /:name, PUT /:name and DELETE /:name', async () => {
     const app = makeApp();
-    await request(app).get('/api/sessions/web').expect(200);
-    await request(app).put('/api/sessions/web').send(body).expect(200);
-    await request(app).delete('/api/sessions/web?removeVolumes=1').expect(204);
+    await request(app).get('/api/containers/web').expect(200);
+    await request(app).put('/api/containers/web').send(body).expect(200);
+    await request(app).delete('/api/containers/web?removeVolumes=1').expect(204);
     expect(calls.find((c) => c.method === 'remove')?.args[1]).toEqual({ removeVolumes: true });
   });
 
   it('DELETE without removeVolumes keeps the volumes', async () => {
-    await request(makeApp()).delete('/api/sessions/web').expect(204);
+    await request(makeApp()).delete('/api/containers/web').expect(204);
     expect(calls.find((c) => c.method === 'remove')?.args[1]).toEqual({ removeVolumes: false });
   });
 
   it('lifecycle routes', async () => {
     const app = makeApp();
     for (const action of ['start', 'stop', 'restart', 'recreate']) {
-      const res = await request(app).post(`/api/sessions/web/${action}`).expect(200);
-      expect(res.body.session.name).toBe('web');
+      const res = await request(app).post(`/api/containers/web/${action}`).expect(200);
+      expect(res.body.container.name).toBe('web');
     }
     expect(calls.map((c) => c.method)).toEqual(['start', 'stop', 'restart', 'recreate']);
   });
 
   it('GET /:name/logs passes tail and timestamps through', async () => {
-    const res = await request(makeApp()).get('/api/sessions/web/logs?tail=50&timestamps=1').expect(200);
+    const res = await request(makeApp()).get('/api/containers/web/logs?tail=50&timestamps=1').expect(200);
     expect(res.body.logs).toBe('hello');
     expect(calls.find((c) => c.method === 'logs')?.args[1]).toEqual({ tail: 50, timestamps: true });
   });
 
   it('404s an unknown sub-route', async () => {
-    await request(makeApp()).get('/api/sessions/web/nope').expect(404);
+    await request(makeApp()).get('/api/containers/web/nope').expect(404);
   });
 });
 

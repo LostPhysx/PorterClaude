@@ -2,7 +2,7 @@
 //
 // These definitions are DATA, not code: they describe how the tools image installs an agent
 // into the shared tools volume (docker/tools, ORCHESTRATION topic) and which paths must be
-// shared between every session on a host (agents/model.ts explains the layout).
+// shared between every container on a host (agents/model.ts explains the layout).
 //
 // Rules
 //  * ids are stable and part of the API (`shell=agent:<id>`, volume `…-auth-<id>`), so they
@@ -35,7 +35,7 @@ export const BUILTIN_AGENTS: AgentDefinition[] = [
     ],
     historyPath: '~/.claude/projects',
     env: {},
-    loginHint: 'Open an agent terminal and run /login once per host.',
+    loginHint: 'Open an agent session and run /login once per host.',
     homepage: 'https://claude.com/claude-code',
   },
   {
@@ -72,7 +72,7 @@ export const BUILTIN_AGENTS: AgentDefinition[] = [
     ],
     historyPath: null,
     env: {},
-    loginHint: 'Run `gemini` and pick "Login with Google", or set GEMINI_API_KEY in the session env.',
+    loginHint: 'Run `gemini` and pick "Login with Google", or set GEMINI_API_KEY in the container env.',
     homepage: 'https://github.com/google-gemini/gemini-cli',
   },
   {
@@ -88,7 +88,7 @@ export const BUILTIN_AGENTS: AgentDefinition[] = [
     ],
     historyPath: '~/.codex/sessions',
     env: {},
-    loginHint: 'Run `codex` and sign in with ChatGPT, or set OPENAI_API_KEY in the session env.',
+    loginHint: 'Run `codex` and sign in with ChatGPT, or set OPENAI_API_KEY in the container env.',
     homepage: 'https://github.com/openai/codex',
   },
   {
@@ -106,7 +106,7 @@ export const BUILTIN_AGENTS: AgentDefinition[] = [
     ],
     historyPath: null,
     env: {},
-    loginHint: 'Aider uses API keys: put them into ~/.aider.conf.yml or the session env.',
+    loginHint: 'Aider uses API keys: put them into ~/.aider.conf.yml or the container env.',
     homepage: 'https://aider.chat',
   },
 ];

@@ -4,14 +4,18 @@ import { readFile, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { buildContext, makeDataDir, TEST_PASSWORD } from './helpers.js';
 import { SecretBox, verifyPassword } from '../../src/config/crypto.js';
-import type { SessionConfig } from '../../src/sessions/model.js';
+import type { ContainerConfig } from '../../src/containers/model.js';
 
 /** master secret used by the v1 fixtures below (the same value seeds APP_SECRET) */
 const FIXTURE_SECRET = 'a-fixture-master-secret-value';
 const FIXTURE_API_KEY = 'ptr_livesecretkey_a1b2';
 
-/** A v0.1 config.json, written straight to disk so init() has to migrate it. */
-function v1Config(backend: Record<string, unknown>, sessions: unknown[] = []): Record<string, unknown> {
+/**
+ * A v0.1 config.json, written straight to disk so init() has to migrate it.
+ * `sessions` is the v1 ON-DISK key (v3 renames it to `containers`) — it stays verbatim here,
+ * that is the whole point of the fixture.
+ */
+function v1Config(backend: Record<string, unknown>, containers: unknown[] = []): Record<string, unknown> {
   return {
     version: 1,
     auth: { passwordHash: null, tokenVersion: 3, updatedAt: null },
@@ -29,12 +33,12 @@ function v1Config(backend: Record<string, unknown>, sessions: unknown[] = []): R
       workspaceMount: '/workspace',
       toolsMount: '/opt/porterclaude',
     },
-    sessions,
+    sessions: containers,
     ui: { layout: { v: 1 }, theme: 'dark' },
   };
 }
 
-function v1Session(name: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
+function v1Container(name: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     name,
     image: { type: 'recipe', recipe: 'node' },
@@ -64,7 +68,7 @@ async function freshDir(): Promise<string> {
   return dir;
 }
 
-function sampleSession(name: string): SessionConfig {
+function sampleContainer(name: string): ContainerConfig {
   return {
     name,
     hostId: 'default',
@@ -90,7 +94,7 @@ describe('ConfigStore', () => {
     const { ctx } = await buildContext({ DATA_DIR: dir });
 
     const onDisk = JSON.parse(await readFile(path.join(dir, 'config.json'), 'utf8'));
-    expect(onDisk.version).toBe(2);
+    expect(onDisk.version).toBe(3);
     expect(onDisk.backend).toBeUndefined();
     expect(onDisk.hosts).toEqual([]);
     expect(onDisk.defaultHostId).toBeNull();
@@ -98,7 +102,8 @@ describe('ConfigStore', () => {
     expect(onDisk.agents).toEqual({ custom: [] });
     expect(onDisk.general.imageNamespace).toBe('porterclaude');
     expect(onDisk.general.volumePrefix).toBe('porterclaude-');
-    expect(onDisk.sessions).toEqual([]);
+    expect(onDisk.containers).toEqual([]);
+    expect(onDisk.sessions).toBeUndefined();
     expect(await verifyPassword(TEST_PASSWORD, onDisk.auth.passwordHash)).toBe(true);
     expect(ctx.config.get().auth.tokenVersion).toBe(1);
     await stat(path.join(dir, 'secret.key'));
@@ -192,7 +197,7 @@ describe('ConfigStore', () => {
             },
             socket: { socketPath: '/var/run/docker.sock' },
           },
-          [v1Session('alpha'), v1Session('beta', { shareHistory: false })],
+          [v1Container('alpha'), v1Container('beta', { shareHistory: false })],
         ),
         null,
         2,
@@ -203,7 +208,7 @@ describe('ConfigStore', () => {
     const { ctx } = await buildContext({ DATA_DIR: dir, APP_SECRET: FIXTURE_SECRET });
     const cfg = ctx.config.get();
 
-    expect(cfg.version).toBe(2);
+    expect(cfg.version).toBe(3);
     expect(cfg.defaultHostId).toBe('default');
     expect(cfg.hosts).toHaveLength(1);
     expect(cfg.hosts[0]!.connection).toEqual({
@@ -224,13 +229,14 @@ describe('ConfigStore', () => {
     expect(sanitized.apiKeyHint).toBe(FIXTURE_API_KEY.slice(-4));
     expect(sanitized.hostIds).toEqual(['default']);
 
-    // lossless: sessions keep everything and gain hostId/agents
-    expect(cfg.sessions.map((s) => s.name)).toEqual(['alpha', 'beta']);
-    expect(cfg.sessions.every((s) => s.hostId === 'default')).toBe(true);
-    expect(cfg.sessions.every((s) => s.agents === null)).toBe(true);
-    expect(cfg.sessions[1]!.shareHistory).toBe(false);
-    expect(cfg.sessions[0]!.env).toEqual({ FOO: 'bar' });
-    expect(cfg.sessions[0]!.createdAt).toBe('2026-01-01T00:00:00.000Z');
+    // lossless: containers keep everything and gain hostId/agents (and the v1 -> v2 -> v3
+    // chain has to run in ONE pass, or `containers` silently falls back to its [] default)
+    expect(cfg.containers.map((c) => c.name)).toEqual(['alpha', 'beta']);
+    expect(cfg.containers.every((c) => c.hostId === 'default')).toBe(true);
+    expect(cfg.containers.every((c) => c.agents === null)).toBe(true);
+    expect(cfg.containers[1]!.shareHistory).toBe(false);
+    expect(cfg.containers[0]!.env).toEqual({ FOO: 'bar' });
+    expect(cfg.containers[0]!.createdAt).toBe('2026-01-01T00:00:00.000Z');
     expect(cfg.general.defaultRecipe).toBe('python');
     expect(cfg.general.sharedClaudeVolume).toBe('porterclaude-claude');
     expect(cfg.auth.tokenVersion).toBe(3);
@@ -242,7 +248,9 @@ describe('ConfigStore', () => {
     expect(backup.backend.kind).toBe('portainer');
     const onDisk = JSON.parse(await readFile(path.join(dir, 'config.json'), 'utf8'));
     expect(onDisk.backend).toBeUndefined();
-    expect(onDisk.version).toBe(2);
+    expect(onDisk.version).toBe(3);
+    expect(onDisk.sessions).toBeUndefined();
+    expect(onDisk.containers.map((c: { name: string }) => c.name)).toEqual(['alpha', 'beta']);
   });
 
   it('migrates a v0.1 socket config and is idempotent on the next boots', async () => {
@@ -252,7 +260,7 @@ describe('ConfigStore', () => {
       JSON.stringify(
         v1Config(
           { kind: 'socket', portainer: {}, socket: { socketPath: '/run/user/1000/docker.sock' } },
-          [v1Session('alpha')],
+          [v1Container('alpha')],
         ),
       ),
       'utf8',
@@ -274,9 +282,9 @@ describe('ConfigStore', () => {
 
     const second = await buildContext({ DATA_DIR: dir });
     expect(second.ctx.config.get().hosts).toHaveLength(1);
-    expect(second.ctx.config.get().sessions[0]!.hostId).toBe('default');
+    expect(second.ctx.config.get().containers[0]!.hostId).toBe('default');
     const third = await buildContext({ DATA_DIR: dir });
-    expect(third.ctx.config.get().version).toBe(2);
+    expect(third.ctx.config.get().version).toBe(3);
     // the backup is written exactly once and never overwritten
     expect(await readFile(path.join(dir, 'config.json.v1.bak'), 'utf8')).toBe(backupBefore);
   });
@@ -293,6 +301,71 @@ describe('ConfigStore', () => {
     expect(ctx.config.get().defaultHostId).toBeNull();
     expect(ctx.hosts.isConfigured()).toBe(false);
     await stat(path.join(dir, 'config.json.v1.bak'));
+  });
+
+  // v0.3 (CONFIG_VERSION 3): `sessions[]` is renamed to `containers[]`. Once the schema has
+  // no `sessions` key any more, zod STRIPS it and `containers` falls back to its `[]`
+  // default - an unmigrated file would parse cleanly and answer "no containers" with no
+  // error anywhere, i.e. every stored definition silently gone.
+  it('migrates a v0.2 config: sessions[] becomes containers[] and config.json.v2.bak is kept', async () => {
+    const dir = await freshDir();
+    const v2 = {
+      version: 2,
+      instanceId: 'pc-0123456789ab',
+      auth: { passwordHash: null, tokenVersion: 4, updatedAt: null },
+      hosts: [
+        {
+          id: 'default',
+          name: 'Local docker',
+          connection: { type: 'socket', socketPath: '/var/run/docker.sock' },
+          overrides: {},
+          agents: { enabled: ['claude'] },
+          notes: null,
+          createdAt: '2026-01-01T00:00:00.000Z',
+          updatedAt: '2026-01-01T00:00:00.000Z',
+        },
+      ],
+      defaultHostId: 'default',
+      credentials: { portainer: [] },
+      agents: { custom: [] },
+      general: { defaultRecipe: 'go' },
+      sessions: [sampleContainer('alpha'), { ...sampleContainer('beta'), shareHistory: false }],
+      ui: { layout: { v: 2 }, theme: 'dark' },
+    };
+    await writeFile(path.join(dir, 'config.json'), JSON.stringify(v2, null, 2), 'utf8');
+
+    const { ctx } = await buildContext({ DATA_DIR: dir });
+    const cfg = ctx.config.get();
+
+    expect(cfg.version).toBe(3);
+    // the entries themselves survive the key rename untouched
+    expect(cfg.containers.map((c) => c.name)).toEqual(['alpha', 'beta']);
+    expect(cfg.containers[1]!.shareHistory).toBe(false);
+    expect(ctx.config.listContainers().map((c) => c.name)).toEqual(['alpha', 'beta']);
+    expect(ctx.config.getContainer('alpha')?.hostId).toBe('default');
+    // ...and nothing else moved
+    expect(cfg.instanceId).toBe('pc-0123456789ab');
+    expect(cfg.auth.tokenVersion).toBe(4);
+    expect(cfg.general.defaultRecipe).toBe('go');
+    expect(cfg.hosts).toHaveLength(1);
+
+    // the v2 file is kept for a rollback, and the new one no longer carries `sessions`
+    const backupRaw = await readFile(path.join(dir, 'config.json.v2.bak'), 'utf8');
+    const backup = JSON.parse(backupRaw);
+    expect(backup.version).toBe(2);
+    expect(backup.sessions.map((s: { name: string }) => s.name)).toEqual(['alpha', 'beta']);
+    const onDisk = JSON.parse(await readFile(path.join(dir, 'config.json'), 'utf8'));
+    expect(onDisk.version).toBe(3);
+    expect(onDisk.sessions).toBeUndefined();
+    expect(onDisk.containers.map((c: { name: string }) => c.name)).toEqual(['alpha', 'beta']);
+    // a v2 file was never a v1: no v1 backup is written on this path
+    await expect(stat(path.join(dir, 'config.json.v1.bak'))).rejects.toThrow();
+
+    // flag 'wx': the backup is written exactly once and never overwritten
+    const second = await buildContext({ DATA_DIR: dir });
+    expect(second.ctx.config.get().version).toBe(3);
+    expect(second.ctx.config.get().containers.map((c) => c.name)).toEqual(['alpha', 'beta']);
+    expect(await readFile(path.join(dir, 'config.json.v2.bak'), 'utf8')).toBe(backupRaw);
   });
 
   it('emits change and never leaves a partial file under concurrent writes', async () => {
@@ -351,11 +424,11 @@ describe('ConfigStore', () => {
   });
 
   // BE-11: the API rejects these values, but a hand-edited file must not cost the user
-  // every stored session - an invalid general value falls back to its default instead.
+  // every stored container - an invalid general value falls back to its default instead.
   it('falls back to the default for an invalid general value without quarantining the file', async () => {
     const dir = await freshDir();
     const { ctx: first } = await buildContext({ DATA_DIR: dir });
-    await first.config.putSession(sampleSession('alpha'));
+    await first.config.putContainer(sampleContainer('alpha'));
 
     const file = path.join(dir, 'config.json');
     const raw = JSON.parse(await readFile(file, 'utf8'));
@@ -366,28 +439,28 @@ describe('ConfigStore', () => {
     const { ctx } = await buildContext({ DATA_DIR: dir });
     expect(ctx.config.general().containerPrefix).toBe('pc-');
     expect(ctx.config.general().workspaceMount).toBe('/workspace');
-    expect(ctx.config.listSessions().map((s) => s.name)).toEqual(['alpha']);
+    expect(ctx.config.listContainers().map((c) => c.name)).toEqual(['alpha']);
     const files = await (await import('node:fs/promises')).readdir(dir);
     expect(files.some((f) => f.includes('corrupt'))).toBe(false);
   });
 
-  it('stores, reads and deletes sessions (the storage B2 calls)', async () => {
+  it('stores, reads and deletes containers (the storage B2 calls)', async () => {
     const dir = await freshDir();
     const { ctx } = await buildContext({ DATA_DIR: dir });
 
-    await ctx.config.putSession(sampleSession('alpha'));
-    await ctx.config.putSession(sampleSession('beta'));
-    expect(ctx.config.listSessions().map((s) => s.name)).toEqual(['alpha', 'beta']);
+    await ctx.config.putContainer(sampleContainer('alpha'));
+    await ctx.config.putContainer(sampleContainer('beta'));
+    expect(ctx.config.listContainers().map((c) => c.name)).toEqual(['alpha', 'beta']);
 
-    const updated = { ...sampleSession('alpha'), displayName: 'Alpha' };
-    await ctx.config.putSession(updated);
-    expect(ctx.config.listSessions()).toHaveLength(2);
-    expect(ctx.config.getSession('alpha')?.displayName).toBe('Alpha');
-    expect(ctx.config.getSession('nope')).toBeNull();
+    const updated = { ...sampleContainer('alpha'), displayName: 'Alpha' };
+    await ctx.config.putContainer(updated);
+    expect(ctx.config.listContainers()).toHaveLength(2);
+    expect(ctx.config.getContainer('alpha')?.displayName).toBe('Alpha');
+    expect(ctx.config.getContainer('nope')).toBeNull();
 
-    expect(await ctx.config.deleteSession('alpha')).toBe(true);
-    expect(await ctx.config.deleteSession('alpha')).toBe(false);
-    expect(ctx.config.listSessions().map((s) => s.name)).toEqual(['beta']);
+    expect(await ctx.config.deleteContainer('alpha')).toBe(true);
+    expect(await ctx.config.deleteContainer('alpha')).toBe(false);
+    expect(ctx.config.listContainers().map((c) => c.name)).toEqual(['beta']);
   });
 
   it('hands out frozen snapshots that cannot corrupt the store', async () => {

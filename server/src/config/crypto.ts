@@ -111,7 +111,7 @@ export class SecretBox {
     return typeof value === 'string' && value.startsWith(ENC_PREFIX);
   }
 
-  /** Key for signing session cookies: hkdf(masterSecret, "porterclaude:jwt:v1"). */
+  /** Key for signing login cookies: hkdf(masterSecret, "porterclaude:jwt:v1"). */
   jwtSecret(): string {
     if (!this.cachedJwt) {
       const derived = hkdfSync('sha256', Buffer.from(this.masterSecret, 'utf8'), Buffer.alloc(0), JWT_KEY_INFO, 32);

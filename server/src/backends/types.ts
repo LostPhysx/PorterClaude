@@ -1,5 +1,5 @@
 // FROZEN (planner-authored, types only). THE contract between B1 (implementations) and
-// B2 (consumers: sessions / terminals / images). Do not change any exported shape.
+// B2 (consumers: containers / sessions / images). Do not change any exported shape.
 import type { Readable } from 'node:stream';
 
 export type BackendKind = 'portainer' | 'socket';
@@ -54,8 +54,8 @@ export interface ContainerInspect {
   /**
    * The container's own `Config.Cmd`, i.e. exactly the argv it was CREATED with (never the
    * image default — the engine does not inherit the image Cmd once the create request sets
-   * an Entrypoint). Read back when recomputing a session spec hash, see
-   * sessions/container.ts `imageCmd`.
+   * an Entrypoint). Read back when recomputing a container spec hash, see
+   * containers/container.ts `imageCmd`.
    */
   cmd?: string[];
   raw: unknown;            // full docker inspect JSON, for anything not modelled here

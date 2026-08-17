@@ -43,7 +43,7 @@
 }
 
 .pc-code-toolbar { flex: 0 0 auto; }
-.pc-code-toolbar #code-session-select { max-width: 16rem; }
+.pc-code-toolbar #code-container-select { max-width: 16rem; }
 
 /* GoldenLayout mount point: must be positioned and sized, never auto-height. */
 .pc-code-root {
@@ -149,7 +149,7 @@
 
 /* ------------------------------------------------- v0.2: hosts in the rail */
 /* Seeded by the planner so F2 has the class names; extend, do not rename.
-   The rail groups sessions by host; with a single host no group header is rendered. */
+   The rail groups containers by host; with a single host no group header is rendered. */
 .pc-rail-group + .pc-rail-group { margin-top: .25rem; }
 .pc-rail-group-head {
   display: flex;
@@ -174,7 +174,7 @@
   flex: 0 0 auto;
   font-variant-numeric: tabular-nums;
 }
-/* "host gone": the group of the sessions of a host that was deleted with force=1 */
+/* "host gone": the group of the containers of a host that was deleted with force=1 */
 .pc-rail-group-head .pc-rail-group-gone {
   flex: 0 0 auto;
   padding: 0 .3rem;
@@ -186,7 +186,7 @@
 }
 .pc-rail-group.is-missing .pc-rail-group-head { background: var(--bs-danger-bg-subtle); }
 .pc-rail-item.is-missing { opacity: .75; cursor: default; }
-/* a session whose host is gone can only be destroyed - its quick actions are inert */
+/* a container whose host is gone can only be destroyed - its quick actions are inert */
 .pc-rail-item.is-missing .pc-rail-actions .btn:disabled {
   opacity: .35;
   pointer-events: none;
@@ -195,10 +195,10 @@
 .pc-code-toolbar #code-host-filter { max-width: 12rem; }
 #new-agent-menu { --bs-dropdown-font-size: .85rem; }
 #new-agent-menu .dropdown-item i { width: 1rem; }
-/* the menu is built from the selected session, so it can be empty: the note below explains
+/* the menu is built from the selected container, so it can be empty: the note below explains
    the enable -> sync -> recreate chain instead of showing nothing at all */
 #new-agent-menu .dropdown-item.disabled { font-style: italic; white-space: normal; }
 #new-agent-menu .dropdown-item { display: flex; align-items: center; }
 #new-agent-menu .dropdown-divider { margin: .25rem 0; }
-/* #btn-new-agent is disabled while no session is selected - keep it visibly inert */
+/* #btn-new-agent is disabled while no container is selected - keep it visibly inert */
 #btn-new-agent:disabled { opacity: .5; }

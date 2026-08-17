@@ -2,17 +2,17 @@
 
 PorterClaude is one container. It needs:
 
-- a **persistent** `/data` volume (config, encrypted secrets, session definitions)
+- a **persistent** `/data` volume (config, encrypted secrets, container definitions)
 - a way to reach Docker: at least one **host** — the local socket (mount
   `/var/run/docker.sock`) or a **Portainer** credential + endpoint, added in Settings
-- an HTTPS reverse proxy in front of it that passes WebSockets (terminals)
+- an HTTPS reverse proxy in front of it that passes WebSockets (sessions)
 
-Everything else — hosts, coding agents, images, sessions — is configured in the app. The
+Everything else — hosts, coding agents, images, containers — is configured in the app. The
 agent-facing half of the documentation (what an agent is, the built-ins, adding a custom one)
 is [AGENTS.md](AGENTS.md).
 
 > **`/data` is load-bearing.** It holds `secret.key`, which encrypts the stored Portainer
-> API keys and signs session cookies. Losing the volume logs everyone out and makes the
+> API keys and signs login cookies. Losing the volume logs everyone out and makes the
 > stored keys undecryptable — you then have to re-enter them in Settings. Set `APP_SECRET`
 > explicitly if you prefer to manage the key yourself.
 
@@ -35,27 +35,27 @@ step.
 |---|---|---|
 | Where the app runs | on the Docker host it manages | anywhere |
 | Setup | mount `/var/run/docker.sock` (+ `group_add`) | paste URL + API key, pick the endpoint |
-| Terminal stream | hijacked exec over the socket | `wss://<portainer>/api/websocket/exec` (API key OK) |
+| Session stream | hijacked exec over the socket | `wss://<portainer>/api/websocket/exec` (API key OK) |
 | Security note | app has root-equivalent access to that host | key scoped by Portainer RBAC |
 
 **Nothing is shared between hosts.** Images, recipe builds, the tools volume, the agent auth
-volumes (i.e. the logins), workspaces and sessions all belong to exactly one host. An agent
+volumes (i.e. the logins), workspaces and containers all belong to exactly one host. An agent
 login on host A says nothing about host B; a recipe built on A must be built again on B.
 
 Two caveats worth knowing before you add the second host:
 
 * A host that is unreachable degrades **only itself**: it is listed with
-  `status: unreachable`, its sessions show as absent, and every other host keeps working.
+  `status: unreachable`, its containers show as absent, and every other host keeps working.
 * Two hosts may point at the *same* engine (e.g. the local socket and a Portainer endpoint of
   the same machine). That is allowed, and they then share volumes and images by construction.
-  Two *separate PorterClaude installs* on one engine do not see each other's sessions: every
+  Two *separate PorterClaude installs* on one engine do not see each other's containers: every
   container carries a `porterclaude.instance=<id>` label (the id is generated once per install
-  and stored in `config.json`), and session listing/reconcile only adopts containers with this
+  and stored in `config.json`), and container listing/reconcile only adopts containers with this
   install's id or with no id (pre-0.2.1 containers). Volumes are still shared by name, so give
   one install a different `volumePrefix` / `containerPrefix` (Settings → Hosts → *(host)* →
   Overrides) if you want fully independent state.
 * Deleting a host **never touches the engine** — containers, volumes and images stay; only
-  PorterClaude forgets them. It refuses while sessions still reference the host unless you
+  PorterClaude forgets them. It refuses while containers still reference the host unless you
   force it.
 
 ### The docker socket and the non-root user
@@ -189,9 +189,9 @@ volumes:
 
 ### Reverse-proxy requirements
 
-* **WebSocket upgrade.** Terminals use `GET /api/terminals` with `Upgrade: websocket`; the
-  proxy must forward the `Upgrade` and `Connection` headers. nginx-proxy does this by
-  default; a hand-written vhost needs:
+* **WebSocket upgrade.** Sessions use `GET /api/sessions` with `Upgrade: websocket` (it was
+  `/api/terminals` before v0.3); the proxy must forward the `Upgrade` and `Connection`
+  headers. nginx-proxy does this by default; a hand-written vhost needs:
 
   ```nginx
   proxy_http_version 1.1;
@@ -199,7 +199,7 @@ volumes:
   proxy_set_header Connection "upgrade";
   ```
 
-* **Idle timeouts.** A terminal that sits idle longer than `proxy_read_timeout` (nginx
+* **Idle timeouts.** A session that sits idle longer than `proxy_read_timeout` (nginx
   default 60 s) is cut. Raise it for this vhost — with nginx-proxy, drop a file into
   `vhost.d/<host>`:
 
@@ -286,6 +286,33 @@ the stack at a registry image instead (`pullImage: true`).
 chores — nginx vhost snippets, proxy reload, leftover QA containers, dangling images — each
 behind its own flag and all of them previewable with `--dry-run`.
 
+## Upgrading to v0.3 (the rename)
+
+v0.3 renames one word that meant three things. What was called a *session* is now a
+**container** (the long-lived box), what was called a *terminal* is now a **session** (one
+connection to a shell inside a container), and the login is just the login. No feature
+changes; the upgrade is a pull and a restart. Four things an operator sees:
+
+1. **Everyone is logged out once.** The cookie `pc_session` became `pc_auth`, so every open
+   browser is asked for the password again after the upgrade. Nothing else about auth changed
+   — `SESSION_TTL_DAYS` keeps its name and its value.
+2. **`config.json` migrates itself.** `sessions[]` becomes `containers[]` and the version goes
+   2 → 3; `config.json.v2.bak` is written before the first v3 write. A v1 file still upgrades
+   in one boot (v1 → v2 → v3). **Back up `/data` first** — this rewrites the file that holds
+   every container definition.
+3. **Running containers are not touched.** They carry the old label `porterclaude.session`;
+   the server writes `porterclaude.container` from now on and **reads either**, so nothing is
+   orphaned. A container is relabelled on its next *recreate* — there is no need to force one.
+   The env var inside the container stays `PORTERCLAUDE_SESSION` on purpose: it is part of the
+   spec hash, so renaming it would flag every container as *needs recreate*.
+4. **Old browser tabs lose their panes.** The websocket moved from
+   `/api/terminals?session=&name=` to `/api/sessions?container=&session=`, and the REST
+   resource from `/api/sessions` to `/api/containers`. A tab still running the pre-upgrade
+   JavaScript talks to paths the new server does not serve — reload it. Make sure your proxy
+   does not cache `/` or `/js/**` for long across the upgrade, and that its WebSocket rule
+   matches `/api/sessions` if it was pinned to `/api/terminals` (see *Reverse-proxy
+   requirements*).
+
 ## Upgrading from v0.1 to v0.2
 
 v0.2 turns the single Docker backend into *hosts* and the hard-wired Claude Code into
@@ -297,18 +324,18 @@ downtime plus one tools sync per host.
 2. **The config migrates itself on first boot.** `config.json` v1 is copied to
    `config.json.v1.bak` before the first v2 write. The migration is lossless: the single
    backend becomes the host **`default`** (a Portainer backend additionally becomes the
-   credential `portainer-1`, re-using the already-encrypted key), every session gets
+   credential `portainer-1`, re-using the already-encrypted key), every container gets
    `hostId: "default"` and inherits the host's agents, and the general settings are carried
    over unchanged. If anything looks wrong, stop the container, restore the `.v1.bak` file
    and go back to the v0.1 image — nothing on the engine has been touched yet.
 3. **Settings → Agents → Sync tools, once per host.** This is the step that installs the
-   agents *and* the session bootstrap: every v0.2 container mounts the tools volume read-only
+   agents *and* the container bootstrap: every v0.2 container mounts the tools volume read-only
    and runs `/opt/porterclaude/entrypoint.sh` from it, so on a host whose tools volume has
-   never been synced a session cannot start at all — docker creates the empty volume, the
+   never been synced a container cannot start at all — docker creates the empty volume, the
    entrypoint is missing and the container restarts forever. PorterClaude therefore refuses to
-   create a session on such a host (`409`, "run the tools sync for this host first") instead
-   of handing you a crash-looping container; existing containers say so in their session
-   warnings, and a restart after the sync brings them up. The same sync performs the
+   create a container on such a host (`409`, "run the tools sync for this host first") instead
+   of handing you a crash-looping container; existing containers say so in their warnings,
+   and a restart after the sync brings them up. The same sync performs the
    **one-time login import**: the
    contents of the v0.1 `porterclaude-claude` and `porterclaude-claude-home` volumes are
    copied into `porterclaude-auth-claude` (marker file `.pc-import-v1`), so **nobody has to
@@ -318,15 +345,15 @@ downtime plus one tools sync per host.
    because the shared provisioning script changed. An un-rebuilt image still works — the
    tools volume shadows the stale `claude` binary on `PATH` — but it wastes ~100 MB and is
    confusing.
-5. **Recreate your sessions.** The agent auth volumes, the tools mount and the entrypoint are
+5. **Recreate your containers.** The agent auth volumes, the tools mount and the entrypoint are
    part of the container spec, so existing containers keep the v0.1 layout until they are
-   recreated. Sessions that need it say *needs recreate* in the Sessions tab. Workspace
+   recreated. Containers that need it say *needs recreate* in the Containers tab. Workspace
    volumes are untouched by a recreate.
 6. Optional: once everything is verified, remove the leftover v0.1 volumes
    `porterclaude-claude` and `porterclaude-claude-home` (and, if you never rolled back,
    `config.json.v1.bak`).
 
-After the upgrade, `which claude` inside a session resolves to `/opt/porterclaude/bin/claude`
+After the upgrade, `which claude` inside a container resolves to `/opt/porterclaude/bin/claude`
 (the tools volume), not to `/usr/local/bin/claude` (the old baked-in copy).
 
 ## Images, the tools volume and agents
@@ -337,7 +364,7 @@ After the upgrade, `which claude` inside a session resolves to `/opt/porterclaud
   from Settings → Images. They are language-toolchain images only — since v0.2 they contain
   **no coding agent**.
 * The **tools volume** (`porterclaude-tools`, one per host) carries the agents, their
-  runtimes and the session entrypoint. Every session mounts it read-only at
+  runtimes and the container entrypoint. Every container mounts it read-only at
   `/opt/porterclaude`, so this is the single place an agent is installed and upgraded.
 
 **What a tools sync needs**, on the *Docker host*, not on the machine running the browser:
@@ -351,7 +378,7 @@ After the upgrade, `which claude` inside a session resolves to `/opt/porterclaud
   carry-over compares the agent's definition, which does not change when a new CLI version
   ships. Settings → Agents → caret next to *Sync tools* → **Upgrade all
   agents** (API: `POST /api/hosts/:hostId/images/tools/sync {"force":true}`) reinstalls every
-  enabled agent and the bundled runtimes, and costs what a first sync costs. Sessions pick the
+  enabled agent and the bundled runtimes, and costs what a first sync costs. Containers pick the
   new version up when they are restarted.
 * **Disk**: ~100 MB for `claude` alone; ~60 MB more for the bundled Node (npm agents), ~90 MB
   for the managed CPython and ~250 MB for aider's dependencies — roughly 500 MB with
@@ -361,14 +388,14 @@ A single agent that fails to install is a **warning**, not a failed sync: it is 
 `/opt/porterclaude/AGENTS.json` as `installed: false` plus a one-line error, which is what the
 Agents and Images panels show. See [AGENTS.md](AGENTS.md) for the agent-side details.
 
-**Alpine (musl) session images** need two extra things, because the tools volume is built
+**Alpine (musl) container images** need two extra things, because the tools volume is built
 once per host and shared by every libc (measured, docs/design/requests/v2-O1.md 4):
 
-* agents installed from npm need the GCC runtime libraries in the *session* image —
+* agents installed from npm need the GCC runtime libraries in the *container* image —
   `RUN apk add --no-cache libstdc++ libgcc`. Without them the shim dies with a loader error
   (the dispatcher prints that exact hint);
 * agents installed from pip are **glibc-only** and refuse to start on musl with a clear
-  message. Give those sessions a Debian/Ubuntu-based image.
+  message. Give those containers a Debian/Ubuntu-based image.
 
 ### Disk: dangling images after a rebuild
 
@@ -400,20 +427,20 @@ host once, or removal by id in Portainer.
 
 One set per host — the names are identical on every engine, the contents are not.
 
-| Volume | Mounted in sessions at | Purpose | Back up? |
+| Volume | Mounted in containers at | Purpose | Back up? |
 |---|---|---|---|
-| `porterclaude-auth-<agentId>` | `/home/dev/.porterclaude/agents/<agentId>` | **the agent's login and settings**, shared by every session on that host | **yes** |
-| `porterclaude-tools` (ro) | `/opt/porterclaude` | the installed agents, their runtimes and the session entrypoint | no — a sync rebuilds it |
-| `porterclaude-ws-<session>` | `/workspace` | per-session workspace when no host path is given | yes, if you keep code in it |
-| `porterclaude-hist-<session>[-<agentId>]` | inside the agent volume (e.g. `…/claude/projects`) | conversation history of a session that opted out of shared history | optional |
+| `porterclaude-auth-<agentId>` | `/home/dev/.porterclaude/agents/<agentId>` | **the agent's login and settings**, shared by every container on that host | **yes** |
+| `porterclaude-tools` (ro) | `/opt/porterclaude` | the installed agents, their runtimes and the container entrypoint | no — a sync rebuilds it |
+| `porterclaude-ws-<container>` | `/workspace` | per-container workspace when no host path is given | yes, if you keep code in it |
+| `porterclaude-hist-<container>[-<agentId>]` | inside the agent volume (e.g. `…/claude/projects`) | conversation history of a container that opted out of shared history | optional |
 | `porterclaude-claude`, `porterclaude-claude-home` | – (v0.1 only) | the v0.1 shared Claude login; **read once** by the v0.2 import, then unused | removable after the upgrade |
 
 The prefix is `general.volumePrefix` (default `porterclaude-`) and can be overridden per host.
 
 **When they appear.** A *tools sync* only builds `porterclaude-tools`. The per-agent auth
-volumes are created with the **first session that mounts them**, so after enabling `opencode`
+volumes are created with the **first container that mounts them**, so after enabling `opencode`
 and syncing you will see `porterclaude-auth-claude` but no `porterclaude-auth-opencode` until
-a session is created (or recreated) with that agent — an empty volume list right after a sync
+a container is created (or recreated) with that agent — an empty volume list right after a sync
 is expected, not a failed sync.
 
 The volume to protect is **`porterclaude-auth-<agentId>`**: it is the only copy of an agent's
@@ -421,12 +448,15 @@ authentication on that host. Losing it means logging in again, on every host it 
 
 ## Architecture notes for operators
 
-- Session containers are named `pc-<session>` and labelled `porterclaude.managed=true`,
-  `porterclaude.session=<name>`, `porterclaude.host=<hostId>` and
+- Containers are named `pc-<container>` and labelled `porterclaude.managed=true`,
+  `porterclaude.container=<name>`, `porterclaude.host=<hostId>` and
   `porterclaude.agents=<id,id,…>`; the app rebuilds its view from these labels, so losing
-  `/data` costs you the settings, not the containers (`POST /api/sessions/reconcile`).
-- Session **names are unique across hosts** — that is what lets a terminal find its host.
-- Every session (recipe *and* custom image) starts through `/opt/porterclaude/entrypoint.sh`
+  `/data` costs you the settings, not the containers (`POST /api/containers/reconcile`).
+  Containers created before v0.3 carry `porterclaude.session=<name>` instead; the server reads
+  both and writes only the new one, so they are discovered and adopted exactly as before and
+  pick up the new label on their next recreate.
+- Container **names are unique across hosts** — that is what lets a session find its host.
+- Every container (recipe *and* custom image) starts through `/opt/porterclaude/entrypoint.sh`
   from the tools volume; recipe images keep their own `CMD` (the `php` recipe still starts
   supervisord). The entrypoint wires `PATH`, symlinks each agent's config paths into its auth
   volume and repairs ownership — it never aborts the container.
@@ -441,9 +471,9 @@ authentication on that host. Losing it means logging in again, on every host it 
 | Settings reports the socket host as unavailable | missing `group_add` (see above), or no socket mounted at all |
 | a host shows *unreachable* | that engine or its Portainer is down; other hosts and the UI keep working. Fix the connection, then *Refresh* |
 | **"no agents installed on this host"** | the tools volume was never populated on it — Settings → Agents → **Sync tools** |
-| a terminal closes with **4410** (`agent_not_available`) | the agent is not mounted into that session: enable it on the host, sync, and **recreate** the session. The client does not reconnect on purpose |
-| a terminal closes with **4411** (`host_unavailable`) | the session's host is gone or unreachable |
-| an agent asks for a login again after the upgrade | the tools sync (which performs the one-time v0.1 login import) has not run yet on that host, or the session predates it — sync, then recreate |
+| a session closes with **4410** (`agent_not_available`) | the agent is not mounted into that container: enable it on the host, sync, and **recreate** the container. The client does not reconnect on purpose |
+| a session closes with **4411** (`host_unavailable`) | the container's host is gone or unreachable |
+| an agent asks for a login again after the upgrade | the tools sync (which performs the one-time v0.1 login import) has not run yet on that host, or the container predates it — sync, then recreate |
 | a login on one host does not work on another | by design: auth volumes are per host |
 | a tools sync fails after ~60 s on a Portainer host | the reverse proxy in front of Portainer is cutting the stream — install the vhost snippet above |
 | a tools sync fails with download errors | the **Docker host** has no outbound HTTPS |

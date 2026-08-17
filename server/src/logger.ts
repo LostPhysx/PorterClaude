@@ -8,7 +8,7 @@ export const REDACT_PATHS = [
   'req.headers.cookie',
   'req.headers.authorization',
   'req.headers["x-api-key"]',
-  // the response header carries a freshly issued session JWT -- never write it to a log
+  // the response header carries a freshly issued login JWT -- never write it to a log
   'res.headers["set-cookie"]',
   '*.apiKey',
   '*.password',

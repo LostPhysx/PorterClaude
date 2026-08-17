@@ -1,4 +1,4 @@
-// FROZEN (planner-authored, fully implemented). Naming rules shared by sessions/terminals/images.
+// FROZEN (planner-authored, fully implemented). Naming rules shared by containers/sessions/images.
 export const SLUG_RE = /^[a-z0-9][a-z0-9-]{0,30}$/;
 
 /** Lowercase, dash-separated, docker-name-safe. Throws if nothing usable remains. */
@@ -17,9 +17,13 @@ export function isSlug(s: string): boolean {
   return SLUG_RE.test(s);
 }
 
-/** tmux session names may not contain '.' or ':'; keep them short and boring. */
-export function tmuxSessionName(terminalName: string): string {
-  const base = terminalName.replace(/[^A-Za-z0-9_-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 40) || 'main';
+/**
+ * tmux session names may not contain '.' or ':'; keep them short and boring.
+ * NAME AND `pc_` PREFIX ARE FROZEN: this is tmux's own vocabulary and the identity of every
+ * live shell — changing either strands the running tmux sessions of a live install.
+ */
+export function tmuxSessionName(sessionName: string): string {
+  const base = sessionName.replace(/[^A-Za-z0-9_-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 40) || 'main';
   return `pc_${base}`;
 }
 

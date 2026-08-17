@@ -2,8 +2,8 @@
 // the stored Portainer credentials and the "import endpoints -> one host each" flow.
 // Not a top-level view; settings.js drives its lifecycle (like images.js).
 //
-// It is ALSO the host cache every other F1 module reads (sessions.js host filter + session
-// dialog, images.js host selector, agents.js host selector).
+// It is ALSO the host cache every other F1 module reads (containers.js host filter +
+// container dialog, images.js host selector, agents.js host selector).
 //
 // CONTRACT (FROZEN):
 //   * loadHosts() emits bus.emit(EVENTS.HOSTS_CHANGED, { hosts, defaultHostId }) after every
@@ -15,7 +15,7 @@
 //     after a save/import, and ONCE after a plain load that still reports status 'unknown'
 //     (nothing has probed that engine yet - FE-QA-03).
 //
-// MODULE GRAPH: this module must NOT import sessions.js (HostView.sessionCount carries the
+// MODULE GRAPH: this module must NOT import containers.js (HostView.containerCount carries the
 // only number it needs) and it deliberately does not import agents.js either - agents.js
 // imports images.js, which imports THIS module, so that edge would close a cycle
 // (docs/design/frontend.md section 12.2). The agent registry is instead kept locally: the
@@ -104,7 +104,7 @@ export async function loadHosts(opts = {}) {
 
 /**
  * The host a panel should point at: the remembered one when it still exists, else the
- * default host, else the first host, else ''. Used by images.js / agents.js / sessions.js.
+ * default host, else the first host, else ''. Used by images.js / agents.js / containers.js.
  * @param {string|null} remembered
  * @returns {string}
  */
@@ -356,7 +356,7 @@ function hostRow(host) {
     `<td>${name}</td>` +
     `<td class="small">${connection}</td>` +
     `<td>${hostStatusCell(host)}</td>` +
-    `<td class="small">${escapeHtml(String(host.sessionCount ?? 0))}</td>` +
+    `<td class="small">${escapeHtml(String(host.containerCount ?? 0))}</td>` +
     `<td>${hostAgentsCell(host)}</td>` +
     `<td class="text-end text-nowrap">${actions}</td>` +
     '</tr>'
@@ -366,7 +366,7 @@ function hostRow(host) {
 /**
  * Render #hosts-tbody, one row per HostView (name + id + default badge + notes, the
  * connection label and its credential, the status badge with the error as a tooltip, the
- * session count, one chip per enabled agent, and the row actions). Everything that comes
+ * container count, one chip per enabled agent, and the row actions). Everything that comes
  * from the API is escaped.
  */
 export function renderHosts() {
@@ -566,7 +566,7 @@ function hostFormHtml(host) {
     '<div class="col-12"><hr class="my-1"></div>' +
     '<div class="col-12"><label class="form-label d-block">Coding agents enabled on this host</label>' +
     `<div class="row g-1" id="hf-agents">${agentCheckboxesHtml(host)}</div>` +
-    '<div class="form-text">Enabling installs nothing: sync the tools volume of this host afterwards, then recreate the sessions that should mount the agent.</div></div>' +
+    '<div class="form-text">Enabling installs nothing: sync the tools volume of this host afterwards, then recreate the containers that should mount the agent.</div></div>' +
 
     '<div class="col-12"><hr class="my-1"></div>' +
     '<div class="col-12"><label class="form-label d-block">Overrides</label>' +
@@ -816,7 +816,7 @@ export async function saveHost(event) {
 }
 
 /**
- * confirmDialog -> DELETE /api/hosts/:id. A 409 means sessions still reference the host:
+ * confirmDialog -> DELETE /api/hosts/:id. A 409 means containers still reference the host:
  * ask a second time and retry with `?force=1`.
  * @param {any} host HostView
  * @returns {Promise<void>}
@@ -842,11 +842,11 @@ export async function deleteHost(host) {
       return;
     }
   }
-  const count = Number(host.sessionCount || 0);
+  const count = Number(host.containerCount || 0);
   const forced = await confirmDialog({
     title: 'Delete it anyway?',
     body:
-      `${escapeHtml(String(count))} session(s) still point at this host. Deleting it leaves them ` +
+      `${escapeHtml(String(count))} container(s) still point at this host. Deleting it leaves them ` +
       'read-only until a host with that id exists again. Containers, volumes and images on that ' +
       'engine are never touched.',
     confirmLabel: 'Delete anyway',
@@ -854,7 +854,7 @@ export async function deleteHost(host) {
   if (!forced) return;
   try {
     await api.hosts.remove(host.id, { force: true });
-    toast(`Host ${host.name} deleted - its sessions are read-only now`, { variant: 'warning' });
+    toast(`Host ${host.name} deleted - its containers are read-only now`, { variant: 'warning' });
     await reload();
   } catch (err) {
     toastError(err, 'Could not delete the host');
@@ -936,7 +936,7 @@ export async function showHostInfo(host) {
     '<dl class="row small mb-3">' +
     `<dt class="col-sm-3">Connection</dt><dd class="col-sm-9">${escapeHtml(host.connectionLabel || '-')}</dd>` +
     (host.credentialName ? `<dt class="col-sm-3">Credential</dt><dd class="col-sm-9">${escapeHtml(host.credentialName)}</dd>` : '') +
-    `<dt class="col-sm-3">Sessions</dt><dd class="col-sm-9">${escapeHtml(String(host.sessionCount ?? 0))}</dd>` +
+    `<dt class="col-sm-3">Containers</dt><dd class="col-sm-9">${escapeHtml(String(host.containerCount ?? 0))}</dd>` +
     `<dt class="col-sm-3">Agents</dt><dd class="col-sm-9">${hostAgentsCell(host)}</dd>` +
     `<dt class="col-sm-3">Created</dt><dd class="col-sm-9">${escapeHtml(fmtDate(host.createdAt))}</dd>` +
     '</dl>';

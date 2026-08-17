@@ -1,5 +1,5 @@
 // OWNER: B1. Public API FROZEN — B2 uses `require()`, `enabledForHost()`,
-// `resolveForSession()` and `installSpecsForHost()`; nothing else.
+// `resolveForContainer()` and `installSpecsForHost()`; nothing else.
 //
 // The registry is the union of the built-ins (agents/builtin.ts) and the custom definitions
 // stored in `config.agents.custom`. Ids are globally unique: a custom agent may not reuse a
@@ -76,8 +76,8 @@ export class AgentRegistry {
   }
 
   /**
-   * Custom agents only. `409 conflict` while a host still enables it or a session still
-   * pins it, unless `force` (which also strips the id from those hosts/sessions).
+   * Custom agents only. `409 conflict` while a host still enables it or a container still
+   * pins it, unless `force` (which also strips the id from those hosts/containers).
    */
   async remove(id: string, opts?: { force?: boolean }): Promise<void> {
     if (this.isBuiltin(id)) throw AppError.conflict(`the built-in agent '${id}' cannot be deleted`);
@@ -86,12 +86,12 @@ export class AgentRegistry {
 
     const cfg = this.deps.config.get();
     const hostIds = cfg.hosts.filter((h) => h.agents.enabled.includes(id)).map((h) => h.id);
-    const sessions = cfg.sessions.filter((s) => s.agents?.includes(id)).map((s) => s.name);
+    const containers = cfg.containers.filter((c) => c.agents?.includes(id)).map((c) => c.name);
 
-    if ((hostIds.length > 0 || sessions.length > 0) && !opts?.force) {
+    if ((hostIds.length > 0 || containers.length > 0) && !opts?.force) {
       throw AppError.conflict(
-        `agent '${id}' is still used by ${hostIds.length} host(s) and ${sessions.length} session(s) — repeat with ?force=1 to remove it everywhere`,
-        { hostIds, sessions },
+        `agent '${id}' is still used by ${hostIds.length} host(s) and ${containers.length} container(s) — repeat with ?force=1 to remove it everywhere`,
+        { hostIds, containers },
       );
     }
 
@@ -100,11 +100,11 @@ export class AgentRegistry {
       for (const host of draft.hosts) {
         host.agents.enabled = host.agents.enabled.filter((a) => a !== id);
       }
-      for (const session of draft.sessions) {
-        if (session.agents) session.agents = session.agents.filter((a) => a !== id);
+      for (const container of draft.containers) {
+        if (container.agents) container.agents = container.agents.filter((a) => a !== id);
       }
     });
-    this.deps.log.info({ agentId: id, hostIds, sessions }, 'custom agent removed');
+    this.deps.log.info({ agentId: id, hostIds, containers }, 'custom agent removed');
   }
 
   /** Definitions of `host.agents.enabled`, skipping ids that no longer exist. */
@@ -113,12 +113,12 @@ export class AgentRegistry {
   }
 
   /**
-   * The agents a session really gets: `session.agents ?? host.agents.enabled`, filtered to
-   * ids that still exist. THE function sessions/container.ts uses to build mounts, so its
-   * result is what the spec hash covers.
+   * The agents a container really gets: `container.agents ?? host.agents.enabled`, filtered
+   * to ids that still exist. THE function containers/container.ts uses to build mounts, so
+   * its result is what the spec hash covers.
    */
-  resolveForSession(host: HostConfig, session: { agents: string[] | null }): AgentDefinition[] {
-    return this.resolve(session.agents ?? host.agents.enabled);
+  resolveForContainer(host: HostConfig, container: { agents: string[] | null }): AgentDefinition[] {
+    return this.resolve(container.agents ?? host.agents.enabled);
   }
 
   /** What the tools populate container installs on this host (PORTERCLAUDE_AGENTS). */

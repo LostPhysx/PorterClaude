@@ -4,8 +4,17 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { NextFunction, Request, Response } from 'express';
 import request from 'supertest';
 
-vi.mock('../../src/sessions/routes.js', () => ({
-  createSessionsRouter: () => (_req: Request, _res: Response, next: NextFunction) => next(),
+vi.mock('../../src/containers/routes.js', () => ({
+  // Answers on one sentinel path so the mount-path test below can observe WHERE this router
+  // is mounted; everything else falls through exactly as before, which is what the rest of
+  // this file relies on (B2's routers are stubbed so only B1's wiring is under test).
+  createContainersRouter: () => (req: Request, res: Response, next: NextFunction) => {
+    if (req.path === '/__mounted__') {
+      res.json({ mounted: true });
+      return;
+    }
+    next();
+  },
 }));
 vi.mock('../../src/images/routes.js', () => ({
   createImagesRouter: () => (_req: Request, _res: Response, next: NextFunction) => next(),
@@ -13,6 +22,7 @@ vi.mock('../../src/images/routes.js', () => ({
 
 const { makeHarness, TEST_PASSWORD } = await import('./helpers.js');
 const { HOST_PROBE_TIMEOUT_MS } = await import('../../src/hosts/manager.js');
+const { SESSION_WS_PATH } = await import('../../src/sessions/ws.js');
 type Harness = Awaited<ReturnType<typeof makeHarness>>;
 
 let h: Harness;
@@ -53,7 +63,7 @@ describe('auth', () => {
   it('401s every protected route with the canonical envelope', async () => {
     const paths = [
       '/api/settings',
-      '/api/sessions',
+      '/api/containers',
       '/api/hosts',
       '/api/credentials/portainer',
       '/api/agents',
@@ -68,12 +78,12 @@ describe('auth', () => {
     }
   });
 
-  it('reports the session state before and after logging in', async () => {
-    const anon = await request(h.app).get('/api/auth/session');
+  it('reports the login state before and after logging in', async () => {
+    const anon = await request(h.app).get('/api/auth/me');
     expect(anon.body).toEqual({ authenticated: false, needsSetup: false });
 
     const cookie = await login();
-    const authed = await request(h.app).get('/api/auth/session').set('Cookie', cookie);
+    const authed = await request(h.app).get('/api/auth/me').set('Cookie', cookie);
     expect(authed.body).toEqual({ authenticated: true, needsSetup: false });
   });
 
@@ -82,7 +92,7 @@ describe('auth', () => {
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ authenticated: true });
     const raw = (res.headers['set-cookie'] as unknown as string[])[0] as string;
-    expect(raw).toMatch(/^pc_session=/);
+    expect(raw).toMatch(/^pc_auth=/);
     expect(raw).toContain('HttpOnly');
     expect(raw).toContain('SameSite=Lax');
     expect(raw).toContain('Path=/');
@@ -115,13 +125,13 @@ describe('auth', () => {
     const res = await request(h.app).post('/api/auth/logout');
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ authenticated: false });
-    expect((res.headers['set-cookie'] as unknown as string[])[0]).toMatch(/^pc_session=;/);
+    expect((res.headers['set-cookie'] as unknown as string[])[0]).toMatch(/^pc_auth=;/);
   });
 
   it('reports needsSetup when no password is configured', async () => {
     const bare = await makeHarness({ APP_PASSWORD: '' });
     try {
-      const res = await request(bare.app).get('/api/auth/session');
+      const res = await request(bare.app).get('/api/auth/me');
       expect(res.body).toEqual({ authenticated: false, needsSetup: true });
       const login = await request(bare.app).post('/api/auth/login').send({ password: 'anything' });
       expect(login.status).toBe(401);
@@ -155,7 +165,7 @@ describe('/api/settings', () => {
   });
 
   // BE-11: path-like settings are used verbatim in every later docker call, so a bad
-  // value has to be a 422 here instead of a 502 on the next session create.
+  // value has to be a 422 here instead of a 502 on the next container create.
   it('PUT /general rejects path-like fields that docker would choke on', async () => {
     const cookie = await login();
     const cases: Array<Record<string, unknown>> = [
@@ -304,7 +314,7 @@ describe('/api/hosts', () => {
       supported: true,
       connectionLabel: 'socket: /x.sock',
       agents: { enabled: ['claude'] },
-      sessionCount: 0,
+      containerCount: 0,
     });
     expect(first.body.host.settings.volumePrefix).toBe('porterclaude-');
 
@@ -373,7 +383,7 @@ describe('/api/hosts', () => {
     expect(JSON.stringify(res.body)).not.toContain(TEST_PASSWORD);
   });
 
-  it('404s an unknown host and 409s a DELETE while sessions reference it', async () => {
+  it('404s an unknown host and 409s a DELETE while containers reference it', async () => {
     const cookie = await login();
     expect((await request(h.app).get('/api/hosts/nope').set('Cookie', cookie)).status).toBe(404);
 
@@ -381,7 +391,7 @@ describe('/api/hosts', () => {
       .post('/api/hosts')
       .set('Cookie', cookie)
       .send({ name: 'Local docker', connection: { type: 'socket', socketPath: '/x.sock' } });
-    await h.ctx.config.putSession({
+    await h.ctx.config.putContainer({
       name: 'web',
       hostId: 'local-docker',
       agents: null,
@@ -405,8 +415,8 @@ describe('/api/hosts', () => {
 
     const forced = await request(h.app).delete('/api/hosts/local-docker?force=1').set('Cookie', cookie);
     expect(forced.status).toBe(204);
-    // the session survives (it is now dangling), the engine was never touched
-    expect(h.ctx.config.listSessions().map((x) => x.name)).toEqual(['web']);
+    // the container survives (it is now dangling), the engine was never touched
+    expect(h.ctx.config.listContainers().map((x) => x.name)).toEqual(['web']);
     expect(h.ctx.config.get().defaultHostId).toBeNull();
   });
 });
@@ -466,7 +476,7 @@ describe('/api/agents', () => {
     expect((await request(h.app).get('/api/agents/nope').set('Cookie', cookie)).status).toBe(404);
   });
 
-  // B-8: a sharedPath becomes a SYMLINK inside the session container, so `..` would point it
+  // B-8: a sharedPath becomes a SYMLINK inside the container, so `..` would point it
   // outside the agent's auth volume (`~/../../etc/passwd` was accepted and stored).
   it('422s a sharedPath / historyPath that escapes the container home', async () => {
     const cookie = await login();
@@ -639,7 +649,7 @@ describe('static assets and error handling', () => {
     const root = await request(h.app).get('/');
     expect(root.status).toBe(200);
     expect(root.text).toContain('<!doctype html>');
-    const deep = await request(h.app).get('/sessions/deep/link');
+    const deep = await request(h.app).get('/containers/deep/link');
     expect(deep.status).toBe(200);
     expect(deep.text).toContain('<!doctype html>');
   });
@@ -649,11 +659,31 @@ describe('static assets and error handling', () => {
     expect(res.status).toBe(404);
     expect(res.body.error.code).toBe('not_found');
   });
+
+  // v0.3 phase R: the HTTP container CRUD moved to /api/containers and the shell connections
+  // took over /api/sessions. That path belongs to the WEBSOCKET upgrade handler alone — if
+  // express ever owns it again it answers the handshake with 401/404 and every pane dies
+  // before it connects. Asserted while AUTHENTICATED so a 404 means "no route", not "no cookie";
+  // the two halves are one test on purpose, so moving the mount back fails BOTH.
+  it('mounts the container CRUD on /api/containers and leaves SESSION_WS_PATH to the websocket', async () => {
+    const cookie = await login();
+
+    const crud = await request(h.app).get('/api/containers/__mounted__').set('Cookie', cookie);
+    expect(crud.status).toBe(200);
+    expect(crud.body).toEqual({ mounted: true });
+
+    const onWsPath = await request(h.app).get(`${SESSION_WS_PATH}/__mounted__`).set('Cookie', cookie);
+    expect(onWsPath.status).toBe(404);
+
+    const res = await request(h.app).get(SESSION_WS_PATH).set('Cookie', cookie);
+    expect(res.status).toBe(404);
+    expect(res.body.error.code).toBe('not_found');
+  });
 });
 
 // ---------------------------------------------------------------------------
 // QA R1-INT2-4 / R2-INT2-7: a custom agent definition is admin-supplied config that ends up
-// in a docker create, in an installer script and in a terminal argv. Everything that cannot
+// in a docker create, in an installer script and in a session argv. Everything that cannot
 // work there is refused HERE (422), not hours later in a tools-sync job log.
 // ---------------------------------------------------------------------------
 describe('/api/agents input hygiene', () => {

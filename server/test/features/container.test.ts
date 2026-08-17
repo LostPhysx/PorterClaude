@@ -1,7 +1,7 @@
 // OWNER: B2. buildContainerSpec / workspaceMountFor / specHash — pure, no docker host.
 // v0.2 contract: one auth volume per agent mounted at <home>/.porterclaude/agents/<id>, the
 // agent's own paths reached through symlinks (PORTERCLAUDE_AGENT_LINKS), the private history
-// volume nested INSIDE the agent volume, and the tools volume + entrypoint in EVERY session
+// volume nested INSIDE the agent volume, and the tools volume + entrypoint in EVERY container
 // (docs/design/backend.md v0.2 §12.3, api.md v0.2 "Container contract").
 import { describe, expect, it } from 'vitest';
 import {
@@ -9,12 +9,12 @@ import {
   composeToolsPath,
   DEFAULT_CONTAINER_PATH,
   imagePathFromEnv,
-  SESSION_PIDS_LIMIT,
+  CONTAINER_PIDS_LIMIT,
   specHash,
   workspaceMountFor,
-} from '../../src/sessions/container.js';
-import { CONTAINER_LABELS } from '../../src/sessions/model.js';
-import { generalConfig, sessionConfig, TEST_HOST_ID, TEST_INSTANCE_ID } from './helpers.js';
+} from '../../src/containers/container.js';
+import { CONTAINER_LABELS } from '../../src/containers/model.js';
+import { generalConfig, containerConfig, TEST_HOST_ID, TEST_INSTANCE_ID } from './helpers.js';
 import { BUILTIN_AGENTS } from '../../src/agents/builtin.js';
 import type { AgentDefinition } from '../../src/agents/model.js';
 
@@ -32,9 +32,9 @@ const agents = [agent('claude')];
 const CLAUDE_DIR = '/home/dev/.porterclaude/agents/claude';
 
 function recipeSpec(overrides = {}, defs: AgentDefinition[] = agents, imageCmd?: string[] | null) {
-  const session = sessionConfig(overrides);
+  const container = containerConfig(overrides);
   return buildContainerSpec({
-    session,
+    container,
     general,
     agents: defs,
     resolvedImage: 'porterclaude/node:latest',
@@ -45,9 +45,9 @@ function recipeSpec(overrides = {}, defs: AgentDefinition[] = agents, imageCmd?:
 }
 
 function customSpec(overrides = {}, defs: AgentDefinition[] = agents) {
-  const session = sessionConfig({ image: { type: 'custom', ref: 'nginx:1.27' }, ...overrides });
+  const container = containerConfig({ image: { type: 'custom', ref: 'nginx:1.27' }, ...overrides });
   return buildContainerSpec({
-    session,
+    container,
     general,
     agents: defs,
     resolvedImage: 'nginx:1.27',
@@ -61,7 +61,7 @@ describe('buildContainerSpec', () => {
     const spec = recipeSpec();
     expect(spec.name).toBe('pc-web');
     expect(spec.labels?.[CONTAINER_LABELS.managed]).toBe('true');
-    expect(spec.labels?.[CONTAINER_LABELS.session]).toBe('web');
+    expect(spec.labels?.[CONTAINER_LABELS.container]).toBe('web');
     expect(spec.labels?.[CONTAINER_LABELS.host]).toBe(TEST_HOST_ID);
     expect(spec.labels?.[CONTAINER_LABELS.agents]).toBe('claude');
     expect(spec.labels?.[CONTAINER_LABELS.imageType]).toBe('recipe');
@@ -95,7 +95,7 @@ describe('buildContainerSpec', () => {
     expect(mounts.some((m) => m.source === 'porterclaude-claude-home')).toBe(false);
   });
 
-  it('mounts NOTHING agent related for a session without agents', () => {
+  it('mounts NOTHING agent related for a container without agents', () => {
     const mounts = recipeSpec({}, []).mounts ?? [];
     expect(mounts.some((m) => m.source.startsWith('porterclaude-auth-'))).toBe(false);
     expect(recipeSpec({}, []).labels?.[CONTAINER_LABELS.agents]).toBe('');
@@ -136,14 +136,14 @@ describe('buildContainerSpec', () => {
     expect(a.labels?.[CONTAINER_LABELS.specHash]).not.toBe(b.labels?.[CONTAINER_LABELS.specHash]);
   });
 
-  it('pins HOME to the container home for every session (BE-4)', () => {
+  it('pins HOME to the container home for every container (BE-4)', () => {
     // Docker would otherwise inherit HOME from the image (/root for root images) and the
     // agents would write their credentials outside the shared auth volumes.
     expect(customSpec().env?.HOME).toBe('/home/dev');
     expect(recipeSpec().env?.HOME).toBe('/home/dev');
   });
 
-  it('lets an explicit session env override the pinned HOME', () => {
+  it('lets an explicit container env override the pinned HOME', () => {
     expect(customSpec({ env: { HOME: '/root' } }).env?.HOME).toBe('/root');
   });
 
@@ -156,7 +156,7 @@ describe('buildContainerSpec', () => {
     );
   });
 
-  it('merges the agent env first and lets the session env win', () => {
+  it('merges the agent env first and lets the container env win', () => {
     const withEnv: AgentDefinition = { ...agent('claude'), env: { AGENT_FLAG: '1', FOO: 'agent' } };
     const spec = recipeSpec({ env: { FOO: 'user' } }, [withEnv]);
     expect(spec.env?.AGENT_FLAG).toBe('1');
@@ -168,7 +168,7 @@ describe('buildContainerSpec', () => {
     expect(shared.some((m) => m.source.startsWith('porterclaude-hist-'))).toBe(false);
 
     const isolated = recipeSpec({ shareHistory: false }, [agent('claude'), agent('codex')]).mounts ?? [];
-    // claude keeps the v0.1 volume name so an upgraded session keeps its history
+    // claude keeps the v0.1 volume name so an upgraded container keeps its history
     expect(isolated).toContainEqual({
       type: 'volume',
       source: 'porterclaude-hist-web',
@@ -191,7 +191,7 @@ describe('buildContainerSpec', () => {
     expect(mounts.some((m) => m.source.startsWith('porterclaude-hist-'))).toBe(false);
   });
 
-  it('sets the session env, working dir, init and pids limit', () => {
+  it('sets the container env, working dir, init and pids limit', () => {
     const spec = recipeSpec({ env: { FOO: 'bar' } });
     expect(spec.env).toMatchObject({
       PORTERCLAUDE_SESSION: 'web',
@@ -200,7 +200,7 @@ describe('buildContainerSpec', () => {
     });
     expect(spec.workingDir).toBe('/workspace');
     expect(spec.init).toBe(true);
-    expect(spec.resources?.pidsLimit).toBe(SESSION_PIDS_LIMIT);
+    expect(spec.resources?.pidsLimit).toBe(CONTAINER_PIDS_LIMIT);
   });
 
   it('translates limits and the restart policy', () => {
@@ -217,7 +217,7 @@ describe('buildContainerSpec', () => {
     expect(spec.ports?.[0] && 'hostPort' in spec.ports[0]).toBe(false);
   });
 
-  it('passes the session network / user through', () => {
+  it('passes the container network / user through', () => {
     const spec = recipeSpec({ network: 'proxy', user: '1001:1001' });
     expect(spec.networks).toEqual(['proxy']);
     expect(spec.user).toBe('1001:1001');
@@ -238,7 +238,7 @@ describe('buildContainerSpec', () => {
   it('honours a per-host volumePrefix and containerHome (host overrides)', () => {
     const edge = generalConfig({ volumePrefix: 'edge-', containerHome: '/root' });
     const spec = buildContainerSpec({
-      session: sessionConfig({ hostId: 'edge' }),
+      container: containerConfig({ hostId: 'edge' }),
       general: edge,
       agents,
       resolvedImage: 'porterclaude/node:latest',
@@ -263,23 +263,23 @@ describe('buildContainerSpec', () => {
 
 describe('workspaceMountFor', () => {
   it('uses porterclaude-ws-<slug> by default and honours an explicit volume', () => {
-    expect(workspaceMountFor(sessionConfig(), general)).toEqual({
+    expect(workspaceMountFor(containerConfig(), general)).toEqual({
       type: 'volume',
       source: 'porterclaude-ws-web',
       target: '/workspace',
       readOnly: false,
     });
     expect(
-      workspaceMountFor(sessionConfig({ workspace: { type: 'volume', volume: 'mine' } }), general).source,
+      workspaceMountFor(containerConfig({ workspace: { type: 'volume', volume: 'mine' } }), general).source,
     ).toBe('mine');
   });
 
   it('binds absolute host paths and resolves relative ones under workspacesRoot', () => {
     expect(
-      workspaceMountFor(sessionConfig({ workspace: { type: 'bind', hostPath: '/srv/x' } }), general),
+      workspaceMountFor(containerConfig({ workspace: { type: 'bind', hostPath: '/srv/x' } }), general),
     ).toEqual({ type: 'bind', source: '/srv/x', target: '/workspace', readOnly: false });
     expect(
-      workspaceMountFor(sessionConfig({ workspace: { type: 'bind', hostPath: 'proj' } }), general).source,
+      workspaceMountFor(containerConfig({ workspace: { type: 'bind', hostPath: 'proj' } }), general).source,
     ).toBe('/srv/porterclaude/workspaces/proj');
   });
 
@@ -288,7 +288,7 @@ describe('workspaceMountFor', () => {
   // such a path today, so these bypass it — exactly like a config.json stored before the
   // rule existed, which is what this second line of defence is for.
   const storedBind = (hostPath: string) => ({
-    ...sessionConfig(),
+    ...containerConfig(),
     workspace: { type: 'bind' as const, hostPath },
   });
 
@@ -308,7 +308,7 @@ describe('workspaceMountFor', () => {
 
   it('gives a git workspace a named volume', () => {
     const mount = workspaceMountFor(
-      sessionConfig({ workspace: { type: 'git', url: 'https://example.com/x.git' } }),
+      containerConfig({ workspace: { type: 'git', url: 'https://example.com/x.git' } }),
       general,
     );
     expect(mount).toEqual({
@@ -341,7 +341,7 @@ describe('specHash', () => {
     const base = specHash(recipeSpec());
     const variants = [
       buildContainerSpec({
-        session: sessionConfig(),
+        container: containerConfig(),
         general,
         agents,
         resolvedImage: 'porterclaude/node:other',
@@ -359,8 +359,8 @@ describe('specHash', () => {
     for (const variant of variants) expect(specHash(variant)).not.toBe(base);
   });
 
-  // enabling an agent on the host must make its sessions ask for a recreate: the new agent
-  // only appears once the container carries its auth mount (api.md v0.2 Sessions)
+  // enabling an agent on the host must make its containers ask for a recreate: the new agent
+  // only appears once the container carries its auth mount (api.md v0.2 Containers)
   it('changes when the AGENT SET changes and is stable while it does not', () => {
     const one = recipeSpec({}, [agent('claude')]);
     const two = recipeSpec({}, [agent('claude'), agent('opencode')]);
@@ -380,9 +380,9 @@ describe('specHash', () => {
 // inherits it. v0.2 does that for RECIPES TOO — the agents live in the tools volume for both.
 describe('container PATH (BE-6)', () => {
   it('prepends the tools bin dir to the image PATH', () => {
-    const session = sessionConfig({ image: { type: 'custom', ref: 'alpine:3.20' } });
+    const container = containerConfig({ image: { type: 'custom', ref: 'alpine:3.20' } });
     const spec = buildContainerSpec({
-      session,
+      container,
       general,
       agents,
       resolvedImage: 'alpine:3.20',
@@ -403,7 +403,7 @@ describe('container PATH (BE-6)', () => {
 
   it('sets PATH for recipe images as well (v0.2: agents come from the tools volume)', () => {
     const spec = buildContainerSpec({
-      session: sessionConfig(),
+      container: containerConfig(),
       general,
       agents,
       resolvedImage: 'porterclaude/node:latest',
@@ -425,10 +425,10 @@ describe('container PATH (BE-6)', () => {
   });
 
   it('imagePathFromEnv recovers the image PATH, so the spec hash of a running container is stable', () => {
-    const session = sessionConfig({ image: { type: 'custom', ref: 'alpine:3.20' } });
+    const container = containerConfig({ image: { type: 'custom', ref: 'alpine:3.20' } });
     const build = (imageEnvPath?: string | null) =>
       buildContainerSpec({
-        session,
+        container,
         general,
         agents,
         resolvedImage: 'alpine:3.20',
@@ -442,7 +442,7 @@ describe('container PATH (BE-6)', () => {
     expect(recovered).toBe('/usr/local/go/bin:/usr/bin');
     expect(specHash(build(recovered))).toBe(specHash(created));
     // and without the recovery the hash would differ - which is what made every
-    // custom-image session report needsRecreate forever
+    // custom-image container report needsRecreate forever
     expect(specHash(build())).not.toBe(specHash(created));
   });
 

@@ -261,7 +261,7 @@ export async function reloadTools() {
       el.innerHTML =
         `tools volume <code>${escapeHtml(s.volume || '')}</code> · ${escapeHtml(String(installed))} agent(s) installed · synced ${escapeHtml(fmtDate(s.lastSyncedAt))}${badge}${hint}`;
     } else {
-      el.innerHTML = `tools volume <code>${escapeHtml(s.volume || 'porterclaude-tools')}</code> is not populated - sessions on this host have no coding agent yet.`;
+      el.innerHTML = `tools volume <code>${escapeHtml(s.volume || 'porterclaude-tools')}</code> is not populated - containers on this host have no coding agent yet.`;
     }
   } catch (err) {
     toolsStatus = null;

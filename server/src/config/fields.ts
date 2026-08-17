@@ -4,7 +4,7 @@
 // both use them without an import cycle.
 //
 // Import DAG (must stay acyclic):
-//   config/fields.ts  <-  hosts/model.ts, agents/model.ts, sessions/model.ts  <-  config/schema.ts
+//   config/fields.ts  <-  hosts/model.ts, agents/model.ts, containers/model.ts  <-  config/schema.ts
 import { z } from 'zod';
 
 /** docker object names (volumes, networks): [a-zA-Z0-9][a-zA-Z0-9_.-]* */
@@ -30,7 +30,7 @@ export const absPosixPath = (label: string) =>
 /**
  * `.catch(<default>)` on the STORED shape only: a hand-edited config.json with a bad value
  * falls back to the default instead of failing AppConfigSchema, which would quarantine the
- * whole file (and with it every stored session). API input schemas have no catch, so a bad
+ * whole file (and with it every stored container). API input schemas have no catch, so a bad
  * value sent to the settings API is a 422.
  */
 export const stored = <T extends z.ZodTypeAny, D extends z.infer<T>>(schema: T, fallback: D) =>

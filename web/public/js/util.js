@@ -8,7 +8,7 @@ export function byId(id) {
 
 const HTML_ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 
-/** HTML-escape untrusted text (session names, docker output, error messages). */
+/** HTML-escape untrusted text (container names, docker output, error messages). */
 export function escapeHtml(value) {
   if (value === null || value === undefined) return '';
   return String(value).replace(/[&<>"']/g, (ch) => HTML_ESCAPES[ch]);
@@ -224,7 +224,7 @@ export function debounce(fn, waitMs) {
   return /** @type {any} */ (wrapped);
 }
 
-/** Bootstrap badge class for a SessionView.status. */
+/** Bootstrap badge class for a ContainerView.status. */
 export function statusBadgeClass(status) {
   switch (status) {
     case 'running':

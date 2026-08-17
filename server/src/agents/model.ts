@@ -1,7 +1,7 @@
 // FROZEN (planner-authored, fully implemented, v0.2). THE coding-agent contract: the shape
 // of an AgentDefinition, the per-host auth volume layout, and the pure helpers that turn a
 // definition into container mounts / symlinks. Used by B1 (registry, routes, hosts) and by
-// B2 (sessions/container.ts, terminals, images/tools sync) alike — no I/O in this file.
+// B2 (containers/container.ts, sessions, images/tools sync) alike — no I/O in this file.
 //
 // LAYOUT (v0.2, docs/design/backend.md §12)
 // ------------------------------------------------------------------------------------
@@ -19,7 +19,7 @@
 // mounted at all (agents rewrite them atomically via rename(2), which breaks a file bind).
 // One volume + symlinks covers both cases with one rule.
 //
-// The private-history overlay (session.shareHistory === false) mounts its own volume at a
+// The private-history overlay (container.shareHistory === false) mounts its own volume at a
 // path INSIDE the agent dir (e.g. <agentDir>/claude/projects) — docker sorts mounts by
 // target depth, so a nested mount on top of the agent volume is well defined, whereas a
 // mount THROUGH the ~/.claude symlink is not.
@@ -35,9 +35,9 @@ export const AgentIdSchema = z
 /**
  * An executable NAME — never a command line. `command` (and the npm/pip `bin` it defaults
  * to) is what the tools volume must put on PATH (`<toolsMount>/bin/<command>`), what
- * `install-agents.sh` writes a `run.sh` for, and what a terminal execs.
+ * `install-agents.sh` writes a `run.sh` for, and what a session execs.
  *
- * A value with shell metacharacters (`evil; rm -rf /`) is not an injection — the terminal
+ * A value with shell metacharacters (`evil; rm -rf /`) is not an injection — the session
  * shell-quotes the argv and the installer refuses it — but it fails at SYNC time, in a job
  * log, hours after the definition was accepted with a 201. It is rejected here instead.
  */
@@ -52,7 +52,7 @@ export const AgentCommandSchema = z
 
 /**
  * Container env var name. The keys of `AgentDefinition.env` end up in `docker create` and in
- * every `docker exec` of a session; a key like `BAD KEY` is accepted by the engine and then
+ * every `docker exec` of a container; a key like `BAD KEY` is accepted by the engine and then
  * unusable by any shell, so it is rejected where it enters the system.
  */
 export const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -64,7 +64,7 @@ export const AgentEnvKeySchema = z
 /**
  * The characters a shared path may use ON THE WAY IN. Beyond `AgentPathSchema` (which only
  * rules out traversal) this keeps a path usable by everything that has to carry it:
- *   * `SESSION_AGENT_LINKS_ENV` encodes links as `target|source|kind;…`, so a `;` or `|` in
+ *   * `CONTAINER_AGENT_LINKS_ENV` encodes links as `target|source|kind;…`, so a `;` or `|` in
  *     a path silently splits ONE link into two malformed ones — the entrypoint drops them
  *     ("ignoring the malformed agent link") and the agent's real directory is never linked;
  *   * the bootstrap and the root repair script (`ensureAgentDirs`) build `sh -c` lines from
@@ -77,7 +77,7 @@ export const AGENT_PATH_SAFE_RE = /^[A-Za-z0-9._~/@+-]+$/;
 /**
  * `~/…` (relative to the container home) or an absolute POSIX path - and nothing else.
  *
- * Every such path becomes a SYMLINK inside the session container (`resolveAgentPath` +
+ * Every such path becomes a SYMLINK inside the container (`resolveAgentPath` +
  * `agentLinks`), so a `..` segment would point the link - and everything the agent writes
  * through it - at a directory outside the agent's own auth volume (`~/../../etc/passwd`).
  * `agentPathSlug` also drops `..` silently, so two different traversal paths would collide on
@@ -106,7 +106,7 @@ export const SafeAgentPathSchema = AgentPathSchema.refine((p) => AGENT_PATH_SAFE
     'path must not contain whitespace or shell metacharacters (allowed: letters, digits, `.`, `_`, `-`, `~`, `/`, `@`, `+`)',
 });
 
-/** Where an agent keeps state that must be shared between every session on a host. */
+/** Where an agent keeps state that must be shared between every container on a host. */
 export const AgentSharedPathSchema = z.object({
   /** `~/…` (relative to the container home) or an absolute POSIX path */
   path: AgentPathSchema,
@@ -185,9 +185,9 @@ export const AgentDefinitionSchema = z.object({
   id: AgentIdSchema,
   name: z.string().min(1).max(80),
   description: z.string().max(400).optional(),
-  /** executable name as it must be callable inside a session (PATH is wired by the tools volume) */
+  /** executable name as it must be callable inside a container (PATH is wired by the tools volume) */
   command: z.string().min(1).max(64),
-  /** extra argv appended when a terminal opens the agent */
+  /** extra argv appended when a session opens the agent */
   args: z.array(z.string().max(200)).max(32).default([]),
   /** argv that prints the installed version, e.g. ['claude','--version'] */
   versionCommand: z.array(z.string().min(1).max(200)).min(1).max(8),
@@ -196,10 +196,10 @@ export const AgentDefinitionSchema = z.object({
   /**
    * Conversation history INSIDE one of the sharedPaths (e.g. `~/.claude/projects`); it becomes
    * a mount target inside the auth volume, so it obeys the same path rules.
-   * `session.shareHistory === false` gives the session its own volume for it.
+   * `container.shareHistory === false` gives the container its own volume for it.
    */
   historyPath: AgentPathSchema.nullable().default(null),
-  /** extra container env this agent needs (merged before the session's own env) */
+  /** extra container env this agent needs (merged before the container's own env) */
   env: z.record(z.string(), z.string()).default({}),
   /** one line telling the user how to authenticate ("run `claude` and use /login") */
   loginHint: z.string().max(300).optional(),
@@ -308,11 +308,18 @@ export const TOOLS_AGENTS_DIR = 'agents';
 /** env var carrying the install specs into the tools populate container */
 export const TOOLS_AGENTS_ENV = 'PORTERCLAUDE_AGENTS';
 
-/** env var of a SESSION container: comma separated ids of the agents mounted into it */
-export const SESSION_AGENTS_ENV = 'PORTERCLAUDE_AGENT_IDS';
+/**
+ * env var of a managed CONTAINER: comma separated ids of the agents mounted into it.
+ * The VALUE keeps its v0.2 name: it is inside the spec hash (containers/container.ts) and is
+ * read by docker/tools/entrypoint.sh, which upgrades independently of the server.
+ */
+export const CONTAINER_AGENTS_ENV = 'PORTERCLAUDE_AGENT_IDS';
 
-/** env var of a SESSION container: the symlinks the bootstrap must create (encodeAgentLinks) */
-export const SESSION_AGENT_LINKS_ENV = 'PORTERCLAUDE_AGENT_LINKS';
+/**
+ * env var of a managed CONTAINER: the symlinks the bootstrap must create (encodeAgentLinks).
+ * The VALUE keeps its v0.2 name for the same reason as `CONTAINER_AGENTS_ENV`.
+ */
+export const CONTAINER_AGENT_LINKS_ENV = 'PORTERCLAUDE_AGENT_LINKS';
 
 // ---------------------------------------------------------------------------
 // Pure helpers — the naming rules both packages must agree on
@@ -400,7 +407,7 @@ export function agentHistoryTarget(def: AgentDefinition, containerHome: string):
   return `${match.source}${rest}`;
 }
 
-/** `target|source|kind;target|source|kind` — the SESSION_AGENT_LINKS_ENV encoding. */
+/** `target|source|kind;target|source|kind` — the CONTAINER_AGENT_LINKS_ENV encoding. */
 export function encodeAgentLinks(links: AgentLink[]): string {
   return links.map((l) => `${l.target}|${l.source}|${l.kind}`).join(';');
 }
@@ -422,7 +429,7 @@ export function agentInstallSpec(def: AgentDefinition): AgentInstallSpec {
   return { id: def.id, command: def.command, install: def.install, versionCommand: def.versionCommand };
 }
 
-/** argv a terminal runs for this agent (`command` + `args`). */
+/** argv a session runs for this agent (`command` + `args`). */
 export function agentCommandLine(def: AgentDefinition): string[] {
   return [def.command, ...def.args];
 }

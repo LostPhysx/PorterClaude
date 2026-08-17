@@ -6,7 +6,7 @@ per host.
 
 - **Code** — terminal workspace (tabs, drag-to-split panes, reconnect-safe via tmux); every
   pane is a shell or a coding agent
-- **Sessions** — create / edit / destroy dev containers on any host, from curated recipes
+- **Containers** — create / edit / destroy dev containers on any host, from curated recipes
   (node, dotnet, php-fpm+nginx, python, go, base) or any custom image
 - **Settings** — **hosts** (local Docker socket and/or Portainer endpoints), **agents**
   (five built in, plus your own), images and account; everything is configured in the app,
@@ -44,11 +44,11 @@ volumes:
    Portainer credential (URL + API key) whose endpoints you import. The seed only applies
    while `/data` holds no host — after that the app is the source of truth.
 3. **Settings → Agents**: pick the agents this host should have. **Sync tools** installs them
-   (minutes on the first run, outbound HTTPS from the Docker host) — or just create a session
-   and let it run: an unsynced host and an unbuilt recipe image are prepared automatically,
-   with the progress on the session row.
-4. Create a session, open a terminal, run your agent and log in once — every other session on
-   that host is now authenticated too.
+   (minutes on the first run, outbound HTTPS from the Docker host) — or just create a
+   container and let it run: an unsynced host and an unbuilt recipe image are prepared
+   automatically, with the progress on the container row.
+4. Create a container, open a session, run your agent and log in once — every other container
+   on that host is now authenticated too.
 
 The app runs as a non-root uid (10001), hence `group_add` for the socket; Portainer hosts
 need no socket. Full operator documentation: [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)
@@ -58,9 +58,9 @@ need no socket. Full operator documentation: [docs/DEPLOYMENT.md](docs/DEPLOYMEN
 
 | Path | What |
 |---|---|
-| `server/` | Node 22 + TypeScript API: **Express 5** + `ws`, WebSocket terminal bridge, host manager (Portainer via fetch / socket via dockerode), agent registry, config store |
+| `server/` | Node 22 + TypeScript API: **Express 5** + `ws`, WebSocket session bridge, host manager (Portainer via fetch / socket via dockerode), agent registry, config store |
 | `web/` | Static UI, **no bundler**: Bootstrap 5 + jQuery, native ES modules, GoldenLayout 2 panes, xterm.js 5 terminals (vendor assets served from `node_modules`) |
-| `docker/` | `Dockerfile` for the app image, `recipes/` for the dev images, `tools/` for the agent delivery (installs the enabled agents into a host's tools volume, plus the session entrypoint) |
+| `docker/` | `Dockerfile` for the app image, `recipes/` for the dev images, `tools/` for the agent delivery (installs the enabled agents into a host's tools volume, plus the container entrypoint) |
 | `deploy/` | reference deployment: `deploy.sh` builds the image through Portainer and creates/updates the stack (secrets gitignored) |
 | `.github/workflows/` | CI (typecheck, lint, test, shell/python, agent-installer contract, compose, image build) and multi-arch release to ghcr.io |
 | `docs/` | [DEPLOYMENT.md](docs/DEPLOYMENT.md), [AGENTS.md](docs/AGENTS.md) + the design docs the implementation follows |

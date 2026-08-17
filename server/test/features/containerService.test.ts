@@ -1,22 +1,23 @@
-// OWNER: B2. SessionService against stubbed DockerBackends (no docker host). v0.2: the
+// OWNER: B2. ContainerService against stubbed DockerBackends (no docker host). v0.2: the
 // service is host- and agent-aware, so the expectations below describe the per-agent auth
 // volumes, the porterclaude.host/agents labels and the multi-host list.
 import { describe, expect, it, vi } from 'vitest';
 import { AppError, DockerApiError } from '../../src/http/errors.js';
-import { CONTAINER_LABELS, SessionConfigSchema, SessionInputSchema } from '../../src/containers/model.js';
+import { CONTAINER_LABELS, ContainerConfigSchema, ContainerInputSchema } from '../../src/containers/model.js';
 import type { ContainerInspect } from '../../src/backends/types.js';
 import { buildContainerSpec } from '../../src/containers/container.js';
-import { SessionService } from '../../src/containers/service.js';
+import { ContainerService } from '../../src/containers/service.js';
 import { BUILTIN_AGENTS } from '../../src/agents/builtin.js';
 import {
+  containerConfig,
+  containerInput,
   containerSummary,
   generalConfig,
   hostConfig,
   imageInspect,
+  legacyContainerSummary,
   otherHostConfig,
   serviceDeps,
-  sessionConfig,
-  sessionInput,
   stubAgentRegistry,
   stubBackend,
   stubHostManager,
@@ -29,14 +30,14 @@ import {
 const claudeAgent = BUILTIN_AGENTS.filter((a) => a.id === 'claude');
 
 function makeService(opts: {
-  sessions?: ReturnType<typeof sessionConfig>[];
+  containers?: ReturnType<typeof containerConfig>[];
   backend?: ReturnType<typeof stubBackend> | null;
   host?: ReturnType<typeof hostConfig>;
 } = {}) {
-  const cfg = stubConfigStore(opts.sessions ?? []);
+  const cfg = stubConfigStore(opts.containers ?? []);
   const sb = opts.backend === undefined ? stubBackend() : opts.backend;
   const hosts = stubHostManager(sb ? sb.backend : null, opts.host ? { host: opts.host } : {});
-  const service = new SessionService(serviceDeps({ config: cfg.store, hosts }));
+  const service = new ContainerService(serviceDeps({ config: cfg.store, hosts }));
   return { service, cfg, sb };
 }
 
@@ -65,21 +66,21 @@ describe('the workspace hostPath rule (INT-03)', () => {
   it('rejects .. segments on the way in but still loads an already stored one', () => {
     const bad = { type: 'bind', hostPath: '../../../etc' };
     expect(
-      SessionInputSchema.safeParse({ name: 'web', image: { type: 'recipe', recipe: 'node' }, workspace: bad })
+      ContainerInputSchema.safeParse({ name: 'web', image: { type: 'recipe', recipe: 'node' }, workspace: bad })
         .success,
     ).toBe(false);
     expect(
-      SessionConfigSchema.safeParse({ ...sessionConfig({ name: 'web' }), workspace: bad }).success,
+      ContainerConfigSchema.safeParse({ ...containerConfig({ name: 'web' }), workspace: bad }).success,
     ).toBe(true);
   });
 });
 
-describe('SessionService.create', () => {
+describe('ContainerService.create', () => {
   it('creates volumes, then the container, then starts it, and persists only afterwards', async () => {
     const { service, cfg, sb } = makeService();
     sb!.images.set('porterclaude/node:latest', imageInspect());
 
-    const view = await service.create(sessionInput({ name: 'web' }));
+    const view = await service.create(containerInput({ name: 'web' }));
 
     const order = sb!.calls.filter((c) =>
       ['createVolume', 'createContainer', 'startContainer'].includes(c),
@@ -103,8 +104,8 @@ describe('SessionService.create', () => {
     expect(spec.labels?.[CONTAINER_LABELS.agents]).toBe('claude');
     expect(spec.env?.PORTERCLAUDE_HOST).toBe('default');
 
-    expect(cfg.sessions.get('web')).toBeTruthy();
-    expect(cfg.sessions.get('web')?.specHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(cfg.containers.get('web')).toBeTruthy();
+    expect(cfg.containers.get('web')?.specHash).toMatch(/^[0-9a-f]{64}$/);
     expect(view.name).toBe('web');
   });
 
@@ -116,7 +117,7 @@ describe('SessionService.create', () => {
     const { service, sb } = makeService();
     sb!.images.set('porterclaude/node:latest', imageInspect({ cmd: php }));
 
-    await service.create(sessionInput({ name: 'web' }));
+    await service.create(containerInput({ name: 'web' }));
 
     const spec = sb!.log.find((c) => c.method === 'createContainer')!.args[0] as {
       cmd?: string[];
@@ -126,11 +127,11 @@ describe('SessionService.create', () => {
     expect(spec.cmd).toEqual(php);
   });
 
-  it('idles a session whose image declares no CMD', async () => {
+  it('idles a container whose image declares no CMD', async () => {
     const { service, sb } = makeService();
     sb!.images.set('porterclaude/node:latest', imageInspect());
 
-    await service.create(sessionInput({ name: 'web' }));
+    await service.create(containerInput({ name: 'web' }));
 
     const spec = sb!.log.find((c) => c.method === 'createContainer')!.args[0] as { cmd?: string[] };
     expect(spec.cmd).toEqual(['sleep', 'infinity']);
@@ -139,33 +140,33 @@ describe('SessionService.create', () => {
   it('does not persist and rolls the container back when the config write fails', async () => {
     const { service, cfg, sb } = makeService();
     sb!.images.set('porterclaude/node:latest', imageInspect());
-    (cfg.store as unknown as { putSession: () => Promise<never> }).putSession = () => {
+    (cfg.store as unknown as { putContainer: () => Promise<never> }).putContainer = () => {
       throw new Error('disk full');
     };
 
-    await expect(service.create(sessionInput({ name: 'web' }))).rejects.toThrow('disk full');
+    await expect(service.create(containerInput({ name: 'web' }))).rejects.toThrow('disk full');
     expect(sb!.calls).toContain('removeContainer');
-    expect(cfg.sessions.has('web')).toBe(false);
-    // BE-9: the volume created for that session goes with it
+    expect(cfg.containers.has('web')).toBe(false);
+    // BE-9: the volume created for that container goes with it
     expect(sb!.log.filter((c) => c.method === 'removeVolume').map((c) => c.args[0])).toEqual([
       'porterclaude-ws-web',
     ]);
   });
 
   it('refuses a duplicate name (stored config)', async () => {
-    const { service } = makeService({ sessions: [sessionConfig({ name: 'web' })] });
-    await expect(service.create(sessionInput({ name: 'web' }))).rejects.toMatchObject({ code: 'conflict' });
+    const { service } = makeService({ containers: [containerConfig({ name: 'web' })] });
+    await expect(service.create(containerInput({ name: 'web' }))).rejects.toMatchObject({ code: 'conflict' });
   });
 
   it('refuses a duplicate name (existing container)', async () => {
     const { service, sb } = makeService();
     sb!.containers.push(containerSummary());
-    await expect(service.create(sessionInput({ name: 'web' }))).rejects.toMatchObject({ code: 'conflict' });
+    await expect(service.create(containerInput({ name: 'web' }))).rejects.toMatchObject({ code: 'conflict' });
   });
 
   it('reports a clear conflict when the recipe image is not built', async () => {
     const { service } = makeService();
-    await expect(service.create(sessionInput({ name: 'web' }))).rejects.toMatchObject({
+    await expect(service.create(containerInput({ name: 'web' }))).rejects.toMatchObject({
       code: 'conflict',
       message: expect.stringContaining('not built'),
     });
@@ -173,14 +174,14 @@ describe('SessionService.create', () => {
 
   it('pulls a custom image that is missing locally', async () => {
     const { service, sb } = makeService();
-    await service.create(sessionInput({ name: 'web', image: { type: 'custom', ref: 'nginx:1.27' } }));
+    await service.create(containerInput({ name: 'web', image: { type: 'custom', ref: 'nginx:1.27' } }));
     expect(sb!.calls).toContain('pullImage');
   });
 
   // BE-9: a failed create must not leave porterclaude-ws-<slug> behind
-  it('creates no session volume when the image cannot be resolved', async () => {
+  it('creates no workspace volume when the image cannot be resolved', async () => {
     const { service, sb } = makeService();
-    await expect(service.create(sessionInput({ name: 'web' }))).rejects.toMatchObject({ code: 'conflict' });
+    await expect(service.create(containerInput({ name: 'web' }))).rejects.toMatchObject({ code: 'conflict' });
     const created = sb!.log
       .filter((c) => c.method === 'createVolume')
       .map((c) => (c.args[0] as { name: string }).name);
@@ -198,7 +199,7 @@ describe('SessionService.create', () => {
     sb.images.set('porterclaude/node:latest', imageInspect());
 
     await expect(
-      service.create(sessionInput({ name: 'web', shareHistory: false })),
+      service.create(containerInput({ name: 'web', shareHistory: false })),
     ).rejects.toThrow('invalid container name');
 
     const removed = sb.log.filter((c) => c.method === 'removeVolume').map((c) => c.args[0]);
@@ -215,19 +216,19 @@ describe('SessionService.create', () => {
     sb.images.set('porterclaude/node:latest', imageInspect());
     sb.volumes.push({ name: 'porterclaude-ws-web', driver: 'local', labels: {} });
 
-    await expect(service.create(sessionInput({ name: 'web' }))).rejects.toThrow('boom');
+    await expect(service.create(containerInput({ name: 'web' }))).rejects.toThrow('boom');
     expect(sb.calls).not.toContain('removeVolume');
   });
 });
 
-describe('SessionService.update / recreate', () => {
+describe('ContainerService.update / recreate', () => {
   it('stops, removes and recreates the container without removing volumes', async () => {
-    const stored = sessionConfig({ name: 'web' });
-    const { service, sb } = makeService({ sessions: [stored] });
+    const stored = containerConfig({ name: 'web' });
+    const { service, sb } = makeService({ containers: [stored] });
     sb!.images.set('porterclaude/node:latest', imageInspect());
     sb!.containers.push(containerSummary());
 
-    await service.update('web', sessionInput({ name: 'web', env: { FOO: 'bar' } }));
+    await service.update('web', containerInput({ name: 'web', env: { FOO: 'bar' } }));
 
     expect(sb!.calls).toContain('stopContainer');
     expect(sb!.calls).toContain('removeContainer');
@@ -237,38 +238,38 @@ describe('SessionService.update / recreate', () => {
     expect(sb!.calls).not.toContain('removeVolume');
   });
 
-  it('rejects a renamed session', async () => {
-    const { service } = makeService({ sessions: [sessionConfig({ name: 'web' })] });
-    await expect(service.update('web', sessionInput({ name: 'other' }))).rejects.toBeInstanceOf(AppError);
+  it('rejects a renamed container', async () => {
+    const { service } = makeService({ containers: [containerConfig({ name: 'web' })] });
+    await expect(service.update('web', containerInput({ name: 'other' }))).rejects.toBeInstanceOf(AppError);
   });
 
   it('recreate keeps the stored config', async () => {
-    const stored = sessionConfig({ name: 'web', env: { KEEP: '1' } });
-    const { service, cfg, sb } = makeService({ sessions: [stored] });
+    const stored = containerConfig({ name: 'web', env: { KEEP: '1' } });
+    const { service, cfg, sb } = makeService({ containers: [stored] });
     sb!.images.set('porterclaude/node:latest', imageInspect());
     await service.recreate('web');
-    expect(cfg.sessions.get('web')?.env).toEqual({ KEEP: '1' });
+    expect(cfg.containers.get('web')?.env).toEqual({ KEEP: '1' });
   });
 });
 
-describe('SessionService.remove', () => {
-  it('never removes an auth volume and only drops the session volumes on request', async () => {
-    const { service, cfg, sb } = makeService({ sessions: [sessionConfig({ name: 'web' })] });
+describe('ContainerService.remove', () => {
+  it('never removes an auth volume and only drops the container volumes on request', async () => {
+    const { service, cfg, sb } = makeService({ containers: [containerConfig({ name: 'web' })] });
     sb!.containers.push(containerSummary());
 
     await service.remove('web', { removeVolumes: true });
 
     const removed = sb!.log.filter((c) => c.method === 'removeVolume').map((c) => c.args[0]);
     expect(removed).toEqual(['porterclaude-ws-web', 'porterclaude-hist-web']);
-    // deleting an auth volume would drop the login of EVERY session on the host
+    // deleting an auth volume would drop the login of EVERY container on the host
     expect(removed).not.toContain('porterclaude-auth-claude');
     expect(removed).not.toContain('porterclaude-tools');
-    expect(cfg.sessions.has('web')).toBe(false);
+    expect(cfg.containers.has('web')).toBe(false);
   });
 
   it('removes one history volume per agent that declares a historyPath', async () => {
     const host = hostConfig({ agents: { enabled: ['claude', 'codex', 'opencode'] } });
-    const { service, sb } = makeService({ sessions: [sessionConfig({ name: 'web' })], host });
+    const { service, sb } = makeService({ containers: [containerConfig({ name: 'web' })], host });
     sb!.containers.push(containerSummary());
 
     await service.remove('web', { removeVolumes: true });
@@ -279,21 +280,21 @@ describe('SessionService.remove', () => {
   });
 
   it('keeps the volumes by default', async () => {
-    const { service, sb } = makeService({ sessions: [sessionConfig({ name: 'web' })] });
+    const { service, sb } = makeService({ containers: [containerConfig({ name: 'web' })] });
     sb!.containers.push(containerSummary());
     await service.remove('web');
     expect(sb!.calls).not.toContain('removeVolume');
   });
 
-  it('404s for an unknown session', async () => {
+  it('404s for an unknown container', async () => {
     const { service } = makeService();
     await expect(service.remove('nope')).rejects.toMatchObject({ code: 'not_found' });
   });
 });
 
-describe('SessionService.list', () => {
+describe('ContainerService.list', () => {
   it('merges stored configs with live containers', async () => {
-    const { service, sb } = makeService({ sessions: [sessionConfig({ name: 'web' })] });
+    const { service, sb } = makeService({ containers: [containerConfig({ name: 'web' })] });
     sb!.containers.push(containerSummary());
     const [view] = await service.list();
     expect(view?.status).toBe('running');
@@ -305,7 +306,7 @@ describe('SessionService.list', () => {
 
   it('adopts managed containers with no stored config as orphans', async () => {
     const { service, sb } = makeService();
-    sb!.containers.push(containerSummary({ labels: { ...containerSummary().labels, 'porterclaude.session': 'ghost' } }));
+    sb!.containers.push(containerSummary({ labels: { ...containerSummary().labels, 'porterclaude.container': 'ghost' } }));
     const views = await service.list();
     expect(views).toHaveLength(1);
     expect(views[0]?.name).toBe('ghost');
@@ -313,8 +314,8 @@ describe('SessionService.list', () => {
   });
 
   it('flags needsRecreate when the container spec-hash differs', async () => {
-    const stored = sessionConfig({ name: 'web' });
-    const { service, sb } = makeService({ sessions: [stored] });
+    const stored = containerConfig({ name: 'web' });
+    const { service, sb } = makeService({ containers: [stored] });
     sb!.containers.push(
       containerSummary({
         labels: { ...containerSummary().labels, [CONTAINER_LABELS.specHash]: 'stale' },
@@ -325,16 +326,16 @@ describe('SessionService.list', () => {
   });
 
   it('does not flag needsRecreate when the hash matches', async () => {
-    const stored = sessionConfig({ name: 'web' });
+    const stored = containerConfig({ name: 'web' });
     const spec = buildContainerSpec({
       agents: claudeAgent,
-      session: stored,
+      container: stored,
       general: generalConfig(),
       resolvedImage: 'porterclaude/node:latest',
       imageType: 'recipe',
       instanceId: TEST_INSTANCE_ID,
     });
-    const { service, sb } = makeService({ sessions: [stored] });
+    const { service, sb } = makeService({ containers: [stored] });
     sb!.containers.push(
       containerSummary({
         labels: {
@@ -351,7 +352,7 @@ describe('SessionService.list', () => {
   // bare digest for it. The view must still name the recipe image and say "outdated".
   it('reports the stable image ref plus imageOutdated after a rebuild', async () => {
     const { service, sb } = makeService({
-      sessions: [sessionConfig({ name: 'web' })],
+      containers: [containerConfig({ name: 'web' })],
       backend: backendRunningImage('sha256:8d4d875a6431'),
     });
     sb!.containers.push(containerSummary({ image: 'sha256:8d4d875a6431', imageId: 'sha256:8d4d875a6431' }));
@@ -365,7 +366,7 @@ describe('SessionService.list', () => {
 
   it('does not flag imageOutdated while the container runs the current image', async () => {
     const { service, sb } = makeService({
-      sessions: [sessionConfig({ name: 'web' })],
+      containers: [containerConfig({ name: 'web' })],
       backend: backendRunningImage('sha256:current'),
     });
     sb!.containers.push(containerSummary({ imageId: 'sha256:current' }));
@@ -376,8 +377,8 @@ describe('SessionService.list', () => {
     expect(view?.resolvedImage).toBe('porterclaude/node:latest');
   });
 
-  it('never flags imageOutdated for a session with no container', async () => {
-    const { service, sb } = makeService({ sessions: [sessionConfig({ name: 'web' })] });
+  it('never flags imageOutdated for a definition with no container', async () => {
+    const { service, sb } = makeService({ containers: [containerConfig({ name: 'web' })] });
     sb!.images.set('porterclaude/node:latest', imageInspect({ id: 'sha256:rebuilt' }));
     const [view] = await service.list();
     expect(view?.status).toBe('absent');
@@ -387,9 +388,9 @@ describe('SessionService.list', () => {
 
   // INT-03: such a config can exist (it was accepted before the rule); listing must not
   // blow up because buildContainerSpec now refuses to mount it.
-  it('keeps listing a session whose stored hostPath escapes workspacesRoot', async () => {
-    const stored = { ...sessionConfig({ name: 'web' }), workspace: { type: 'bind' as const, hostPath: '../../etc' } };
-    const { service, sb } = makeService({ sessions: [stored] });
+  it('keeps listing a container whose stored hostPath escapes workspacesRoot', async () => {
+    const stored = { ...containerConfig({ name: 'web' }), workspace: { type: 'bind' as const, hostPath: '../../etc' } };
+    const { service, sb } = makeService({ containers: [stored] });
     sb!.containers.push(containerSummary());
 
     const [view] = await service.list();
@@ -404,7 +405,7 @@ describe('SessionService.list', () => {
         throw new DockerApiError('connect ECONNREFUSED', 502);
       },
     });
-    const { service } = makeService({ sessions: [sessionConfig({ name: 'web' })], backend: failing });
+    const { service } = makeService({ containers: [containerConfig({ name: 'web' })], backend: failing });
     const views = await service.list();
     expect(views).toHaveLength(1);
     expect(views[0]?.status).toBe('absent');
@@ -412,17 +413,17 @@ describe('SessionService.list', () => {
   });
 
   it('degrades when no backend is configured at all', async () => {
-    const { service } = makeService({ sessions: [sessionConfig({ name: 'web' })], backend: null });
+    const { service } = makeService({ containers: [containerConfig({ name: 'web' })], backend: null });
     const views = await service.list();
     expect(views[0]?.status).toBe('absent');
     expect(views[0]?.warnings.length).toBeGreaterThan(0);
   });
 });
 
-describe('SessionService.reconcile / requireRunningContainer', () => {
+describe('ContainerService.reconcile / requireRunningContainer', () => {
   it('reports known, running, orphans and missing', async () => {
     const { service, sb } = makeService({
-      sessions: [sessionConfig({ name: 'web' }), sessionConfig({ name: 'gone' })],
+      containers: [containerConfig({ name: 'web' }), containerConfig({ name: 'gone' })],
     });
     sb!.containers.push(containerSummary());
     sb!.containers.push(
@@ -431,21 +432,21 @@ describe('SessionService.reconcile / requireRunningContainer', () => {
         name: 'pc-ghost',
         names: ['pc-ghost'],
         state: 'exited',
-        labels: { 'porterclaude.managed': 'true', 'porterclaude.session': 'ghost' },
+        labels: { 'porterclaude.managed': 'true', 'porterclaude.container': 'ghost' },
       }),
     );
     const report = await service.reconcile();
     expect(report).toEqual({ known: 2, running: 1, orphans: ['ghost'], adopted: [], missing: ['gone'] });
   });
 
-  it('resolves a running container for the terminal layer', async () => {
-    const { service, sb } = makeService({ sessions: [sessionConfig({ name: 'web' })] });
+  it('resolves a running container for the session layer', async () => {
+    const { service, sb } = makeService({ containers: [containerConfig({ name: 'web' })] });
     sb!.containers.push(containerSummary());
     await expect(service.requireRunningContainer('web')).resolves.toMatchObject({ containerId: 'c1' });
   });
 
-  it('throws not_found for an unknown session and conflict for a stopped one', async () => {
-    const { service, sb } = makeService({ sessions: [sessionConfig({ name: 'web' })] });
+  it('throws not_found for an unknown container and conflict for a stopped one', async () => {
+    const { service, sb } = makeService({ containers: [containerConfig({ name: 'web' })] });
     await expect(service.requireRunningContainer('nope')).rejects.toMatchObject({ code: 'not_found' });
     await expect(service.requireRunningContainer('web')).rejects.toMatchObject({ code: 'conflict' });
 
@@ -454,9 +455,52 @@ describe('SessionService.reconcile / requireRunningContainer', () => {
   });
 });
 
-describe('SessionService.logs / stop / start', () => {
+// ---------------------------------------------------------------------------
+// v0.3: `porterclaude.session` -> `porterclaude.container`. Every container that exists on a
+// live engine today carries ONLY the old label, and discovery matches on it. Writing the new
+// one is not enough — all three read sites go through `containerLabelOf`, which falls back to
+// the legacy key. `legacyContainerSummary` is deliberately NOT named `<prefix><name>`, so
+// matchContainer's second fallback (match by derived name) cannot mask a missing read.
+// ---------------------------------------------------------------------------
+describe('ContainerService legacy porterclaude.session label (v0.2 containers)', () => {
+  it('matches a stored definition to its pre-v0.3 container instead of reporting it absent', async () => {
+    const { service, sb } = makeService({ containers: [containerConfig({ name: 'web' })] });
+    sb!.containers.push(legacyContainerSummary('web'));
+
+    const [view] = await service.list();
+    expect(view?.name).toBe('web');
+    expect(view?.status).toBe('running');
+    expect(view?.containerId).toBe('c-legacy-web');
+    expect(view?.orphan).toBe(false);
+  });
+
+  it('names an unstored pre-v0.3 container from the legacy label, not from its docker name', async () => {
+    const { service, sb } = makeService();
+    sb!.containers.push(legacyContainerSummary('web'));
+
+    const [view] = await service.list();
+    // the docker name is `renamed-web`: only the legacy label can produce `web`
+    expect(view?.name).toBe('web');
+    expect(view?.orphan).toBe(true);
+  });
+
+  it('reconciles and adopts a pre-v0.3 container under its label name', async () => {
+    const { service, cfg, sb } = makeService();
+    sb!.containers.push(legacyContainerSummary('web'));
+
+    expect((await service.reconcile()).orphans).toEqual(['web']);
+
+    const report = await service.reconcile({ adopt: true });
+    expect(report.adopted).toEqual(['web']);
+    expect([...cfg.containers.keys()]).toEqual(['web']);
+    // ...and the stored definition is no longer reported as missing on the next pass
+    expect((await service.reconcile()).missing).toEqual([]);
+  });
+});
+
+describe('ContainerService.logs / stop / start', () => {
   it('reads container logs', async () => {
-    const { service, sb } = makeService({ sessions: [sessionConfig({ name: 'web' })] });
+    const { service, sb } = makeService({ containers: [containerConfig({ name: 'web' })] });
     sb!.containers.push(containerSummary());
     await expect(service.logs('web', { tail: 10 })).resolves.toBe('log output');
     const call = sb!.log.find((c) => c.method === 'containerLogs');
@@ -464,7 +508,7 @@ describe('SessionService.logs / stop / start', () => {
   });
 
   it('stops a running container and starts a stopped one', async () => {
-    const { service, sb } = makeService({ sessions: [sessionConfig({ name: 'web' })] });
+    const { service, sb } = makeService({ containers: [containerConfig({ name: 'web' })] });
     sb!.containers.push(containerSummary());
     await service.stop('web');
     expect(sb!.calls).toContain('stopContainer');
@@ -475,24 +519,24 @@ describe('SessionService.logs / stop / start', () => {
   });
 });
 
-describe('SessionService private history (BE-2)', () => {
+describe('ContainerService private history (BE-2)', () => {
   const initMounts = (sb: ReturnType<typeof stubBackend>) =>
     sb.log
       .filter((c) => c.method === 'createContainer')
       .map((c) => c.args[0] as { name: string; mounts?: Array<{ source: string; target: string }> });
 
-  it('pre-creates the agent history dir with the auth volume ownership before the session container', async () => {
+  it('pre-creates the agent history dir with the auth volume ownership before the managed container', async () => {
     const { service, sb } = makeService();
     sb!.images.set('porterclaude/node:latest', imageInspect());
 
-    await service.create(sessionInput({ name: 'web', shareHistory: false }));
+    await service.create(containerInput({ name: 'web', shareHistory: false }));
 
     const created = initMounts(sb!);
     expect(created).toHaveLength(2);
     const init = created[0]!;
-    const session = created[1]!;
+    const container = created[1]!;
     expect(init.name).toMatch(/^porterclaude-histinit-/);
-    expect(session.name).toBe('pc-web');
+    expect(container.name).toBe('pc-web');
 
     // the AUTH volume is mounted at its REAL path so docker's empty-volume seeding keeps the
     // recipe's uid-1000 ownership; the history volume gets a scratch path
@@ -518,17 +562,17 @@ describe('SessionService private history (BE-2)', () => {
     // the directory that is created is the one INSIDE the auth volume, never the ~/ symlink
     expect(spec.cmd?.[0]).toContain('mkdir -p \'/home/dev/.porterclaude/agents/claude/claude/projects\'');
     expect(spec.cmd?.[0]).toContain("chown \"$own\"");
-    // must never look like a session to reconcile/list
+    // must never look like a managed container to reconcile/list
     expect(spec.labels?.['porterclaude.managed']).toBeUndefined();
 
     // and the helper container is cleaned up again
     expect(sb!.calls.filter((c) => c === 'removeContainer')).toHaveLength(1);
   });
 
-  it('does not run the volume-init container for shared-history sessions', async () => {
+  it('does not run the volume-init container for shared-history containers', async () => {
     const { service, sb } = makeService();
     sb!.images.set('porterclaude/node:latest', imageInspect());
-    await service.create(sessionInput({ name: 'web' }));
+    await service.create(containerInput({ name: 'web' }));
     expect(initMounts(sb!).map((c) => c.name)).toEqual(['pc-web']);
     expect(sb!.calls).not.toContain('waitContainer');
   });
@@ -538,14 +582,14 @@ describe('SessionService private history (BE-2)', () => {
     const { service } = makeService({ backend: sb });
     sb.images.set('porterclaude/node:latest', imageInspect());
 
-    const view = await service.create(sessionInput({ name: 'web', shareHistory: false }));
+    const view = await service.create(containerInput({ name: 'web', shareHistory: false }));
     expect(view.warnings.join(' ')).toContain('private history volume failed');
   });
 
   it('repairs the agent dirs, symlinks and history dir on every start (root exec)', async () => {
     const { service, sb } = makeService();
     sb!.images.set('porterclaude/node:latest', imageInspect());
-    await service.create(sessionInput({ name: 'web' }));
+    await service.create(containerInput({ name: 'web' }));
 
     const exec = sb!.log.find(
       (c) => c.method === 'runExec' && String((c.args[1] as string[])[2]).includes('.porterclaude/agents'),
@@ -585,7 +629,7 @@ describe('SessionService private history (BE-2)', () => {
     const cfg = stubConfigStore([]);
     const sb = stubBackend();
     sb.images.set('porterclaude/node:latest', imageInspect());
-    const service = new SessionService(
+    const service = new ContainerService(
       serviceDeps({
         config: cfg.store,
         hosts: stubHostManager(sb.backend, { host: hostConfig({ agents: { enabled: ['hostile'] } }) }),
@@ -593,7 +637,7 @@ describe('SessionService private history (BE-2)', () => {
       }),
     );
 
-    await service.create(sessionInput({ name: 'web' }));
+    await service.create(containerInput({ name: 'web' }));
     const script = sb.log
       .filter((c) => c.method === 'runExec')
       .map((c) => String((c.args[1] as string[])[2]))
@@ -603,7 +647,7 @@ describe('SessionService private history (BE-2)', () => {
   });
 });
 
-describe('SessionService orphan adoption (BE-5)', () => {
+describe('ContainerService orphan adoption (BE-5)', () => {
   const ghost = () =>
     containerSummary({
       id: 'c9',
@@ -612,7 +656,7 @@ describe('SessionService orphan adoption (BE-5)', () => {
       state: 'exited',
       labels: {
         'porterclaude.managed': 'true',
-        'porterclaude.session': 'ghost',
+        'porterclaude.container': 'ghost',
         'porterclaude.image-type': 'recipe',
         'porterclaude.recipe': 'node',
       },
@@ -625,7 +669,7 @@ describe('SessionService orphan adoption (BE-5)', () => {
 
     const view = await service.start('ghost');
     expect(sb!.calls).toContain('startContainer');
-    expect(cfg.sessions.has('ghost')).toBe(true);
+    expect(cfg.containers.has('ghost')).toBe(true);
     expect(view.orphan).toBe(false);
   });
 
@@ -635,7 +679,7 @@ describe('SessionService orphan adoption (BE-5)', () => {
     sb!.containers.push(ghost());
 
     await service.recreate('ghost');
-    expect(cfg.sessions.get('ghost')?.image).toEqual({ type: 'recipe', recipe: 'node' });
+    expect(cfg.containers.get('ghost')?.image).toEqual({ type: 'recipe', recipe: 'node' });
     expect(sb!.calls).toContain('removeContainer');
     expect(sb!.calls).toContain('createContainer');
   });
@@ -645,15 +689,15 @@ describe('SessionService orphan adoption (BE-5)', () => {
     sb!.images.set('porterclaude/node:latest', imageInspect());
     sb!.containers.push(ghost());
 
-    await service.update('ghost', sessionInput({ name: 'ghost', env: { FOO: 'bar' } }));
-    expect(cfg.sessions.get('ghost')?.env).toEqual({ FOO: 'bar' });
+    await service.update('ghost', containerInput({ name: 'ghost', env: { FOO: 'bar' } }));
+    expect(cfg.containers.get('ghost')?.env).toEqual({ FOO: 'bar' });
   });
 
   it('still 404s when neither a config nor a container exists', async () => {
     const { service } = makeService();
     await expect(service.start('nope')).rejects.toMatchObject({ code: 'not_found' });
     await expect(service.recreate('nope')).rejects.toMatchObject({ code: 'not_found' });
-    await expect(service.update('nope', sessionInput({ name: 'nope' }))).rejects.toMatchObject({
+    await expect(service.update('nope', containerInput({ name: 'nope' }))).rejects.toMatchObject({
       code: 'not_found',
     });
   });
@@ -665,7 +709,7 @@ describe('SessionService orphan adoption (BE-5)', () => {
     sb!.containers.push(ghost());
     const report = await service.reconcile();
     expect(report.orphans).toEqual(['ghost']);
-    expect(cfg.sessions.has('ghost')).toBe(false);
+    expect(cfg.containers.has('ghost')).toBe(false);
     const [view] = await service.list();
     expect(view?.orphan).toBe(true);
   });
@@ -678,7 +722,7 @@ describe('SessionService orphan adoption (BE-5)', () => {
     expect(report.adopted).toEqual(['ghost']);
     expect(report.orphans).toEqual([]);
     expect(report.known).toBe(1);
-    expect(cfg.sessions.has('ghost')).toBe(true);
+    expect(cfg.containers.has('ghost')).toBe(true);
     const [view] = await service.list();
     expect(view?.orphan).toBe(false);
     // a freshly adopted definition describes THAT container: no recreate nag
@@ -689,7 +733,7 @@ describe('SessionService orphan adoption (BE-5)', () => {
 // ---------------------------------------------------------------------------
 // BE-7: adoption must not lose ports/env/limits/mounts/network/restart policy
 // ---------------------------------------------------------------------------
-describe('SessionService orphan reconstruction (BE-7)', () => {
+describe('ContainerService orphan reconstruction (BE-7)', () => {
   const orphanContainer = () =>
     containerSummary({
       id: 'c9',
@@ -699,7 +743,7 @@ describe('SessionService orphan reconstruction (BE-7)', () => {
       state: 'running',
       labels: {
         'porterclaude.managed': 'true',
-        'porterclaude.session': 'qa-shared',
+        'porterclaude.container': 'qa-shared',
         'porterclaude.image-type': 'custom',
         // inherited from the IMAGE (docker merges image labels into the container's): a
         // custom ref that points at a recipe image carries it, and it must not win
@@ -762,7 +806,7 @@ describe('SessionService orphan reconstruction (BE-7)', () => {
     return made;
   }
 
-  it('keeps a custom session custom even when the IMAGE carries a porterclaude.recipe label', async () => {
+  it('keeps a custom container custom even when the IMAGE carries a porterclaude.recipe label', async () => {
     // docker merges the image labels into the container's, so a custom ref that happens to
     // be a recipe image reports porterclaude.recipe - the image-type label decides
     const { service } = makeOrphanService();
@@ -794,7 +838,7 @@ describe('SessionService orphan reconstruction (BE-7)', () => {
   it('persists the full definition when the orphan is adopted, so Recreate keeps the ports', async () => {
     const { service, cfg } = makeOrphanService();
     await service.start('qa-shared');
-    const stored = cfg.sessions.get('qa-shared');
+    const stored = cfg.containers.get('qa-shared');
     expect(stored?.ports).toEqual([{ containerPort: 3000, protocol: 'tcp', hostPort: 32774 }]);
     expect(stored?.env).toEqual({ FOO: 'bar' });
     expect(stored?.limits).toEqual({ cpus: 1.5, memoryMb: 512 });
@@ -826,7 +870,7 @@ describe('SessionService orphan reconstruction (BE-7)', () => {
 // ---------------------------------------------------------------------------
 // BE-6: non-root custom images need <containerHome> chowned from the outside
 // ---------------------------------------------------------------------------
-describe('SessionService custom-image bootstrap (BE-6)', () => {
+describe('ContainerService custom-image bootstrap (BE-6)', () => {
   function homeExecs(sb: ReturnType<typeof stubBackend>) {
     return sb.log.filter((c) => c.method === 'runExec');
   }
@@ -836,7 +880,7 @@ describe('SessionService custom-image bootstrap (BE-6)', () => {
     sb!.images.set('alpine:3.20', imageInspect({ tags: ['alpine:3.20'], env: ['PATH=/usr/bin:/bin'] }));
 
     await service.create(
-      sessionInput({ name: 'usr', image: { type: 'custom', ref: 'alpine:3.20' }, user: '1000:1000' }),
+      containerInput({ name: 'usr', image: { type: 'custom', ref: 'alpine:3.20' }, user: '1000:1000' }),
     );
 
     const chown = homeExecs(sb!).find((c) => String((c.args[1] as string[])[2]).includes('chown'));
@@ -848,7 +892,7 @@ describe('SessionService custom-image bootstrap (BE-6)', () => {
       String((c.args[1] as string[])[2]).includes('--porterclaude-bootstrap'),
     );
     expect(boot).toBeTruthy();
-    // runs as the session user (no user override), so the files land with the right owner
+    // runs as the container user (no user override), so the files land with the right owner
     expect((boot!.args[2] as { user?: string }).user).toBeUndefined();
 
     // and the container itself carries the tools PATH
@@ -863,7 +907,7 @@ describe('SessionService custom-image bootstrap (BE-6)', () => {
     sb!.images.set('alpine:3.20', imageInspect({ tags: ['alpine:3.20'], env: ['PATH=/usr/bin:/bin'] }));
 
     await service.create(
-      sessionInput({ name: 'usr', image: { type: 'custom', ref: 'alpine:3.20' }, user: '1000:1000' }),
+      containerInput({ name: 'usr', image: { type: 'custom', ref: 'alpine:3.20' }, user: '1000:1000' }),
     );
 
     const script = homeExecs(sb!)
@@ -883,7 +927,7 @@ describe('SessionService custom-image bootstrap (BE-6)', () => {
   });
 
   it('re-runs the bootstrap on restart, but never adopts an orphan doing so', async () => {
-    const stored = sessionConfig({
+    const stored = containerConfig({
       name: 'usr',
       image: { type: 'custom', ref: 'alpine:3.20' },
       user: '1000:1000',
@@ -893,10 +937,10 @@ describe('SessionService custom-image bootstrap (BE-6)', () => {
       name: 'pc-usr',
       names: ['pc-usr'],
       image: 'alpine:3.20',
-      labels: { 'porterclaude.managed': 'true', 'porterclaude.session': 'usr' },
+      labels: { 'porterclaude.managed': 'true', 'porterclaude.container': 'usr' },
     });
 
-    const withConfig = makeService({ sessions: [stored] });
+    const withConfig = makeService({ containers: [stored] });
     withConfig.sb!.containers.push(container);
     await withConfig.service.restart('usr');
     expect(withConfig.sb!.calls).toContain('restartContainer');
@@ -911,16 +955,16 @@ describe('SessionService custom-image bootstrap (BE-6)', () => {
     orphaned.sb!.containers.push(container);
     await orphaned.service.restart('usr');
     expect(orphaned.sb!.calls).toContain('restartContainer');
-    expect(orphaned.cfg.sessions.has('usr')).toBe(false);
+    expect(orphaned.cfg.containers.has('usr')).toBe(false);
   });
 
-  it('does not touch the home of a root custom image or of a recipe session', async () => {
+  it('does not touch the home of a root custom image or of a recipe container', async () => {
     const { service, sb } = makeService();
     sb!.images.set('alpine:3.20', imageInspect({ tags: ['alpine:3.20'] }));
     sb!.images.set('porterclaude/node:latest', imageInspect());
 
-    await service.create(sessionInput({ name: 'root-img', image: { type: 'custom', ref: 'alpine:3.20' } }));
-    await service.create(sessionInput({ name: 'web' }));
+    await service.create(containerInput({ name: 'root-img', image: { type: 'custom', ref: 'alpine:3.20' } }));
+    await service.create(containerInput({ name: 'web' }));
 
     const chowns = homeExecs(sb!).filter((c) =>
       String((c.args[1] as string[])[2]).includes('chmod u+rwx'),
@@ -931,16 +975,16 @@ describe('SessionService custom-image bootstrap (BE-6)', () => {
 
 
 // ---------------------------------------------------------------------------
-// v0.2: N hosts. Session NAMES stay globally unique, everything else is per host.
+// v0.2: N hosts. Container NAMES stay globally unique, everything else is per host.
 // ---------------------------------------------------------------------------
-describe('SessionService across hosts', () => {
+describe('ContainerService across hosts', () => {
   const EDGE = 'edge';
 
-  function makeHosts(opts: { edge?: ReturnType<typeof stubBackend> | null; sessions?: ReturnType<typeof sessionConfig>[] } = {}) {
+  function makeHosts(opts: { edge?: ReturnType<typeof stubBackend> | null; containers?: ReturnType<typeof containerConfig>[] } = {}) {
     const home = stubBackend();
     const edge = opts.edge === undefined ? stubBackend() : opts.edge;
     const cfg = stubConfigStore(
-      opts.sessions ?? [sessionConfig({ name: 'web' }), sessionConfig({ name: 'api', hostId: EDGE })],
+      opts.containers ?? [containerConfig({ name: 'web' }), containerConfig({ name: 'api', hostId: EDGE })],
     );
     const hosts = stubHosts([
       { host: hostConfig(), backend: home.backend },
@@ -951,7 +995,7 @@ describe('SessionService across hosts', () => {
         general: generalConfig({ volumePrefix: 'edge-' }),
       },
     ]);
-    const service = new SessionService(serviceDeps({ config: cfg.store, hosts }));
+    const service = new ContainerService(serviceDeps({ config: cfg.store, hosts }));
     home.images.set('porterclaude/node:latest', imageInspect());
     if (edge) edge.images.set('porterclaude/node:latest', imageInspect());
     return { service, cfg, home, edge };
@@ -964,13 +1008,13 @@ describe('SessionService across hosts', () => {
       names: ['pc-api'],
       labels: {
         'porterclaude.managed': 'true',
-        'porterclaude.session': 'api',
+        'porterclaude.container': 'api',
         'porterclaude.host': EDGE,
         'porterclaude.agents': 'claude,opencode',
       },
     });
 
-  it('lists the sessions of every host with their host name', async () => {
+  it('lists the containers of every host with their host name', async () => {
     const { service, home, edge } = makeHosts();
     home.containers.push(containerSummary());
     edge!.containers.push(edgeContainer());
@@ -1013,7 +1057,7 @@ describe('SessionService across hosts', () => {
         id: 'c-orph',
         name: 'pc-orph',
         names: ['pc-orph'],
-        labels: { 'porterclaude.managed': 'true', 'porterclaude.session': 'orph' },
+        labels: { 'porterclaude.managed': 'true', 'porterclaude.container': 'orph' },
       }),
     );
     const cfg = stubConfigStore([]);
@@ -1021,9 +1065,9 @@ describe('SessionService across hosts', () => {
       { host: hostConfig(), backend: engine.backend },
       { host: otherHostConfig(), backend: engine.backend },
     ]);
-    const service = new SessionService(serviceDeps({ config: cfg.store, hosts }));
+    const service = new ContainerService(serviceDeps({ config: cfg.store, hosts }));
 
-    // the orphan belongs to exactly ONE host - the default one (no stored session, same prefix)
+    // the orphan belongs to exactly ONE host - the default one (no stored definition, same prefix)
     expect((await service.list()).map((v) => [v.name, v.hostId])).toEqual([['orph', 'default']]);
     expect((await service.list({ hostId: 'default' })).map((v) => v.name)).toEqual(['orph']);
     expect(await service.list({ hostId: EDGE })).toEqual([]);
@@ -1031,14 +1075,14 @@ describe('SessionService across hosts', () => {
     // ...and a filtered reconcile of the OTHER host must not adopt it
     const report = await service.reconcile({ adopt: true, hostId: EDGE });
     expect(report.adopted).toEqual([]);
-    expect(cfg.store.getSession('orph')).toBeFalsy();
+    expect(cfg.store.getContainer('orph')).toBeFalsy();
 
     const own = await service.reconcile({ adopt: true, hostId: 'default' });
     expect(own.adopted).toEqual(['orph']);
-    expect(cfg.store.getSession('orph')?.hostId).toBe('default');
+    expect(cfg.store.getContainer('orph')?.hostId).toBe('default');
   });
 
-  it('degrades only the sessions of a failing host', async () => {
+  it('degrades only the containers of a failing host', async () => {
     const failing = stubBackend({
       listContainers: async () => {
         throw new DockerApiError('connect ECONNREFUSED', 502);
@@ -1057,24 +1101,24 @@ describe('SessionService across hosts', () => {
     expect(web?.warnings).toEqual([]);
   });
 
-  it('still deletes a session whose host is gone (nothing to talk to)', async () => {
-    const cfg = stubConfigStore([sessionConfig({ name: 'orphaned', hostId: 'deleted-host' })]);
+  it('still deletes a container whose host is gone (nothing to talk to)', async () => {
+    const cfg = stubConfigStore([containerConfig({ name: 'orphaned', hostId: 'deleted-host' })]);
     const sb = stubBackend();
     const hosts = stubHosts([{ host: hostConfig(), backend: sb.backend }]);
-    const service = new SessionService(serviceDeps({ config: cfg.store, hosts }));
+    const service = new ContainerService(serviceDeps({ config: cfg.store, hosts }));
 
     await service.remove('orphaned', { removeVolumes: true });
-    expect(cfg.sessions.has('orphaned')).toBe(false);
+    expect(cfg.containers.has('orphaned')).toBe(false);
     // ...and nothing was attempted on the surviving host
     expect(sb.calls).not.toContain('removeContainer');
     expect(sb.calls).not.toContain('removeVolume');
   });
 
-  it('marks a session whose host is gone as hostMissing and read-only', async () => {
-    const cfg = stubConfigStore([sessionConfig({ name: 'orphaned', hostId: 'deleted-host' })]);
+  it('marks a container whose host is gone as hostMissing and read-only', async () => {
+    const cfg = stubConfigStore([containerConfig({ name: 'orphaned', hostId: 'deleted-host' })]);
     const sb = stubBackend();
     const hosts = stubHosts([{ host: hostConfig(), backend: sb.backend }]);
-    const service = new SessionService(serviceDeps({ config: cfg.store, hosts }));
+    const service = new ContainerService(serviceDeps({ config: cfg.store, hosts }));
 
     const [view] = await service.list();
     expect(view).toMatchObject({
@@ -1089,9 +1133,9 @@ describe('SessionService across hosts', () => {
   });
 
   it('creates on the requested host, with that host s settings and backend', async () => {
-    const { service, home, edge } = makeHosts({ sessions: [] });
+    const { service, home, edge } = makeHosts({ containers: [] });
 
-    await service.create(sessionInput({ name: 'api', hostId: EDGE }));
+    await service.create(containerInput({ name: 'api', hostId: EDGE }));
 
     expect(edge!.calls).toContain('createContainer');
     expect(home.calls).not.toContain('createContainer');
@@ -1108,52 +1152,52 @@ describe('SessionService across hosts', () => {
   });
 
   it('creates on the DEFAULT host when the input omits one', async () => {
-    const { service, home, edge } = makeHosts({ sessions: [] });
-    await service.create(sessionInput({ name: 'api' }));
+    const { service, home, edge } = makeHosts({ containers: [] });
+    await service.create(containerInput({ name: 'api' }));
     expect(home.calls).toContain('createContainer');
     expect(edge!.calls).not.toContain('createContainer');
   });
 
-  // session names are unique ACROSS hosts - that is what lets the terminal websocket route
-  // session -> host with nothing but the name (api.md v0.2)
+  // container names are unique ACROSS hosts - that is what lets the session websocket route
+  // container -> host with nothing but the name (api.md v0.2)
   it('409s a name that is already used on ANOTHER host', async () => {
     const { service } = makeHosts();
-    await expect(service.create(sessionInput({ name: 'web', hostId: EDGE }))).rejects.toMatchObject({
+    await expect(service.create(containerInput({ name: 'web', hostId: EDGE }))).rejects.toMatchObject({
       code: 'conflict',
     });
   });
 
   it('409s a name taken by a container of the target host', async () => {
-    const { service, edge } = makeHosts({ sessions: [] });
+    const { service, edge } = makeHosts({ containers: [] });
     edge!.containers.push(edgeContainer());
-    await expect(service.create(sessionInput({ name: 'api', hostId: EDGE }))).rejects.toMatchObject({
+    await expect(service.create(containerInput({ name: 'api', hostId: EDGE }))).rejects.toMatchObject({
       code: 'conflict',
     });
   });
 
   it('404s an unknown host on create', async () => {
-    const { service } = makeHosts({ sessions: [] });
-    await expect(service.create(sessionInput({ name: 'api', hostId: 'nope' }))).rejects.toMatchObject({
+    const { service } = makeHosts({ containers: [] });
+    await expect(service.create(containerInput({ name: 'api', hostId: 'nope' }))).rejects.toMatchObject({
       code: 'not_found',
     });
   });
 
-  it('422s a PUT that moves the session to another host (the host is immutable)', async () => {
+  it('422s a PUT that moves the container to another host (the host is immutable)', async () => {
     const { service } = makeHosts();
     await expect(
-      service.update('web', sessionInput({ name: 'web', hostId: EDGE })),
+      service.update('web', containerInput({ name: 'web', hostId: EDGE })),
     ).rejects.toMatchObject({ code: 'validation_error' });
   });
 
   it('accepts a PUT that repeats the stored hostId', async () => {
     const { service, home } = makeHosts();
     home.containers.push(containerSummary());
-    await expect(service.update('web', sessionInput({ name: 'web', hostId: 'default' }))).resolves.toMatchObject({
+    await expect(service.update('web', containerInput({ name: 'web', hostId: 'default' }))).resolves.toMatchObject({
       hostId: 'default',
     });
   });
 
-  it('uses the session host for start/stop/logs, never the default one', async () => {
+  it('uses the container host for start/stop/logs, never the default one', async () => {
     const { service, home, edge } = makeHosts();
     edge!.containers.push(edgeContainer());
     await service.stop('api');
@@ -1164,7 +1208,7 @@ describe('SessionService across hosts', () => {
     expect(edge!.calls).toContain('containerLogs');
   });
 
-  it('requireRunningContainer answers the session host', async () => {
+  it('requireRunningContainer answers the container host', async () => {
     const { service, edge } = makeHosts();
     edge!.containers.push(edgeContainer());
     await expect(service.requireRunningContainer('api')).resolves.toMatchObject({
@@ -1183,7 +1227,7 @@ describe('SessionService across hosts', () => {
         name: 'pc-ghost',
         names: ['pc-ghost'],
         state: 'exited',
-        labels: { 'porterclaude.managed': 'true', 'porterclaude.session': 'ghost', 'porterclaude.host': EDGE },
+        labels: { 'porterclaude.managed': 'true', 'porterclaude.container': 'ghost', 'porterclaude.host': EDGE },
       }),
     );
 
@@ -1203,99 +1247,99 @@ describe('SessionService across hosts', () => {
     const { service, home } = makeHosts({ edge: failing });
     home.containers.push(containerSummary());
     const report = await service.reconcile();
-    // the dead host contributes nothing at all - not even its stored session as "missing"
+    // the dead host contributes nothing at all - not even its stored definition as "missing"
     expect(report).toMatchObject({ running: 1, orphans: [], missing: [] });
   });
 
   it('adopts an orphan with the host and agents from its labels', async () => {
-    const { service, cfg, edge } = makeHosts({ sessions: [] });
+    const { service, cfg, edge } = makeHosts({ containers: [] });
     edge!.containers.push(edgeContainer());
 
     const report = await service.reconcile({ adopt: true });
     expect(report.adopted).toEqual(['api']);
-    const stored = cfg.sessions.get('api');
+    const stored = cfg.containers.get('api');
     expect(stored?.hostId).toBe(EDGE);
     expect(stored?.agents).toEqual(['claude', 'opencode']);
   });
 
   it('falls back to the listing host when a v0.1 container carries no host label', async () => {
-    const { service, cfg, edge } = makeHosts({ sessions: [] });
+    const { service, cfg, edge } = makeHosts({ containers: [] });
     edge!.containers.push(
       containerSummary({
         id: 'c-old',
         name: 'pc-legacy',
         names: ['pc-legacy'],
-        labels: { 'porterclaude.managed': 'true', 'porterclaude.session': 'legacy' },
+        labels: { 'porterclaude.managed': 'true', 'porterclaude.container': 'legacy' },
       }),
     );
     await service.reconcile({ adopt: true });
-    const stored = cfg.sessions.get('legacy');
+    const stored = cfg.containers.get('legacy');
     expect(stored?.hostId).toBe(EDGE);
-    // no agents label: the session inherits whatever the host enables
+    // no agents label: the container inherits whatever the host enables
     expect(stored?.agents).toBeNull();
   });
 });
 
 // ---------------------------------------------------------------------------
-// v0.2: which agents a session mounts
+// v0.2: which agents a container mounts
 // ---------------------------------------------------------------------------
-describe('SessionService.resolveAgents', () => {
+describe('ContainerService.resolveAgents', () => {
   it('inherits the host set, honours an explicit list and drops unknown ids', async () => {
     const host = hostConfig({ agents: { enabled: ['claude', 'opencode'] } });
-    const { service } = makeService({ host, sessions: [] });
+    const { service } = makeService({ host, containers: [] });
 
-    expect(service.resolveAgents(sessionConfig({ name: 'a' })).map((a) => a.id)).toEqual([
+    expect(service.resolveAgents(containerConfig({ name: 'a' })).map((a) => a.id)).toEqual([
       'claude',
       'opencode',
     ]);
     expect(
-      service.resolveAgents(sessionConfig({ name: 'b', agents: ['opencode'] })).map((a) => a.id),
+      service.resolveAgents(containerConfig({ name: 'b', agents: ['opencode'] })).map((a) => a.id),
     ).toEqual(['opencode']);
     expect(
-      service.resolveAgents(sessionConfig({ name: 'c', agents: ['opencode', 'ghost'] })).map((a) => a.id),
+      service.resolveAgents(containerConfig({ name: 'c', agents: ['opencode', 'ghost'] })).map((a) => a.id),
     ).toEqual(['opencode']);
-    expect(service.resolveAgents(sessionConfig({ name: 'd', agents: [] }))).toEqual([]);
+    expect(service.resolveAgents(containerConfig({ name: 'd', agents: [] }))).toEqual([]);
   });
 
   // B-8: resolveAgents DROPS unknown ids, so a typo used to be stored and echoed back in
   // `agents` forever while nothing was ever mounted. PUT /api/hosts/:id/agents 422s the same
-  // input, so creating/updating a session must too.
+  // input, so creating/updating a container must too.
   it('422s an unknown agent id on create and update instead of silently dropping it', async () => {
     const { service, cfg, sb } = makeService();
     sb!.images.set('porterclaude/node:latest', imageInspect());
     await expect(
-      service.create(sessionInput({ name: 'web', agents: ['claude', 'nope'] })),
+      service.create(containerInput({ name: 'web', agents: ['claude', 'nope'] })),
     ).rejects.toMatchObject({ code: 'validation_error' });
-    expect(cfg.store.getSession('web')).toBeFalsy();
+    expect(cfg.store.getContainer('web')).toBeFalsy();
 
-    await service.create(sessionInput({ name: 'web', agents: ['claude'] }));
+    await service.create(containerInput({ name: 'web', agents: ['claude'] }));
     await expect(
-      service.update('web', sessionInput({ name: 'web', agents: ['ghost'] })),
+      service.update('web', containerInput({ name: 'web', agents: ['ghost'] })),
     ).rejects.toMatchObject({ code: 'validation_error' });
-    expect(cfg.store.getSession('web')?.agents).toEqual(['claude']);
+    expect(cfg.store.getContainer('web')?.agents).toEqual(['claude']);
 
     // null (inherit the host) and an empty list stay legal
-    await service.update('web', sessionInput({ name: 'web', agents: null }));
-    expect(cfg.store.getSession('web')?.agents).toBeNull();
+    await service.update('web', containerInput({ name: 'web', agents: null }));
+    expect(cfg.store.getContainer('web')?.agents).toBeNull();
   });
 
   it('sorts by id so the spec hash does not depend on the config order', async () => {
     const host = hostConfig({ agents: { enabled: ['opencode', 'claude'] } });
-    const { service } = makeService({ host, sessions: [] });
-    expect(service.resolveAgents(sessionConfig({ name: 'a' })).map((a) => a.id)).toEqual([
+    const { service } = makeService({ host, containers: [] });
+    expect(service.resolveAgents(containerConfig({ name: 'a' })).map((a) => a.id)).toEqual([
       'claude',
       'opencode',
     ]);
   });
 
   // B-2: resolvedAgents is "what the container really mounts" (api.md), so a host-level
-  // enable does NOT appear in it until the session is recreated - the terminal would refuse
+  // enable does NOT appear in it until the container is recreated - the session would refuse
   // that agent with 4410, and the UI must not offer a pane for it.
-  it('makes a session that mounts a new agent report needsRecreate without claiming it', async () => {
-    const stored = sessionConfig({ name: 'web' });
+  it('makes a container that mounts a new agent report needsRecreate without claiming it', async () => {
+    const stored = containerConfig({ name: 'web' });
     const spec = buildContainerSpec({
       agents: claudeAgent,
-      session: stored,
+      container: stored,
       general: generalConfig(),
       resolvedImage: 'porterclaude/node:latest',
       imageType: 'recipe',
@@ -1303,7 +1347,7 @@ describe('SessionService.resolveAgents', () => {
     });
     // the container was created with claude only; the host now also enables opencode
     const { service, sb } = makeService({
-      sessions: [stored],
+      containers: [stored],
       host: hostConfig({ agents: { enabled: ['claude', 'opencode'] } }),
     });
     sb!.containers.push(
@@ -1322,7 +1366,7 @@ describe('SessionService.resolveAgents', () => {
 
   it('falls back to the configured agents for a v0.1 container (no label, no env)', async () => {
     const { service, sb } = makeService({
-      sessions: [sessionConfig({ name: 'web' })],
+      containers: [containerConfig({ name: 'web' })],
       host: hostConfig({ agents: { enabled: ['claude', 'opencode'] } }),
     });
     sb!.containers.push(containerSummary());
@@ -1332,7 +1376,7 @@ describe('SessionService.resolveAgents', () => {
 
   it('requireRunningContainer reports the agents of the container, not of the config', async () => {
     const { service, sb } = makeService({
-      sessions: [sessionConfig({ name: 'web' })],
+      containers: [containerConfig({ name: 'web' })],
       host: hostConfig({ agents: { enabled: ['claude', 'opencode'] } }),
     });
     sb!.containers.push(
@@ -1351,16 +1395,16 @@ describe('SessionService.resolveAgents', () => {
 // INT2-2: a host whose tools volume was never synced can only produce
 // crash-looping containers (tini: exec <toolsMount>/entrypoint.sh failed)
 // ---------------------------------------------------------------------------
-describe('SessionService tools-volume gate (INT2-2) - fallback without a preparer', () => {
+describe('ContainerService tools-volume gate (INT2-2) - fallback without a preparer', () => {
   function toolsService(
     answer: 'ready' | 'unsynced' | 'unknown',
-    opts: { sessions?: ReturnType<typeof sessionConfig>[] } = {},
+    opts: { containers?: ReturnType<typeof containerConfig>[] } = {},
   ) {
-    const cfg = stubConfigStore(opts.sessions ?? []);
+    const cfg = stubConfigStore(opts.containers ?? []);
     const sb = stubBackend();
     sb.images.set('porterclaude/node:latest', imageInspect());
     const probes: Array<{ hostId: string; probeImage?: string }> = [];
-    const service = new SessionService(
+    const service = new ContainerService(
       serviceDeps({ config: cfg.store, hosts: stubHostManager(sb.backend) }),
       {
         toolsReadiness: async (hostId: string, o?: { probeImage?: string }) => {
@@ -1372,30 +1416,30 @@ describe('SessionService tools-volume gate (INT2-2) - fallback without a prepare
     return { service, sb, cfg, probes };
   }
 
-  it('refuses to create a session on a host whose tools volume was never synced', async () => {
+  it('refuses to create a container on a host whose tools volume was never synced', async () => {
     // v0.2.2: this is the FALLBACK path - a probe that can only answer readiness (no
     // ensureToolsSynced) cannot fix anything, so refusing is still the honest answer. The
     // real ImageService implements the preparer half; see the block below.
     const { service, sb, cfg, probes } = toolsService('unsynced');
 
-    await expect(service.create(sessionInput({ name: 'web' }))).rejects.toMatchObject({
+    await expect(service.create(containerInput({ name: 'web' }))).rejects.toMatchObject({
       code: 'conflict',
       details: { reason: 'tools_not_synced', hostId: 'default', toolsVolume: 'porterclaude-tools' },
     });
-    await expect(service.create(sessionInput({ name: 'web' }))).rejects.toThrow(/tools sync/i);
+    await expect(service.create(containerInput({ name: 'web' }))).rejects.toThrow(/tools sync/i);
 
     // nothing was created on the engine and nothing was stored: no empty tools volume, no
     // container that restarts forever, no 201 with warnings:[]
     expect(sb.calls).not.toContain('createContainer');
     expect(sb.calls).not.toContain('createVolume');
-    expect(cfg.sessions.size).toBe(0);
-    // the probe gets an image that provably exists on THAT engine (the session's own)
+    expect(cfg.containers.size).toBe(0);
+    // the probe gets an image that provably exists on THAT engine (the container's own)
     expect(probes[0]).toEqual({ hostId: 'default', probeImage: 'porterclaude/node:latest' });
   });
 
   it('creates as before when the probe cannot tell (unknown never blocks)', async () => {
     const { service, sb } = toolsService('unknown');
-    const view = await service.create(sessionInput({ name: 'web' }));
+    const view = await service.create(containerInput({ name: 'web' }));
     expect(view.name).toBe('web');
     expect(view.warnings).toEqual([]);
     expect(sb.calls).toContain('createContainer');
@@ -1404,11 +1448,11 @@ describe('SessionService tools-volume gate (INT2-2) - fallback without a prepare
   it('creates without a probe at all (the gate is optional)', async () => {
     const { service, sb } = makeService();
     sb!.images.set('porterclaude/node:latest', imageInspect());
-    await expect(service.create(sessionInput({ name: 'web' }))).resolves.toMatchObject({ name: 'web' });
+    await expect(service.create(containerInput({ name: 'web' }))).resolves.toMatchObject({ name: 'web' });
   });
 
   it('warns instead of refusing when an EXISTING container is started', async () => {
-    const { service, sb } = toolsService('unsynced', { sessions: [sessionConfig({ name: 'web' })] });
+    const { service, sb } = toolsService('unsynced', { containers: [containerConfig({ name: 'web' })] });
     sb.containers.push(containerSummary({ state: 'exited' }));
 
     const view = await service.start('web');
@@ -1418,7 +1462,7 @@ describe('SessionService tools-volume gate (INT2-2) - fallback without a prepare
   });
 
   it('says nothing when the volume is ready', async () => {
-    const { service, sb } = toolsService('ready', { sessions: [sessionConfig({ name: 'web' })] });
+    const { service, sb } = toolsService('ready', { containers: [containerConfig({ name: 'web' })] });
     sb.containers.push(containerSummary({ state: 'exited' }));
     expect((await service.start('web')).warnings).toEqual([]);
   });
@@ -1429,7 +1473,7 @@ describe('SessionService tools-volume gate (INT2-2) - fallback without a prepare
 // v0.2.2: "just do it" - a host that is not ready is PREPARED, not refused. The user
 // typed a form; losing it to send them to another screen is the bug being fixed here.
 // ---------------------------------------------------------------------------
-describe('SessionService preparation (v0.2.2)', () => {
+describe('ContainerService preparation (v0.2.2)', () => {
   type Job = { id: string; kind: string; target: string; status: string; error: string | null };
 
   /**
@@ -1442,10 +1486,10 @@ describe('SessionService preparation (v0.2.2)', () => {
       tools?: 'ready' | 'unsynced' | 'unknown';
       imageBuilt?: boolean;
       buildFails?: boolean;
-      sessions?: ReturnType<typeof sessionConfig>[];
+      containers?: ReturnType<typeof containerConfig>[];
     } = {},
   ) {
-    const cfg = stubConfigStore(opts.sessions ?? []);
+    const cfg = stubConfigStore(opts.containers ?? []);
     const sb = stubBackend();
     let toolsAnswer = opts.tools ?? 'unsynced';
     if (opts.imageBuilt !== false) sb.images.set('porterclaude/node:latest', imageInspect());
@@ -1465,7 +1509,7 @@ describe('SessionService preparation (v0.2.2)', () => {
       return job;
     };
 
-    const service = new SessionService(
+    const service = new ContainerService(
       serviceDeps({ config: cfg.store, hosts: stubHostManager(sb.backend) }),
       {
         toolsReadiness: async () => toolsAnswer,
@@ -1493,7 +1537,7 @@ describe('SessionService preparation (v0.2.2)', () => {
   it('stores the definition and syncs the tools volume instead of refusing the create', async () => {
     const { service, sb, cfg, started, release } = preparerService({ tools: 'unsynced' });
 
-    const view = await service.create(sessionInput({ name: 'web' }));
+    const view = await service.create(containerInput({ name: 'web' }));
 
     // the answer comes back immediately, and NOTHING the user typed is lost
     expect(view.preparing).toMatchObject({ phase: 'syncing-tools' });
@@ -1501,7 +1545,7 @@ describe('SessionService preparation (v0.2.2)', () => {
     expect(view.preparing?.jobs).toEqual([
       { id: 'job1', kind: 'tools-sync', target: 'porterclaude-tools' },
     ]);
-    expect(cfg.sessions.has('web')).toBe(true);
+    expect(cfg.containers.has('web')).toBe(true);
     expect(sb.calls).not.toContain('createContainer');
 
     release();
@@ -1514,7 +1558,7 @@ describe('SessionService preparation (v0.2.2)', () => {
   it('builds a recipe image that does not exist yet, then syncs, then creates', async () => {
     const { service, sb, started, release } = preparerService({ imageBuilt: false, tools: 'unsynced' });
 
-    const view = await service.create(sessionInput({ name: 'web' }));
+    const view = await service.create(containerInput({ name: 'web' }));
     expect(view.preparing).toMatchObject({ phase: 'building-image' });
     expect(view.preparing?.detail).toMatch(/building the 'node' image/);
 
@@ -1523,10 +1567,10 @@ describe('SessionService preparation (v0.2.2)', () => {
     expect(started).toEqual(['build:node', 'sync:porterclaude/node:latest']);
   });
 
-  it('keeps the session (with a warning) when the preparation fails, so Start can retry', async () => {
+  it('keeps the definition (with a warning) when the preparation fails, so Start can retry', async () => {
     const { service, sb, cfg, release } = preparerService({ imageBuilt: false, buildFails: true });
 
-    await service.create(sessionInput({ name: 'web' }));
+    await service.create(containerInput({ name: 'web' }));
     release();
     await vi.waitFor(async () => expect((await service.get('web')).warnings.length).toBe(1));
 
@@ -1535,13 +1579,13 @@ describe('SessionService preparation (v0.2.2)', () => {
     expect(view.status).toBe('absent');
     expect(view.warnings[0]).toMatch(/building the 'node' image failed: boom/);
     // the definition is still there - that is the whole point
-    expect(cfg.sessions.has('web')).toBe(true);
+    expect(cfg.containers.has('web')).toBe(true);
     expect(sb.calls).not.toContain('createContainer');
   });
 
   it('does not prepare at all when the host is already ready (still fully synchronous)', async () => {
     const { service, sb, started } = preparerService({ tools: 'ready' });
-    const view = await service.create(sessionInput({ name: 'web' }));
+    const view = await service.create(containerInput({ name: 'web' }));
     expect(view.preparing).toBeNull();
     expect(started).toEqual([]);
     expect(sb.calls).toContain('createContainer');
@@ -1550,7 +1594,7 @@ describe('SessionService preparation (v0.2.2)', () => {
   it('a second call while a preparation runs does not start a second build', async () => {
     const { service, started, release } = preparerService({ imageBuilt: false });
 
-    await service.create(sessionInput({ name: 'web' }));
+    await service.create(containerInput({ name: 'web' }));
     // both of these land while the first preparation is still waiting on the gate
     await service.start('web');
     await service.start('web');
@@ -1562,7 +1606,7 @@ describe('SessionService preparation (v0.2.2)', () => {
   it('start prepares an unsynced host instead of only warning about it', async () => {
     const { service, sb, release } = preparerService({
       tools: 'unsynced',
-      sessions: [sessionConfig({ name: 'web' })],
+      containers: [containerConfig({ name: 'web' })],
     });
     sb.containers.push(containerSummary({ state: 'exited' }));
 
@@ -1581,7 +1625,7 @@ describe('SessionService preparation (v0.2.2)', () => {
 // INT2-3: a `kind:file` shared path is a symlink into the auth volume, so the
 // source has to exist - a dangling link kills aider on every start
 // ---------------------------------------------------------------------------
-describe('SessionService file-kind agent paths (INT2-3)', () => {
+describe('ContainerService file-kind agent paths (INT2-3)', () => {
   function aiderScript(sb: ReturnType<typeof stubBackend>): string {
     return (
       sb.log
@@ -1595,14 +1639,14 @@ describe('SessionService file-kind agent paths (INT2-3)', () => {
     const cfg = stubConfigStore([]);
     const sb = stubBackend();
     sb.images.set('porterclaude/node:latest', imageInspect());
-    const service = new SessionService(
+    const service = new ContainerService(
       serviceDeps({
         config: cfg.store,
         hosts: stubHostManager(sb.backend, { host: hostConfig({ agents: { enabled: ['aider'] } }) }),
         agents: stubAgentRegistry(BUILTIN_AGENTS),
       }),
     );
-    await service.create(sessionInput({ name: 'web' }));
+    await service.create(containerInput({ name: 'web' }));
     return { sb, script: aiderScript(sb) };
   }
 
@@ -1638,14 +1682,14 @@ describe('SessionService file-kind agent paths (INT2-3)', () => {
     const cfg = stubConfigStore([]);
     const sb = stubBackend();
     sb.images.set('porterclaude/node:latest', imageInspect());
-    const service = new SessionService(
+    const service = new ContainerService(
       serviceDeps({
         config: cfg.store,
         hosts: stubHostManager(sb.backend, { host: hostConfig({ agents: { enabled: ['plain'] } }) }),
         agents: stubAgentRegistry([plain]),
       }),
     );
-    await service.create(sessionInput({ name: 'web' }));
+    await service.create(containerInput({ name: 'web' }));
     const script = aiderScript(sb);
     expect(script).toContain(`: > '/home/dev/.porterclaude/agents/plain/plainrc'`);
     expect(script).not.toContain("'{}'");
@@ -1665,7 +1709,7 @@ describe('SessionService file-kind agent paths (INT2-3)', () => {
 // QA R1-INT2-5 / R2-INT2-6: two PorterClaude INSTALLS on one engine. Every container this
 // install creates carries porterclaude.instance=<config.instanceId>; a container labelled
 // for another install must be invisible here (it was listed as an adoptable orphan, with a
-// terminal that opened into it), while an UNLABELLED container - a v0.1 / v0.2.0 container
+// session that opened into it), while an UNLABELLED container - a v0.1 / v0.2.0 container
 // of THIS install - must stay visible.
 // ---------------------------------------------------------------------------
 describe('cross-instance isolation on a shared engine', () => {
@@ -1676,7 +1720,7 @@ describe('cross-instance isolation on a shared engine', () => {
       names: ['qa-a1'],
       labels: {
         'porterclaude.managed': 'true',
-        'porterclaude.session': 'a1',
+        'porterclaude.container': 'a1',
         [CONTAINER_LABELS.instance]: 'pc-someone-else',
       },
     });
@@ -1686,7 +1730,7 @@ describe('cross-instance isolation on a shared engine', () => {
       id: 'c-legacy',
       name: 'pc-old',
       names: ['pc-old'],
-      labels: { 'porterclaude.managed': 'true', 'porterclaude.session': 'old' },
+      labels: { 'porterclaude.managed': 'true', 'porterclaude.container': 'old' },
     });
 
   const mine = () =>
@@ -1696,7 +1740,7 @@ describe('cross-instance isolation on a shared engine', () => {
       names: ['pc-ghost'],
       labels: {
         'porterclaude.managed': 'true',
-        'porterclaude.session': 'ghost',
+        'porterclaude.container': 'ghost',
         [CONTAINER_LABELS.instance]: TEST_INSTANCE_ID,
       },
     });
@@ -1705,7 +1749,7 @@ describe('cross-instance isolation on a shared engine', () => {
     const { service, sb } = makeService();
     sb!.images.set('porterclaude/node:latest', imageInspect());
 
-    await service.create(sessionInput({ name: 'web' }));
+    await service.create(containerInput({ name: 'web' }));
 
     const spec = sb!.log.find((c) => c.method === 'createContainer')!.args[0] as {
       labels?: Record<string, string>;
@@ -1735,10 +1779,10 @@ describe('cross-instance isolation on a shared engine', () => {
 
     const report = await service.reconcile({ adopt: true });
     expect(report).toMatchObject({ orphans: [], adopted: [], missing: [] });
-    expect([...cfg.sessions.keys()]).toEqual([]);
+    expect([...cfg.containers.keys()]).toEqual([]);
   });
 
-  it('does not resolve a foreign container by name (no terminal into it, no remove)', async () => {
+  it('does not resolve a foreign container by name (no session into it, no remove)', async () => {
     const { service, sb } = makeService();
     sb!.containers.push(foreign());
 
@@ -1747,7 +1791,7 @@ describe('cross-instance isolation on a shared engine', () => {
     expect(sb!.calls).not.toContain('removeContainer');
   });
 
-  it('still refuses to create a session whose NAME a foreign container occupies', async () => {
+  it('still refuses to create a container whose NAME a foreign container occupies', async () => {
     const { service, sb } = makeService();
     sb!.images.set('porterclaude/node:latest', imageInspect());
     sb!.containers.push(
@@ -1757,13 +1801,13 @@ describe('cross-instance isolation on a shared engine', () => {
         names: ['pc-web'],
         labels: {
           'porterclaude.managed': 'true',
-          'porterclaude.session': 'web',
+          'porterclaude.container': 'web',
           [CONTAINER_LABELS.instance]: 'pc-someone-else',
         },
       }),
     );
 
-    await expect(service.create(sessionInput({ name: 'web' }))).rejects.toMatchObject({
+    await expect(service.create(containerInput({ name: 'web' }))).rejects.toMatchObject({
       code: 'conflict',
     });
     expect(sb!.calls).not.toContain('createContainer');

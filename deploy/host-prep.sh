@@ -5,13 +5,13 @@
 #
 # It exists because the reference host needs things deploy.sh must never do behind the
 # operator's back:
-#   --clean   remove leftover QA session containers (porterclaude.managed=true, named
+#   --clean   remove leftover QA containers (porterclaude.managed=true, named
 #             pc-qa-* / pc-o1-*) together with their workspace/history volumes
 #   --prune   remove DANGLING images that carry porterclaude.* labels (every recipe rebuild
 #             and every tools sync leaves one behind: ~1-2 GB each; since v0.2 the app-image
 #             stages built by deploy.sh are labelled porterclaude.image=app and collected too)
 #   --vhost   write vhost.d/<portainer-host> and vhost.d/<app-host> for nginx-proxy so that
-#             long /docker/build streams and idle terminal WebSockets stop being cut at 60 s
+#             long /docker/build streams and idle session WebSockets stop being cut at 60 s
 #   --reload  HUP the nginx-proxy container so it picks the new vhost files up
 #
 # SECURITY RULES: identical to deploy.sh, implemented in deploy/lib/common.sh — the API key
@@ -44,7 +44,7 @@ actions (each is opt-in; without one the script does nothing):
   --prune     remove dangling images that carry a porterclaude.* label (recipe and tools
               builds, plus the app-image stages every deploy.sh run leaves behind)
   --vhost     write nginx-proxy vhost.d snippets for the Portainer host (long build streams)
-              and for the app host (idle terminal WebSockets)
+              and for the app host (idle session WebSockets)
   --reload    send SIGHUP to the nginx-proxy container so it reloads its configuration
   --all       all four, in that order
 
@@ -128,7 +128,7 @@ json_string() {
 }
 
 # ---------------------------------------------------------------------------------------
-# --clean : leftover QA session containers and their volumes
+# --clean : leftover QA containers and their volumes
 # ---------------------------------------------------------------------------------------
 clean_qa_containers() {
   log "--clean: containers labelled porterclaude.managed=true named ${QA_PREFIXES// /, }"
@@ -156,7 +156,7 @@ clean_qa_containers() {
     # Named workspace/history volumes are only reachable through the container spec, so they
     # have to be collected BEFORE the container disappears. The prefix list is deliberately
     # short: the per-agent auth volumes (porterclaude-auth-<agentId>) hold the LOGINS and are
-    # shared by every session on the host — they must never be removed with a QA container.
+    # shared by every container on the host — they must never be removed with a QA container.
     vols=""
     if api_get "$base/containers/$cid/json"; then
       vols="$(pyx mount-volumes --prefix porterclaude-ws- --prefix porterclaude-hist- \
@@ -227,7 +227,7 @@ prune_dangling_images() {
 # The Portainer vhost carries the long-stream settings — they cover the app-image build, the
 # recipe/tools image builds and the tools-sync container's log stream (a first sync downloads
 # the host's coding agents and runs for minutes). The app vhost only needs the two timeouts
-# (terminals are idle WebSockets — buffering stays on for ordinary app traffic).
+# (sessions are idle WebSockets — buffering stays on for ordinary app traffic).
 portainer_vhost_body() {
   cat <<'CONF'
 # PorterClaude (deploy/host-prep.sh --vhost): Portainer proxies long-running docker streams
@@ -243,7 +243,7 @@ CONF
 
 app_vhost_body() {
   cat <<'CONF'
-# PorterClaude (deploy/host-prep.sh --vhost): terminal WebSockets sit idle between keystrokes
+# PorterClaude (deploy/host-prep.sh --vhost): session WebSockets sit idle between keystrokes
 # and nginx's default proxy_read_timeout (60s) would drop them.
 proxy_read_timeout 3600s;
 proxy_send_timeout 3600s;

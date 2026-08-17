@@ -3,8 +3,8 @@
 // changing a signature is a cross-package change (docs/design/frontend.md section 12).
 //
 // v0.2: every Docker-facing call is HOST SCOPED (`/api/hosts/:hostId/...`); the old
-// `/api/settings/backend*` endpoints are gone. Sessions stay flat - a session name is unique
-// across hosts, which is also what lets the terminal websocket route session -> host.
+// `/api/settings/backend*` endpoints are gone. Containers stay flat - a container name is
+// unique across hosts, which is also what lets the session websocket route container -> host.
 // Every path/shape comes from docs/design/api.md (authoritative).
 import { bus, EVENTS } from './bus.js';
 
@@ -60,7 +60,7 @@ function buildUrl(path, query) {
 }
 
 /**
- * Paths whose 401 means "wrong credentials in this form", not "session expired".
+ * Paths whose 401 means "wrong credentials in this form", not "the login expired".
  * A 401 from these must never tear the UI down into the login modal.
  */
 const CREDENTIAL_CHECK_PATHS = ['/auth/', '/settings/password'];
@@ -99,15 +99,15 @@ function errorFromXhr(jqXHR, textStatus) {
 /**
  * The single HTTP entry point. Everything else delegates here.
  *
- * Same-origin, so the `pc_session` cookie rides along automatically (no CORS options).
+ * Same-origin, so the `pc_auth` cookie rides along automatically (no CORS options).
  * Resolves with the parsed JSON body, or `null` for 204/empty responses; rejects with an
  * ApiError. A 401 emits `auth:required` once before rejecting, except on endpoints where
- * 401 means "the credentials you just typed are wrong" rather than "your session is gone":
+ * 401 means "the credentials you just typed are wrong" rather than "your login is gone":
  * `/auth/*`, `/settings/password` (api.md: 401 = wrong currentPassword, the caller's own
  * cookie stays valid and is refreshed on success), and any call passing `noAuthEvent`.
  *
  * @param {'GET'|'POST'|'PUT'|'DELETE'} method
- * @param {string} path path under /api, e.g. '/sessions/web/start'
+ * @param {string} path path under /api, e.g. '/containers/web/start'
  * @param {{ body?: unknown, query?: Record<string, unknown>, timeoutMs?: number,
  *           noAuthEvent?: boolean }} [opts]
  * @returns {Promise<any>}
@@ -161,7 +161,7 @@ export const api = {
   health: () => get('/health'),
   auth: {
     /** @returns {Promise<{authenticated:boolean, needsSetup:boolean}>} */
-    session: () => get('/auth/session'),
+    me: () => get('/auth/me'),
     /** @returns {Promise<{authenticated:boolean}>} */
     login: (password) => post('/auth/login', { password }),
     logout: () => post('/auth/logout', {}),
@@ -176,7 +176,7 @@ export const api = {
     /** @param {{layout?:unknown, theme?:'auto'|'light'|'dark'}} ui */
     putUi: (ui) => put('/settings/ui', ui),
     changePassword: (currentPassword, newPassword) =>
-      // noAuthEvent: a 401 here means the typed currentPassword was wrong; the session cookie
+      // noAuthEvent: a 401 here means the typed currentPassword was wrong; the auth cookie
       // is untouched, so this must not trigger the global re-login flow.
       request('POST', '/settings/password', {
         body: { currentPassword, newPassword },
@@ -196,7 +196,7 @@ export const api = {
     create: (input) => post('/hosts', input),
     /** @param {any} input HostUpdateInput (partial; `id` is immutable) */
     update: (hostId, input) => put(hostPath(hostId), input),
-    /** @param {{force?:boolean}} [opts] force=1 deletes a host that still has sessions */
+    /** @param {{force?:boolean}} [opts] force=1 deletes a host that still has containers */
     remove: (hostId, opts = {}) => del(hostPath(hostId), { force: opts.force ? 1 : undefined }),
     /** Probe UNSAVED form values. @param {any} connection @param {string} [apiKey]
      *  @returns {Promise<{ok:boolean, info?:any, endpoints?:any[], error?:{code:string,message:string}}>} */
@@ -244,7 +244,7 @@ export const api = {
     /** @param {any} definition AgentDefinition (custom only) */
     create: (definition) => post('/agents', definition),
     update: (id, definition) => put(`/agents/${enc(id)}`, definition),
-    /** @param {{force?:boolean}} [opts] force=1 also strips it from hosts/sessions */
+    /** @param {{force?:boolean}} [opts] force=1 also strips it from hosts/containers */
     remove: (id, opts = {}) => del(`/agents/${enc(id)}`, { force: opts.force ? 1 : undefined }),
   },
 
@@ -280,29 +280,29 @@ export const api = {
     pull: (hostId, image) => post(hostPath(hostId, '/images/pull'), { image }),
   },
 
-  // ---- sessions (FLAT: names are unique across hosts) --------------------
-  sessions: {
+  // ---- containers (FLAT: names are unique across hosts) ------------------
+  containers: {
     /** @param {{hostId?:string}} [opts] optional server-side filter
-     *  @returns {Promise<{sessions: any[]}>} SessionView[] (with hostId/hostName/resolvedAgents) */
-    list: (opts = {}) => get('/sessions', { hostId: opts.hostId }),
-    get: (name) => get(`/sessions/${enc(name)}`),
-    /** @param {any} input SessionInput (+ `hostId` on create, `agents`) */
-    create: (input) => post('/sessions', input),
+     *  @returns {Promise<{containers: any[]}>} ContainerView[] (with hostId/hostName/resolvedAgents) */
+    list: (opts = {}) => get('/containers', { hostId: opts.hostId }),
+    get: (name) => get(`/containers/${enc(name)}`),
+    /** @param {any} input ContainerInput (+ `hostId` on create, `agents`) */
+    create: (input) => post('/containers', input),
     /** `hostId` must not change - the server answers 422 */
-    update: (name, input) => put(`/sessions/${enc(name)}`, input),
+    update: (name, input) => put(`/containers/${enc(name)}`, input),
     /** @param {{removeVolumes?:boolean}} [opts] never removes an agent auth volume */
     remove: (name, opts = {}) =>
-      del(`/sessions/${enc(name)}`, { removeVolumes: opts.removeVolumes ? 1 : undefined }),
-    start: (name) => post(`/sessions/${enc(name)}/start`, {}),
-    stop: (name) => post(`/sessions/${enc(name)}/stop`, {}),
-    restart: (name) => post(`/sessions/${enc(name)}/restart`, {}),
-    recreate: (name) => post(`/sessions/${enc(name)}/recreate`, {}),
+      del(`/containers/${enc(name)}`, { removeVolumes: opts.removeVolumes ? 1 : undefined }),
+    start: (name) => post(`/containers/${enc(name)}/start`, {}),
+    stop: (name) => post(`/containers/${enc(name)}/stop`, {}),
+    restart: (name) => post(`/containers/${enc(name)}/restart`, {}),
+    recreate: (name) => post(`/containers/${enc(name)}/recreate`, {}),
     /** @param {{tail?:number, timestamps?:boolean}} [opts] */
     logs: (name, opts = {}) =>
-      get(`/sessions/${enc(name)}/logs`, {
+      get(`/containers/${enc(name)}/logs`, {
         tail: opts.tail, timestamps: opts.timestamps ? 1 : undefined,
       }),
-    reconcile: () => post('/sessions/reconcile', {}),
+    reconcile: () => post('/containers/reconcile', {}),
   },
 };
 
@@ -310,15 +310,15 @@ export const api = {
 // WebSocket helper (FROZEN, implemented - F2 uses this, do not change).
 // ---------------------------------------------------------------------------
 
-/** Pane names must match this so the derived tmux name `pc_<name>` is safe. */
-export const TERMINAL_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,39}$/;
+/** Session (pane) names must match this so the derived tmux name `pc_<name>` is safe. */
+export const SESSION_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,39}$/;
 
 /** Agent ids are slugs (server/src/agents/model.ts AGENT_ID_RE). */
 export const AGENT_ID_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
 
 /**
- * Build the wire value of the `shell` query parameter (server/src/terminals/protocol.ts
- * `parseTerminalShell`). FROZEN.
+ * Build the wire value of the `shell` query parameter (server/src/sessions/protocol.ts
+ * `parseSessionShell`). FROZEN.
  *   ('bash')              -> 'bash'
  *   ('sh')                -> 'sh'
  *   ('agent', 'claude')   -> 'agent:claude'
@@ -350,19 +350,22 @@ export function parseShellParam(raw) {
 }
 
 /**
- * Build the terminal websocket URL. The pc_session cookie rides along automatically
- * because this is same-origin. There is NO host parameter: the server resolves
- * session -> host (api.md "WebSocket: terminals").
- * @param {{session:string, shell:string, name:string, cols?:number, rows?:number}} opts
+ * Build the session websocket URL. The pc_auth cookie rides along automatically because
+ * this is same-origin. There is NO host parameter: the server resolves
+ * container -> host (api.md "WebSocket: sessions").
+ * @param {{container:string, shell:string, session:string, cols?:number, rows?:number}} opts
+ *        `container` is the container the shell runs in, `session` the pane/tmux name;
  *        `shell` is the WIRE value: 'bash' | 'sh' | 'agent:<agentId>' (formatShellParam)
  * @returns {string}
  */
-export function terminalWsUrl(opts) {
+export function sessionWsUrl(opts) {
   const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const qs = new URLSearchParams({ session: opts.session, shell: opts.shell, name: opts.name });
+  const qs = new URLSearchParams({
+    container: opts.container, session: opts.session, shell: opts.shell,
+  });
   if (opts.cols) qs.set('cols', String(opts.cols));
   if (opts.rows) qs.set('rows', String(opts.rows));
-  return `${proto}//${window.location.host}${API_BASE}/terminals?${qs.toString()}`;
+  return `${proto}//${window.location.host}${API_BASE}/sessions?${qs.toString()}`;
 }
 
 /** Re-exported so modules do not have to import bus.js just for the auth event. */

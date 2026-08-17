@@ -1,7 +1,7 @@
 // OWNER: F1 (v0.2, new). Two jobs in one module:
 //   1. the AGENT REGISTRY CACHE - the only place that knows what an agent id means. The
 //      getters below are a CROSS-PACKAGE CONTRACT (FROZEN): F2 imports `agentLabel`,
-//      `agentIcon` and `getAgents` for the Code tab's new-terminal menu and tab titles.
+//      `agentIcon` and `getAgents` for the Code tab's new-session menu and tab titles.
 //   2. the Settings -> Agents panel (built-ins + custom definitions, per-host enable,
 //      install state). Not a top-level view; settings.js drives its lifecycle, exactly like
 //      images.js.
@@ -23,7 +23,7 @@ export const LS_AGENTS_HOST = `${LS_PREFIX}agents.host`;
 
 /**
  * Bootstrap-icon class per built-in agent id, used by the Settings cards AND by F2's
- * new-terminal menu. FROZEN: add ids here, never rename the export.
+ * new-session menu. FROZEN: add ids here, never rename the export.
  */
 export const AGENT_ICONS = Object.freeze({
   claude: 'bi-stars',
@@ -62,7 +62,7 @@ export function getAgents() {
 
 /**
  * The HostAgentView[] of the host the Agents panel currently shows (panel-local state;
- * sessions.js fetches its own list for the host picked in the session dialog).
+ * containers.js fetches its own list for the host picked in the container dialog).
  * @returns {any[]}
  */
 export function getHostAgents() {
@@ -310,8 +310,8 @@ export async function setAgentEnabled(agentId, enabled) {
     renderAgentCards();
     toast(
       enabled
-        ? `Enabled on ${hostLabel(panelHostId)}. Run "Sync tools", then recreate the sessions that should mount it.`
-        : `Disabled on ${hostLabel(panelHostId)}. Sessions keep the mount until they are recreated.`,
+        ? `Enabled on ${hostLabel(panelHostId)}. Run "Sync tools", then recreate the containers that should mount it.`
+        : `Disabled on ${hostLabel(panelHostId)}. Containers keep the mount until they are recreated.`,
       { variant: enabled ? 'success' : 'info', title: agentLabel(agentId) },
     );
   } catch (err) {
@@ -377,7 +377,7 @@ export async function syncAgents(force = false) {
         `Every agent enabled on <strong>${escapeHtml(hostLabel(panelHostId))}</strong> is reinstalled from ` +
         'source, together with the bundled Node/Python runtimes, so they pick up the current ' +
         'upstream versions. This takes minutes and re-downloads a few hundred MB. Running ' +
-        'sessions keep their current agent until they are restarted.',
+        'containers keep their current agent until they are restarted.',
       confirmLabel: 'Upgrade',
       variant: 'primary',
     });
@@ -543,7 +543,7 @@ export async function saveAgent(event) {
 }
 
 /**
- * confirmDialog -> DELETE /api/agents/:id. A 409 means a host enables it or a session pins
+ * confirmDialog -> DELETE /api/agents/:id. A 409 means a host enables it or a container pins
  * it: ask again, then retry with `?force=1`.
  * @param {any} agent AgentView
  * @returns {Promise<void>}
@@ -571,7 +571,7 @@ export async function deleteAgent(agent) {
   const forced = await confirmDialog({
     title: 'Remove it everywhere?',
     body:
-      'Remove it from those hosts and sessions too? Their containers keep the mount until they ' +
+      'Remove it from those hosts and containers too? Their containers keep the mount until they ' +
       'are recreated.',
     confirmLabel: 'Remove everywhere',
   });

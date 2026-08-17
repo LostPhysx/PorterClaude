@@ -2,10 +2,16 @@
 
 > **v0.2 (hosts + agents): jump to [section 12](#12-v02--hosts-and-agents-authoritative-from-here-down)
 > at the bottom. It supersedes every v0.1 statement it contradicts.**
+>
+> **v0.3 (phase R, the rename): every name in this file is the post-rename one** — the tab and
+> the module are **containers** (`js/containers.js`, `#/containers`), a pane holds one
+> **session** (`js/session.js`, `SessionPane`), and the widget inside it is still an xterm
+> **terminal**. Section 13 lists what changed and what deliberately did not (the GoldenLayout
+> componentType `'terminal'`, the localStorage key strings, the xterm API).
 
 Companion to [`api.md`](api.md) (the wire contract, authoritative) and
 [`backend.md`](backend.md). This doc is the internal design of the browser UI: module map,
-DOM contract, layout/terminal mechanics, error handling and how QA verifies it.
+DOM contract, layout/session mechanics, error handling and how QA verifies it.
 
 Planner-owned. Coders implement the stubs; they do not restructure this doc. Anything that
 would change a **FROZEN** name here is a cross-package change → raise it, don't just edit.
@@ -30,7 +36,7 @@ layout state, which is exactly the feature set we need).
   (`bootstrap.Modal`, `bootstrap.Toast`, `bootstrap.Tab`) — both are globals.
 * **No inline `<script>` with app logic** in `index.html`; the server sets a CSP-friendly
   posture and everything belongs in `/js/*.js`.
-* Every string that comes from the API (session names, image refs, docker output, error
+* Every string that comes from the API (container names, image refs, docker output, error
   messages) is HTML-escaped via `util.escapeHtml` before it touches `innerHTML`, or is set
   with `.text()`. Terminal bytes go into xterm, never into the DOM.
 * Theme: `<html data-bs-theme="dark">` by default; `auto` follows
@@ -53,7 +59,7 @@ jQuery, bootstrap, Terminal, FitAddon, WebLinksAddon
 ```
 
 Until that lands, files that use vendor globals carry a `/* global ... */` pragma
-(`terminal.js` already does). Coders must not edit `eslint.config.js` themselves.
+(`session.js` already does). Coders must not edit `eslint.config.js` themselves.
 
 ## 2. npm dependencies and the `/vendor` map
 
@@ -130,20 +136,20 @@ web/
     css/code.css                    F2   rail, GoldenLayout container, xterm panes
     js/bus.js                       F1   FROZEN, complete: pub/sub + EVENTS (nobody edits)
     js/api.js                       F1   $.ajax wrapper, ApiError, full endpoint surface,
-                                         terminalWsUrl() (complete)
+                                         sessionWsUrl() (complete)
     js/util.js                      F1   escapeHtml, toast, confirmDialog, fmt*, debounce, storage
     js/app.js                       F1   boot, auth gate, hash routing, theme, view lifecycle
-    js/sessions.js                  F1   Sessions tab (table, modal, actions, logs)
+    js/containers.js                F1   Containers tab (table, modal, actions, logs)
     js/settings.js                  F1   Settings tab (backend / general / account)
     js/images.js                    F1   Settings → Images sub-panel (recipes, jobs, tools)
     js/code.js                      F2   Code tab: GoldenLayout, rail, layout persistence
-    js/terminal.js                  F2   TerminalPane: xterm + websocket + reconnect
+    js/session.js                   F2   SessionPane: xterm + websocket + reconnect
 ```
 
-**Ownership is file-level and disjoint.** F1 never opens `code.js` / `terminal.js` /
+**Ownership is file-level and disjoint.** F1 never opens `code.js` / `session.js` /
 `code.css`; F2 never opens anything else. The only coupling is through:
 
-1. exported function signatures in `api.js` / `util.js` / `sessions.js` / `settings.js`
+1. exported function signatures in `api.js` / `util.js` / `containers.js` / `settings.js`
    (marked FROZEN in the stubs — F1 implements the bodies, F2 only calls them),
 2. the event bus (`bus.js`, complete — neither coder edits it),
 3. the DOM ids in `index.html` (§4),
@@ -154,10 +160,10 @@ web/
 ```
 app.js ──▶ api.js ──▶ bus.js
    │  ├──▶ util.js
-   │  ├──▶ sessions.js ──▶ api/util/bus
+   │  ├──▶ containers.js ──▶ api/util/bus
    │  ├──▶ settings.js ──▶ images.js ──▶ api/util
-   │  └──▶ code.js  ──▶ terminal.js ──▶ api (terminalWsUrl) + bus
-   │                └──▶ sessions.js (getSessions), settings.js (getSettings)
+   │  └──▶ code.js  ──▶ session.js ──▶ api (sessionWsUrl) + bus
+   │                └──▶ containers.js (getContainers), settings.js (getSettings)
 ```
 
 `code.js` reads *state* from F1 modules through two frozen getters and otherwise reacts to
@@ -173,11 +179,11 @@ Ids may be **added**, never renamed or removed. F1 owns the file but must leave 
 | id | purpose | used by |
 |---|---|---|
 | `#app-navbar`, `#main-tabs` | top bar | F1 |
-| `#nav-code`, `#nav-sessions`, `#nav-settings` | tab links (`href="#/code"`, …, `data-view=`) | F1 |
+| `#nav-code`, `#nav-containers`, `#nav-settings` | tab links (`href="#/code"`, …, `data-view=`) | F1 |
 | `#backend-badge` | active backend chip (`socket` / `portainer` / `not configured`) | F1 |
 | `#btn-logout` | logout | F1 |
 | `#app-shell` | wrapper, `d-none` until authenticated | F1 |
-| `#view-code`, `#view-sessions`, `#view-settings` | `.pc-view`, exactly one visible | F1 toggles |
+| `#view-code`, `#view-containers`, `#view-settings` | `.pc-view`, exactly one visible | F1 toggles |
 | `#toast-area` | Bootstrap toast container | `util.toast` |
 | `#login-modal`, `#login-form`, `#login-password`, `#login-error`, `#login-setup-hint` | auth | F1 |
 | `#confirm-modal`, `#confirm-title`, `#confirm-body`, `#confirm-ok` | `util.confirmDialog` | F1 |
@@ -186,19 +192,19 @@ Ids may be **added**, never renamed or removed. F1 owns the file but must leave 
 
 | id | purpose |
 |---|---|
-| `#session-rail`, `#session-rail-list` | left rail; F2 renders `.pc-rail-item` rows |
-| `#btn-rail-refresh` | force `sessions.reload()` (F2 calls the F1 module) |
+| `#container-rail`, `#container-rail-list` | left rail; F2 renders `.pc-rail-item` rows |
+| `#btn-rail-refresh` | force `containers.reload()` (F2 calls the F1 module) |
 | `#btn-reset-layout` | drop the saved layout, close all panes |
-| `#code-toolbar`, `#code-session-select` | target session for new terminals |
+| `#code-toolbar`, `#code-container-select` | target container for new sessions |
 | `#btn-new-bash`, `#btn-new-claude`, `#btn-new-sh` | open a pane with that shell |
 | `#code-status` | connection summary ("3 panes · 1 reconnecting") |
 | `#code-root` | **GoldenLayout mount point** — must stay empty and sized |
 | `#code-empty` | empty-state overlay, toggled by F2 |
 
-**Sessions tab (F1)**: `#sessions-table` / `#sessions-tbody` / `#sessions-empty` /
-`#sessions-alert`, buttons `#btn-session-new`, `#btn-sessions-refresh`, `#btn-reconcile`;
-modals `#session-modal` (+ `#session-form`, `#session-form-body`, `#session-modal-title`,
-`#btn-session-save`, `#session-form-error`) and `#logs-modal` (+ `#logs-body`, `#logs-tail`,
+**Containers tab (F1)**: `#containers-table` / `#containers-tbody` / `#containers-empty` /
+`#containers-alert`, buttons `#btn-container-new`, `#btn-containers-refresh`, `#btn-reconcile`;
+modals `#container-modal` (+ `#container-form`, `#container-form-body`, `#container-modal-title`,
+`#btn-container-save`, `#container-form-error`) and `#logs-modal` (+ `#logs-body`, `#logs-tail`,
 `#btn-logs-refresh`).
 
 **Settings tab (F1)**: `#settings-subtabs` with `.pc-subview[data-subtab]` panes
@@ -215,15 +221,15 @@ modals `#session-modal` (+ `#session-form`, `#session-form-body`, `#session-moda
 
 | event | emitted by | payload | consumed by |
 |---|---|---|---|
-| `sessions:changed` | sessions.js after every list/poll/CRUD | `{ sessions: SessionView[] }` | code.js (rail + session select) |
-| `code:open-terminal` | sessions.js row action | `{ session, shell }` | code.js (opens a pane; app.js navigates to `#/code`) |
+| `containers:changed` | containers.js after every list/poll/CRUD | `{ containers: ContainerView[] }` | code.js (rail + container select) |
+| `code:open-session` | containers.js row action | `{ container, shell }` | code.js (opens a pane; app.js navigates to `#/code`) |
 | `auth:required` | api.js on any 401 | `{}` | app.js (show login), code.js (dispose panes) |
 | `auth:ready` | app.js after login/boot | `{}` | all views |
 | `auth:lost` | app.js on logout | `{}` | code.js (dispose panes, keep the layout) |
 | `settings:changed` | settings.js | `{ settings }` | code.js (layout blob, theme) |
 | `theme:changed` | app.js | `{ theme: 'dark'\|'light' }` | code.js → `pane.setTheme()` |
 | `view:changed` | app.js on every route change | `{ view }` | code.js (re-fit when it becomes visible) |
-| `terminals:changed` | code.js | `{ count }` | F1 (badge, optional) |
+| `sessions:changed` | code.js | `{ count }` | F1 (badge, optional) |
 
 ## 5. Key flows
 
@@ -232,7 +238,7 @@ modals `#session-modal` (+ `#session-form`, `#session-form-body`, `#session-moda
 ```
 DOMContentLoaded
   └─ app.boot()
-       ├─ GET /api/auth/session
+       ├─ GET /api/auth/me
        │    ├─ needsSetup:true      → login modal + "set APP_PASSWORD and restart" hint
        │    ├─ authenticated:false  → login modal (static backdrop, #app-shell hidden)
        │    └─ authenticated:true   → app.startApp()
@@ -244,7 +250,7 @@ DOMContentLoaded
 startApp()
   ├─ show #app-shell
   ├─ GET /api/settings   (theme, ui.layout, backend kind for #backend-badge)
-  ├─ await view.init(ctx) for code / sessions / settings   (each is idempotent)
+  ├─ await view.init(ctx) for code / containers / settings   (each is idempotent)
   ├─ bus.emit('auth:ready')
   └─ route()   // from location.hash, else the remembered view, else #/code
 ```
@@ -256,11 +262,11 @@ panes reattach to their tmux sessions.
 
 ### 5.2 Routing
 
-Hash routing only: `#/code`, `#/sessions`, `#/settings`. Unknown/empty hash → the value in
+Hash routing only: `#/code`, `#/containers`, `#/settings`. Unknown/empty hash → the value in
 `localStorage['porterclaude.lastView']`, else `#/code`. The server's SPA fallback means a
-hard reload of `https://host/#/sessions` still serves `index.html`. Route changes call
+hard reload of `https://host/#/containers` still serves `index.html`. Route changes call
 `hide()` on the outgoing module and `show()` on the incoming one; modules keep their state
-(terminals stay connected while you visit Settings).
+(sessions stay connected while you visit Settings).
 
 `ViewModule` (FROZEN):
 
@@ -273,14 +279,14 @@ hard reload of `https://host/#/sessions` still serves `index.html`. Route change
 
 `ctx` = `{ api, bus, navigate(view), getSettings(), getTheme() }`.
 
-### 5.3 Sessions CRUD
+### 5.3 Containers CRUD
 
-* `sessions.reload()` → `GET /api/sessions` → render + `bus.emit('sessions:changed')`.
-  Polled every **5 s** (`SESSION_POLL_MS`), started in `init()` and kept running while the
+* `containers.reload()` → `GET /api/containers` → render + `bus.emit('containers:changed')`.
+  Polled every **5 s** (`CONTAINER_POLL_MS`), started in `init()` and kept running while the
   Code tab is visible, because the rail depends on it. Poll pauses while a modal is open
   and while the tab is hidden (`document.visibilityState`).
-* Create/Edit use one modal. The form maps 1:1 onto `SessionInput`
-  (`server/src/sessions/model.ts` is the schema of record):
+* Create/Edit use one modal. The form maps 1:1 onto `ContainerInput`
+  (`server/src/containers/model.ts` is the schema of record):
   name (`^[a-z0-9][a-z0-9-]{0,30}$`, **immutable on edit**), displayName, image
   (`{type:'recipe',recipe}` | `{type:'custom',ref}`), workspace
   (`{type:'volume'}` | `{type:'bind',hostPath}` | `{type:'git',url,branch?}`), env map,
@@ -291,9 +297,9 @@ hard reload of `https://host/#/sessions` still serves `index.html`. Route change
   mismatch) inline; validation never blocks saving.
 * Edit ⇒ recreate: the confirm dialog says *"this recreates the container; the workspace and
   named volumes survive"*. Destroy asks twice when `removeVolumes` is ticked.
-* Row actions map to `POST /api/sessions/:name/{start,stop,restart,recreate}`, `DELETE`,
-  logs modal (`GET …/logs?tail=`), and **Open terminal** →
-  `bus.emit('code:open-terminal', {session, shell:'bash'})` + `navigate('code')`.
+* Row actions map to `POST /api/containers/:name/{start,stop,restart,recreate}`, `DELETE`,
+  logs modal (`GET …/logs?tail=`), and **Open session** →
+  `bus.emit('code:open-session', {container, shell:'bash'})` + `navigate('code')`.
 * `needsRecreate` renders a warning pill with a one-click **Recreate**; `orphan` renders an
   "adopt or destroy" hint; `warnings[]` becomes a tooltip on the row.
 
@@ -319,14 +325,16 @@ hard reload of `https://host/#/sessions` still serves `index.html`. Route change
 ### 5.5 Code tab: GoldenLayout
 
 `code.js` creates one `GoldenLayout` over `#code-root` and registers a single component
-factory, `'terminal'`, whose **component state is the pane contract**:
+factory, `'terminal'` (the componentType is FROZEN: it is persisted verbatim in every
+saved layout blob, and it names the component that hosts the xterm widget), whose
+**component state is the pane contract**:
 
 ```js
-{ session: 'web', shell: 'claude', name: 'web-claude-1', title?: 'web · claude' }
+{ container: 'web', shell: 'claude', name: 'web-claude-1', title?: 'web · claude' }
 ```
 
 * `layout.registerComponentFactoryFunction('terminal', (container, state) => …)` builds
-  `.pc-pane > .pc-pane-term`, constructs a `TerminalPane` and attaches it.
+  `.pc-pane > .pc-pane-term`, constructs a `SessionPane` and attaches it.
 * New pane: `layout.addComponent('terminal', state, title)` (first pane bootstraps the root
   via `layout.loadLayout()`); drag-to-split and tab reordering come from GoldenLayout.
 * Sizing: GoldenLayout 2 does not observe its container by itself — call
@@ -334,8 +342,8 @@ factory, `'terminal'`, whose **component state is the pane contract**:
   once on `view:changed → code` (a hidden container measures 0×0, which would create a 1×1
   terminal). Each `container.on('resize')` runs `pane.fit()` on the next animation frame.
 * `container.on('destroy')` disposes the pane and persists.
-* Pane naming (FROZEN, in `terminal.js`): `makeTerminalName(session, shell, n)` →
-  `"<session>-<shell>-<n>"` with the smallest free `n ≥ 1`, matching
+* Pane naming (FROZEN, in `session.js`): `makeSessionName(container, shell, n)` →
+  `"<container>-<shell>-<n>"` with the smallest free `n ≥ 1`, matching
   `^[a-z0-9][a-z0-9_-]{0,39}$`. The server derives the tmux session `pc_<name>`, so the name
   **must** survive a reload unchanged — that is exactly why it lives in the layout state.
 
@@ -348,14 +356,14 @@ factory, `'terminal'`, whose **component state is the pane contract**:
 * `localStorage['porterclaude.layout.v1']` — written immediately on `stateChanged`.
 * `PUT /api/settings/ui { layout }` — debounced 1.5 s, failures swallowed (never toast).
 * On boot the **fresher `savedAt` wins**; blobs with a different `v` are ignored. Restoring
-  recreates panes, which reconnect and reattach to tmux. A pane whose session vanished gets
+  recreates panes, which reconnect and reattach to tmux. A pane whose container vanished gets
   a `4404` close and shows an inline error with a close action instead of retrying forever.
 * `#btn-reset-layout` disposes all panes and clears both copies.
 
-### 5.6 Terminal websocket (`terminal.js`)
+### 5.6 Session websocket (`session.js`)
 
 ```
-new WebSocket(terminalWsUrl({session, shell, name, cols, rows}))   // cookie rides along
+new WebSocket(sessionWsUrl({container, shell, session, cols, rows}))   // cookie rides along
 ws.binaryType = 'arraybuffer'
 ```
 
@@ -366,7 +374,7 @@ ws.binaryType = 'arraybuffer'
 | client → server | binary | `ws.send(new TextEncoder().encode(data))` from `term.onData` |
 | client → server | text | `{type:'resize',cols,rows}`, `{type:'ping'}`, `{type:'signal',signal:'SIGINT'}` |
 
-* First text frame is always `ready`; store `terminalId`, `tmux`, `reattached`. Send a
+* First text frame is always `ready`; store `sessionId`, `tmux`, `reattached`. Send a
   `resize` right after `ready` (the fit addon has real numbers by then).
   `tmux:false` → a persistent amber `.pc-pane-note` strip: *"no tmux in this image —
   reloading the page kills this shell"*. `reattached:true` → a dim `info` line.
@@ -377,7 +385,7 @@ ws.binaryType = 'arraybuffer'
   (tmux reattaches); `4401` → `bus.emit('auth:required')`, never retry; `4400/4404/4409/
   4502/4500` and abnormal `1006` → exponential backoff 1 s → 15 s with jitter, forever, with
   the countdown shown in the pane; the delay resets after a socket that stayed open > 10 s.
-  `4409` (session not running) additionally offers a "start session" button.
+  `4409` (container not running) additionally offers a "start container" button.
 * `dispose()` is idempotent: clear timers, `ws.close(1000)`, `term.dispose()`.
 * Copy/paste: rely on xterm defaults (`Ctrl+Shift+C/V`); do not intercept `Ctrl+C`, it must
   reach the pty. No app-level keyboard shortcuts inside a pane — the keyboard belongs to the
@@ -389,10 +397,10 @@ ws.binaryType = 'arraybuffer'
   built from the `{error:{…}}` envelope.
 * `401` → `auth:required` (login modal), never a toast.
 * `409 backend_not_configured` → inline alert in the view with a link to Settings
-  (`#/settings`), not a toast loop. Sessions/Code render an empty state instead of an error.
+  (`#/settings`), not a toast loop. Containers/Code render an empty state instead of an error.
 * `422 validation_error` → map `details` (zod issues) onto the offending form field where
-  the path is known, otherwise show the message in `#session-form-error`.
-* `502 backend_error` → toast with the docker message and a "Retry" action; the sessions
+  the path is known, otherwise show the message in `#container-form-error`.
+* `502 backend_error` → toast with the docker message and a "Retry" action; the containers
   poll backs off to 30 s after three consecutive failures and returns to 5 s on success.
 * `429` → inline on the login form.
 * Network failures (`status 0`) → toast "server unreachable"; the poll keeps trying.
@@ -421,11 +429,11 @@ ws.binaryType = 'arraybuffer'
    * `curl -s localhost:8080/js/app.js | head -3` → module source
    * `curl -sI localhost:8080/vendor/xterm/lib/xterm.js` → `200`
    * `curl -sI localhost:8080/vendor/golden-layout/esm/index.js` → `200`
-   * `curl -sI localhost:8080/#/sessions`-equivalent: `curl -sI localhost:8080/anything`
+   * `curl -sI localhost:8080/#/containers`-equivalent: `curl -sI localhost:8080/anything`
      → `200` + `index.html` (SPA fallback)
-   * `curl -s -b pc_session=<cookie> localhost:8080/api/settings/vendor | jq '.routes[] | select(.mounted==false)'`
-     → empty (the endpoint needs the session cookie like every `/api/settings/*` route)
-   * `curl -s localhost:8080/api/sessions` → `401` + `{"error":{"code":"unauthorized"…}}`
+   * `curl -s -b pc_auth=<cookie> localhost:8080/api/settings/vendor | jq '.routes[] | select(.mounted==false)'`
+     → empty (the endpoint needs the login cookie like every `/api/settings/*` route)
+   * `curl -s localhost:8080/api/containers` → `401` + `{"error":{"code":"unauthorized"…}}`
 4. Grep guards: `grep -rn "from '[a-z@]" web/public/js` must return nothing (no bare
    specifiers); `grep -rn "apiKey" web/public/js` must show no persistence to localStorage.
 
@@ -436,20 +444,20 @@ ws.binaryType = 'arraybuffer'
 6. Settings → backend: pick Portainer, paste URL + key, **Test connection** → info card +
    endpoint list; reload the page → the key field is empty and shows the hint (proof the key
    never round-trips).
-7. Sessions: create a session with recipe `node` and a volume workspace → row appears with
+7. Containers: create a container with recipe `node` and a volume workspace → row appears with
    status; Start/Stop/Logs work; Edit → recreate keeps the workspace; Destroy without
    `removeVolumes` leaves `<volumePrefix>ws-<name>` (the prefix comes from the host's
    effective settings — `HostView.settings.volumePrefix` — never hard-coded, and the destroy
    confirm names exactly that volume).
-8. Code: open `bash` in a running session → prompt within a second; type `echo hi`; drag the
-   tab to the right half → split pane, both terminals still live and resized correctly
+8. Code: open `bash` in a running container → prompt within a second; type `echo hi`; drag the
+   tab to the right half → split pane, both sessions still live and resized correctly
    (`stty size` inside matches the pane).
 9. Reload the page → the same panes come back and **tmux reattaches** (the `echo hi`
    scrollback and any running `claude` are still there). `info` line mentions "reattached".
-10. Kill the server (or `docker stop` the session) → panes show a reconnect countdown, and
-    they recover automatically when it comes back (session must be running again).
-11. Stop a session from the Sessions tab while a pane is open → close code `4409` and an
-    inline "session is not running" with a start action.
+10. Kill the server (or `docker stop` the container) → panes show a reconnect countdown, and
+    they recover automatically when it comes back (container must be running again).
+11. Stop a container from the Containers tab while a pane is open → close code `4409` and an
+    inline "container is not running" with a start action.
 12. Custom image without tmux (e.g. `alpine:3.20` after tools sync) → the pane shows the
     amber "no tmux" warning strip.
 13. `#btn-reset-layout` → all panes close, and a reload shows the empty state.
@@ -476,14 +484,14 @@ skeleton.
 | 2 | Docker connection UI | one backend form | `js/hosts.js`: host table + host modal + Portainer credentials + endpoint import |
 | 3 | Agents | Claude hard-wired | `js/agents.js`: registry cache (**F2 reads it**) + Settings → Agents panel |
 | 4 | Images panel | global | per host (`#images-host-select`), tools status lists installed agents |
-| 5 | Sessions table | – | **Host** column, `#sessions-host-filter`, agent chips under the name |
-| 6 | Session dialog | – | host picker (create only, immutable), agent picker (`null` = host default) |
-| 7 | Code toolbar | `bash \| claude \| sh` buttons | `bash`, `sh` + an **Agent dropdown** built from the session's `resolvedAgents` |
+| 5 | Containers table | – | **Host** column, `#containers-host-filter`, agent chips under the name |
+| 6 | Container dialog | – | host picker (create only, immutable), agent picker (`null` = host default) |
+| 7 | Code toolbar | `bash \| claude \| sh` buttons | `bash`, `sh` + an **Agent dropdown** built from the container's `resolvedAgents` |
 | 8 | Code rail | flat list | grouped by host (single host ⇒ unchanged flat list), `#code-host-filter` |
-| 9 | Pane state | `{session, shell:'bash'\|'claude'\|'sh', name}` | `{session, shell:'bash'\|'sh'\|'agent', agentId, name, hostId?}` |
+| 9 | Pane state | `{container, shell:'bash'\|'claude'\|'sh', name}` | `{container, shell:'bash'\|'sh'\|'agent', agentId, name, hostId?}` |
 | 10 | Layout blob | `v: 1` | `v: 2`, **v1 blobs are migrated, never discarded** (pane names survive ⇒ tmux reattaches) |
 | 11 | WS `shell` param | `bash\|claude\|sh` | `bash\|sh\|agent:<agentId>` (`api.formatShellParam`) |
-| 12 | Close codes | – | `4410 agent_not_available`, `4411 host_unavailable` — **terminal, no auto-reconnect** |
+| 12 | Close codes | – | `4410 agent_not_available`, `4411 host_unavailable` — **fatal, no auto-reconnect** |
 | 13 | `api.js` | flat `/api/images/*`, `/api/docker/*`, `/api/settings/backend*` | host-scoped `api.images.*(hostId, …)` / `api.docker.*(hostId)`; `api.hosts`, `api.credentials.portainer`, `api.agents`; **`settings.putBackend/testBackend/endpoints` are gone** |
 | 14 | Navbar chip | `#backend-badge` = backend kind | same id, now the **hosts** summary |
 | 15 | Copy | "Claude" everywhere | agent-neutral: "coding agent", "agent history", "the agents enabled on this host" |
@@ -504,9 +512,9 @@ web/public/js/
   agents.js     F1  NEW   agent registry cache + Settings → Agents panel
   settings.js   F1        shell: sub-tabs, General, Account (backend panel deleted)
   images.js     F1        per-host recipes/jobs/tools, openJob(hostId, jobId)
-  sessions.js   F1        host column/filter, host + agent pickers, host-scoped lookups
+  containers.js F1        host column/filter, host + agent pickers, host-scoped lookups
   code.js       F2        rail grouped by host, agent menu, PaneState v2, layout migration
-  terminal.js   F2        agent panes, terminalSlug(), 4410/4411
+  session.js    F2        agent panes, sessionSlug(), 4410/4411
 ```
 
 ```
@@ -514,9 +522,9 @@ app.js ─▶ api.js ─▶ bus.js
    ├─▶ util.js
    ├─▶ hosts.js   ─▶ api/util/bus, settings.js (GENERAL_FIELDS only — see below)
    ├─▶ agents.js  ─▶ api/util/bus, hosts.js, images.js (openJob)
-   ├─▶ sessions.js ─▶ api/util/bus, hosts.js, agents.js
+   ├─▶ containers.js ─▶ api/util/bus, hosts.js, agents.js
    ├─▶ settings.js ─▶ hosts.js, agents.js, images.js
-   └─▶ code.js    ─▶ terminal.js, sessions.js, settings.js, agents.js, hosts.js
+   └─▶ code.js    ─▶ session.js, containers.js, settings.js, agents.js, hosts.js
                        images.js ─▶ api/util, hosts.js
 ```
 
@@ -524,7 +532,7 @@ app.js ─▶ api.js ─▶ bus.js
 
 * `images.js` does **not** import `agents.js` (that would close a cycle with `openJob`); the
   tools-status agent table therefore shows agent **ids**, which are the API identity anyway.
-* `hosts.js` does **not** import `sessions.js`; `HostView.sessionCount` carries the number it
+* `hosts.js` does **not** import `containers.js`; `HostView.containerCount` carries the number it
   needs.
 * `hosts.js` does **not** import `agents.js` either, although the host table shows agent
   **chips**: the chain `agents.js ─▶ images.js ─▶ hosts.js` means importing `agentLabel()`
@@ -549,13 +557,13 @@ api.credentials.portainer.list | create | update | remove | test | testStored | 
 api.agents.list | get | create | update | remove({force})
 api.docker.{info,containers,volumes,networks}(hostId, …)
 api.images.{list,recipes,buildRecipe,jobs,job,cancelJob,tools,syncTools,validateCustom,pull}(hostId, …)
-api.sessions.list({hostId}) …                       (otherwise unchanged)
+api.containers.list({hostId}) …                       (otherwise unchanged)
 api.settings.{get,putGeneral,putUi,changePassword,vendor}
 hostPath(hostId, suffix)                            '/hosts/<id><suffix>'
 formatShellParam(shell, agentId) -> 'bash'|'sh'|'agent:<id>'
 parseShellParam(raw)             -> {shell, agentId} | null   (accepts the legacy 'claude')
-terminalWsUrl({session, shell /* WIRE value */, name, cols, rows})
-TERMINAL_NAME_RE, AGENT_ID_RE
+sessionWsUrl({container, shell /* WIRE value */, session, cols, rows})
+SESSION_NAME_RE, AGENT_ID_RE
 ```
 
 `hosts.js` → everyone: `getHosts()`, `getHost(id)`, `hostLabel(id)`, `getDefaultHostId()`,
@@ -567,12 +575,12 @@ TERMINAL_NAME_RE, AGENT_ID_RE
 
 `images.js` → `agents.js`: `openJob(hostId, jobId)`, `syncTools()`, `currentHostId()`.
 
-`sessions.js` → F2 (unchanged): `getSessions()`, `reload()`, `imageOutdated()`; new exports
-`visibleSessions()`, `hostCell()`, `agentChips()` are F1-internal.
+`containers.js` → F2 (unchanged): `getContainers()`, `reload()`, `imageOutdated()`; new exports
+`visibleContainers()`, `hostCell()`, `agentChips()` are F1-internal.
 
-`terminal.js` → `code.js`: **`terminalSlug(shell, agentId)`** and
-`makeTerminalName(session, slug, n)` — note the **second parameter is now the slug**, not the
-shell. `terminalSlug('agent','claude') === 'claude'`, so a claude pane keeps the v0.1 name
+`session.js` → `code.js`: **`sessionSlug(shell, agentId)`** and
+`makeSessionName(container, slug, n)` — note the **second parameter is now the slug**, not the
+shell. `sessionSlug('agent','claude') === 'claude'`, so a claude pane keeps the v0.1 name
 `web-claude-1` and reattaches to its existing tmux session after the upgrade. This is the
 single most important compatibility detail of the whole topic.
 
@@ -582,7 +590,7 @@ Bus events (bus.js, FROZEN):
 |---|---|---|
 | `hosts:changed` | hosts.js after every list/CRUD | `{ hosts: HostView[], defaultHostId }` |
 | `agents:changed` | agents.js after every registry load/CRUD | `{ agents: AgentView[] }` |
-| `code:open-terminal` | sessions.js | `{ session, shell }` — `shell` is the **wire** value |
+| `code:open-session` | containers.js | `{ container, shell }` — `shell` is the **wire** value |
 | everything else | unchanged | |
 
 ## 12.4 DOM contract additions (index.html, planner-authored, FROZEN)
@@ -595,10 +603,10 @@ Ids may be added, never renamed. F1 owns the file; the `#view-code` subtree belo
 **Code tab (F2)** — added: `#code-host-filter` (select), `#btn-new-agent` (dropdown toggle),
 `#new-agent-menu` (`<ul>`; items are `<button class="dropdown-item" data-agent="<id>">`).
 Kept: `#btn-new-bash`, `#btn-new-sh`. **Removed: `#btn-new-claude`.**
-Rail markup: `.pc-rail-group[data-host]` → `.pc-rail-group-head` + `.pc-rail-item[data-session]`;
+Rail markup: `.pc-rail-group[data-host]` → `.pc-rail-group-head` + `.pc-rail-item[data-container]`;
 quick actions are `[data-open="bash"]` and `[data-open="agent:<id>"]`.
 
-**Sessions (F1)** — `#sessions-host-filter`; a `Host` column (2nd) in `#sessions-table`;
+**Containers (F1)** — `#containers-host-filter`; a `Host` column (2nd) in `#containers-table`;
 dialog fields `#sf-host`, `#sf-host-fields`, `#sf-host-note`, `#sf-agents-inherit`,
 `#sf-agents` (checkboxes carry `data-agent="<id>"`).
 
@@ -653,8 +661,8 @@ unchanged.
   (`POST /api/hosts/test`); a stored credential's key is never re-sent.
 * Overrides: the same field list as Settings → General (`GENERAL_FIELDS`, imported from
   `settings.js`), blank = inherit, placeholder = the inherited value.
-* Delete: `409` while sessions reference the host → a second confirm explains that force
-  leaves those sessions read-only and that **containers, volumes and images on that engine
+* Delete: `409` while containers reference the host → a second confirm explains that force
+  leaves those containers read-only and that **containers, volumes and images on that engine
   are never touched**, then retries with `?force=1`.
 * Credentials: the API key is **write-only** — always rendered empty, `apiKeyHint` next to the
   label, an empty field means "keep the stored key" (omit the property; never send `""`).
@@ -675,7 +683,7 @@ unchanged.
   `GET /api/hosts/:hostId/agents`: enabled switch, `installed`/`version`/`installedAt`, and
   the install `error` when the last sync failed for that agent.
 * Enabling installs **nothing**. The toast after a successful `PUT …/agents` must say:
-  *"Enabled on `<host>`. Run 'Sync tools', then recreate the sessions that
+  *"Enabled on `<host>`. Run 'Sync tools', then recreate the containers that
   should mount it."* — that is the whole mental model of v0.2 in one sentence.
 * "Sync tools" (`#btn-agents-sync`; the Images panel button `#btn-tools-sync` carries the SAME
   label, and so do the docs) = `POST /api/hosts/:hostId/images/tools/sync`, whose job log
@@ -686,60 +694,62 @@ unchanged.
 * An unreachable host answers `installed:false` + an `error` per agent — render it, never a
   toast loop.
 
-### Sessions (F1)
+### Containers (F1)
 
-* `reload()` still fetches **every** host's sessions and emits the unfiltered array on the bus
-  (F2's rail depends on it). `#sessions-host-filter` filters at render time only, is
-  remembered in `porterclaude.sessions.host`, and is hidden while ≤1 host exists.
+* `reload()` still fetches **every** host's containers and emits the unfiltered array on the bus
+  (F2's rail depends on it). `#containers-host-filter` filters at render time only, is
+  remembered in `porterclaude.sessions.host` (the key STRING keeps its v0.2 spelling on
+  purpose — only the constant became `LS_CONTAINERS_HOST`, see §13.2), and is hidden while
+  ≤1 host exists.
 * The dialog picks the host **first**: `#sf-host` drives `loadLookups(hostId)` (recipes,
   image refs, networks, `GET /api/hosts/:hostId/agents`). Changing it repaints those pickers
   without losing what the user typed.
 * On **edit** `#sf-host` is disabled and `hostId` is never sent (`PUT` with a different host
-  is a `422`); the note says *"the host of a session is immutable — create a new session to
+  is a `422`); the note says *"the host of a container is immutable — create a new container to
   move it"*.
 * Agents: `#sf-agents-inherit` checked (the default) ⇒ send `agents: null`; unchecked ⇒ the
   array of checked ids (an empty array is legal and means "no agent, plain shell").
-* Copy: *"Share agent conversation history with the other sessions on this host"*; the destroy
+* Copy: *"Share agent conversation history with the other containers on this host"*; the destroy
   dialog says the per-agent history volumes go and **the shared agent login volumes never do**.
-* A session with `hostMissing: true` renders a danger pill and is read-only except for Destroy.
+* A container with `hostMissing: true` renders a danger pill and is read-only except for Destroy.
 
 ### Code tab (F2)
 
-* Rail: grouped by host when more than one host has sessions (`.pc-rail-group[data-host]`,
+* Rail: grouped by host when more than one host has containers (`.pc-rail-group[data-host]`,
   default host first, hosts sorted by name); a single host renders exactly the v0.1 flat list.
-  Quick actions: bash and the session's **first** `resolvedAgent`
+  Quick actions: bash and the container's **first** `resolvedAgent`
   (`data-open="agent:<id>"`, `agentIcon(id)`, title "Open `<agentLabel(id)>`").
 * Host **names** (rail group heads, `#code-host-filter` labels, the `<host>/` tab prefix)
-  come from the hosts cache — `hostLabel(session.hostId)`, with `SessionView.hostName` as the
+  come from the hosts cache — `hostLabel(container.hostId)`, with `ContainerView.hostName` as the
   fallback for a host the cache no longer knows. `hostName` rides on the row that carried it
   and an adopted/orphan row can name the host that *scanned* it, which labelled every group
   and tab identically (FE-QA-06). `code.js` therefore imports `hosts.js`; that closes no cycle
   (`hosts.js` imports `api`/`bus`/`util`/`settings.js` only) and titles are repainted on
   `hosts:changed`.
-* Toolbar: `#code-host-filter` (hidden with ≤1 host), `#code-session-select` (labels become
-  `<session> — <host name>` with more than one host), `bash`, `sh`, and the **Agent** dropdown
-  filled from the selected session's `resolvedAgents` via `agentLabel`/`agentIcon`.
-  A session without agents shows a disabled item plus a link to Settings → Agents.
-  The menu is rebuilt on `sessions:changed`, `agents:changed` and on every select change.
-* `openTerminal(session, shellParam)` takes the **wire** value. An agent that is not in
+* Toolbar: `#code-host-filter` (hidden with ≤1 host), `#code-container-select` (labels become
+  `<container> — <host name>` with more than one host), `bash`, `sh`, and the **Agent** dropdown
+  filled from the selected container's `resolvedAgents` via `agentLabel`/`agentIcon`.
+  A container without agents shows a disabled item plus a link to Settings → Agents.
+  The menu is rebuilt on `containers:changed`, `agents:changed` and on every select change.
+* `openSession(container, shellParam)` takes the **wire** value. An agent that is not in
   `resolvedAgents` is refused client-side with a toast (the server would close `4410`).
 * Pane state v2 + `LAYOUT_VERSION = 2`; `ACCEPTED_LAYOUT_VERSIONS = [1, 2]` and
   `migrateLayoutBlob()` rewrite a v1 tree in place (`shell:'claude'` →
   `{shell:'agent', agentId:'claude'}`) **keeping every `name`**, so the restored panes
   reattach to their tmux sessions. A state that will not normalise is dropped from the tree.
-* Tab titles: `<session> · <agentLabel|shell>[ n][ mark]`, prefixed `"<host>/"` when panes of
+* Tab titles: `<container> · <agentLabel|shell>[ n][ mark]`, prefixed `"<host>/"` when panes of
   more than one host are open.
 
-### Terminals (F2)
+### Sessions (F2)
 
-* `TerminalPane({session, shell, agentId, name, …, onOpenBash})`; the URL is built with
+* `SessionPane({container, shell, agentId, name, …, onOpenBash})`; the URL is built with
   `formatShellParam(shell, agentId)`.
 * `ready` now carries `hostId` and `agentId`: store both (the server is authoritative — it may
   answer with the agent it actually started) and pass them through `onStatus('open', info)`.
 * `4410 agent_not_available` → **fatal**, no retry: note + actions *Open bash instead*
   (`onOpenBash`) and *Close pane*. `4411 host_unavailable` → **fatal**, no retry: note + *Close
   pane*. Everything else keeps the v0.1 policy (`1000` → Enter restarts, `4401` → auth,
-  `4409` → backoff + Start session, `4400/4500/4502/1006` → backoff).
+  `4409` → backoff + Start container, `4400/4500/4502/1006` → backoff).
 
 ## 12.6 Copy rules (agent-neutral)
 
@@ -752,14 +762,14 @@ The product is still **PorterClaude**; the UI is not Claude-specific.
 * "Claude conversation history" → "agent conversation history"; "shared Claude login volume" →
   "shared agent login volumes".
 * Anywhere the user could reasonably ask "why is my agent missing?", say the whole chain:
-  **enable on the host → sync the tools volume → recreate the session**.
+  **enable on the host → sync the tools volume → recreate the container**.
 
 ## 12.7 Package split
 
 | | F1 | F2 |
 |---|---|---|
-| owns | `index.html`, `css/app.css`, `js/{app,util,hosts,agents,settings,images,sessions}.js` | `js/{code,terminal}.js`, `css/code.css` |
-| never opens | `code.js`, `terminal.js`, `code.css` | everything else (incl. `index.html`) |
+| owns | `index.html`, `css/app.css`, `js/{app,util,hosts,agents,settings,images,containers}.js` | `js/{code,session}.js`, `css/code.css` |
+| never opens | `code.js`, `session.js`, `code.css` | everything else (incl. `index.html`) |
 
 `api.js` and `bus.js` are planner-owned and complete: **neither coder edits them.** If one of
 them really is wrong, that is a cross-package change → raise it, do not patch it silently.
@@ -780,24 +790,24 @@ them really is wrong, that is a cross-package change → raise it, do not patch 
 
 7. Boot with a migrated v0.1 config: the navbar chip says `host: <name>`, Settings → Hosts
    lists exactly one host with status `ok`, and **no** host filter is visible anywhere
-   (Sessions and Code look like v0.1).
+   (Containers and Code look like v0.1).
 8. Reload with panes open from before the upgrade: the same panes come back, the claude pane
-   is named `<session>-claude-<n>` and the `info` line says **reattached** (proof that the
+   is named `<container>-claude-<n>` and the `info` line says **reattached** (proof that the
    layout migration kept the tmux identity).
 9. Settings → Agents: `claude` shows *installed `<version>`*; enable `opencode` → the toast
-   names the three steps; sync → job log; the card flips to *installed*; recreate the session
-   → the Agent menu of that session now lists opencode and opening it starts it.
+   names the three steps; sync → job log; the card flips to *installed*; recreate the container
+   → the Agent menu of that container now lists opencode and opening it starts it.
 
 **Browser, two hosts**
 
 10. Add a Portainer credential → Test → Import endpoints → one host per endpoint appears;
     re-running the import updates instead of duplicating.
-11. Make the second host default; create a session on it; the Sessions table shows the Host
+11. Make the second host default; create a container on it; the Containers table shows the Host
     column, the filter appears, and the Code rail grows a group header per host.
-12. Sessions on host A and host B open terminals side by side; `stty size` inside each matches
+12. Containers on host A and host B open sessions side by side; `stty size` inside each matches
     its pane, and the tab titles disambiguate by host.
-13. Editing a session shows the host disabled with the immutability note.
-14. Delete a host that still has sessions → the two-step confirm, then those sessions render
+13. Editing a container shows the host disabled with the immutability note.
+14. Delete a host that still has containers → the two-step confirm, then those containers render
     the "host gone" pill and are read-only apart from Destroy.
 15. Point a pane at an agent that was disabled meanwhile → close `4410`, note with *Open bash
     instead*, and **no reconnect storm** in the network panel.
@@ -806,3 +816,63 @@ them really is wrong, that is a cross-package change → raise it, do not patch 
 
 **Known non-goals**: still no unit-test runner for `web/`; `verify-assets.mjs` plus this
 walkthrough are the contract.
+
+---
+
+# 13. v0.3 — the rename (phase R)
+
+Vocabulary only (`users.md` §0/§7). There is no bundler here, so every one of these is a
+module-resolution error or a silently-null `byId()` if it is half-applied — §13.3 is the check.
+
+## 13.1 Renamed
+
+| Was | Is |
+|---|---|
+| `js/sessions.js`, default export `sessionsView` | `js/containers.js`, `containersView` |
+| `js/terminal.js`, `TerminalPane` | `js/session.js`, `SessionPane` (`.container`, `.sessionId`) |
+| `api.sessions.*` (`/sessions…`) | `api.containers.*` (`/containers…`) |
+| `api.auth.session()` (`/auth/session`) | `api.auth.me()` (`/auth/me`) |
+| `terminalWsUrl({session, shell, name, …})` | `sessionWsUrl({container, shell, session, …})` → `/api/sessions?container=&session=&shell=` |
+| `TERMINAL_NAME_RE` | `SESSION_NAME_RE` |
+| `terminalSlug()`, `makeTerminalName(session, slug, n)` | `sessionSlug()`, `makeSessionName(container, slug, n)` — the produced name `<container>-<slug>-<n>` is **byte-identical**; it is the tmux identity |
+| `EVENTS.SESSIONS_CHANGED` (`sessions:changed`, containers) | `EVENTS.CONTAINERS_CHANGED` (`containers:changed`) |
+| `EVENTS.TERMINALS_CHANGED` (`terminals:changed`) | `EVENTS.SESSIONS_CHANGED` (`sessions:changed`) — **the old name, new meaning** |
+| `EVENTS.OPEN_TERMINAL` (`code:open-terminal`) | `EVENTS.OPEN_SESSION` (`code:open-session`), payload `{ container, shell }` |
+| `getSessions()`, `visibleSessions()`, `openSessionModal()` | `getContainers()`, `visibleContainers()`, `openContainerModal()` |
+| `openTerminal(session, shellParam)` | `openSession(container, shellParam)` |
+| route `#/sessions`, `VIEWS` entry `sessions` | `#/containers`, `containers` |
+| `SESSION_POLL_MS`, `SESSION_STATE_POLL_MS` | `CONTAINER_POLL_MS`, `CONTAINER_STATE_POLL_MS` |
+| DOM ids `nav-sessions`, `view-sessions`, `session-rail(-list)`, `code-session-select`, `sessions-{host-filter,alert,table,th-host,tbody,empty}`, `btn-{sessions-refresh,session-new,session-save}`, `session-{modal,form,modal-title,form-body,form-error}` | the same ids with `session`/`sessions` → `container`/`containers` (+ the matching `app.css` / `code.css` selectors) |
+| copy "Sessions", "New session", "No sessions yet.", hosts column "Sessions", "Session network" | "Containers", "New container", "No containers yet.", "Containers", "Container network" |
+
+`PaneState.session` → `PaneState.container` forces `LAYOUT_VERSION` 2 → 3 with
+`ACCEPTED_LAYOUT_VERSIONS = [1, 2, 3]` and `normalizeState()` reading `raw.container ?? raw.session`
+— the same write-new/read-either rule as the docker label. Without the compat read every
+stored pane normalises to `null`, `migrateLayoutItem` drops it, and the Code tab comes back
+empty while the tmux sessions behind those panes stay alive and unreachable.
+
+## 13.2 Deliberately NOT renamed
+
+* The GoldenLayout componentType **`'terminal'`** (`COMPONENT_TERMINAL`, const *and* value):
+  it is persisted verbatim in every saved layout blob (localStorage + `config.ui.layout`), and
+  it names the component that hosts the xterm widget.
+* The **localStorage key strings**: `porterclaude.layout.v1`, `${LS_PREFIX}code.session`,
+  `${LS_PREFIX}sessions.host`. Only the JS constants changed (`LS_LAST_CONTAINER`,
+  `LS_CONTAINERS_HOST`), so an upgrade keeps the user's layout, container preselect and host
+  filter.
+* xterm.js's own API — `new Terminal(...)`, `FitAddon`, `WebLinksAddon` — the Bootstrap icon
+  class `bi bi-terminal`, and `ws.readyState`.
+* The word *terminal* wherever it means the widget: terminal bytes, "no tmux → terminals do
+  not survive a reload", the keyboard belonging to the terminal.
+
+## 13.3 QA (headless, in addition to §8 and §12.8)
+
+* `grep -rn "sessions\.js\|terminal\.js\|TerminalPane\|terminalWsUrl\|makeTerminalName\|terminalSlug\|getSessions\|OPEN_TERMINAL" web/public` → nothing.
+* Every OLD DOM id string from §13.1 → nothing in `web/public` (`byId()` returning `null` is
+  swallowed everywhere, so this grep is the only detector).
+* `grep -rn "api/sessions\|api/terminals" web/public/js` → only `sessionWsUrl`'s websocket
+  path, never an `$.ajax` call.
+* Then load the app: the Containers tab renders rows, a pane opens, and a reload reattaches.
+* Cached-client note: a tab still running the pre-R bundle opens `/api/terminals?session=&name=`,
+  which the new server does not own — its panes die until the page is reloaded. `index.html`
+  and `/js/**` must not be served with a long cache lifetime through the upgrade.

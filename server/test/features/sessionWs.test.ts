@@ -1,4 +1,4 @@
-// OWNER: B2. The terminal websocket bridge (auth refusal, ready frame, control messages,
+// OWNER: B2. The session websocket bridge (auth refusal, ready frame, control messages,
 // close codes). Uses a real http server + ws client; the auth module is mocked so this
 // test does not depend on B1's runtime code.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -7,8 +7,8 @@ import type { AddressInfo } from 'node:net';
 import { WebSocket } from 'ws';
 import type { AppContext } from '../../src/context.js';
 import { AppError } from '../../src/http/errors.js';
-import { TERMINAL_CLOSE, TerminalRefusal } from '../../src/sessions/protocol.js';
-import { attachTerminalWs, STOP_RECHECK } from '../../src/sessions/ws.js';
+import { SESSION_CLOSE, SessionRefusal } from '../../src/sessions/protocol.js';
+import { attachSessionWs, STOP_RECHECK } from '../../src/sessions/ws.js';
 import { silentLog, stubExecStream } from './helpers.js';
 
 const authState = vi.hoisted(() => ({ ok: true }));
@@ -25,30 +25,30 @@ interface TestStream {
 }
 
 let server: http.Server;
-let handle: ReturnType<typeof attachTerminalWs>;
+let handle: ReturnType<typeof attachSessionWs>;
 let stream: ReturnType<typeof stubExecStream> & TestStream;
 let openError: unknown = null;
-let sessionStateError: unknown = null;
+let containerStateError: unknown = null;
 /** how many requireRunningContainer() calls still answer "running" before the error hits */
-let sessionStateErrorAfter = 1;
-let sessionStateChecks = 0;
+let containerStateErrorAfter = 1;
+let containerStateChecks = 0;
 let execExitCode: number | null = 0;
 let unregistered: string[] = [];
 let killed: string[] = [];
-/** the host ids the bridge asked for a transport (must be the SESSION'S host) */
+/** the host ids the bridge asked for a transport (must be the CONTAINER'S host) */
 let backendLookups: string[] = [];
-/** what terminals.open() was called with (v0.2: shell + agentId come from the query) */
+/** what sessions.open() was called with (v0.2: shell + agentId come from the query) */
 let openedWith: { shell: string; agentId: string | null } | null = null;
 
 function makeCtx(): AppContext {
   return {
     log: silentLog,
-    terminals: {
+    sessions: {
       open: async (input: { shell: string; agentId?: string | null }) => {
         openedWith = { shell: input.shell, agentId: input.agentId ?? null };
         if (openError) throw openError;
         return {
-          terminalId: 't1',
+          sessionId: 't1',
           stream,
           containerId: 'c1',
           // v0.2: the ready frame names the host and the agent of the pane
@@ -59,19 +59,19 @@ function makeCtx(): AppContext {
         };
       },
       unregister: (id: string) => unregistered.push(id),
-      killTmuxSession: async (session: string, name: string) => {
-        killed.push(`${session}/${name}`);
+      killTmuxSession: async (container: string, sessionName: string) => {
+        killed.push(`${container}/${sessionName}`);
         return true;
       },
     },
-    sessions: {
+    containers: {
       requireRunningContainer: async () => {
-        sessionStateChecks += 1;
-        if (sessionStateError && sessionStateChecks >= sessionStateErrorAfter) throw sessionStateError;
+        containerStateChecks += 1;
+        if (containerStateError && containerStateChecks >= containerStateErrorAfter) throw containerStateError;
         return { containerId: 'c1', config: {}, hostId: 'edge', containerAgents: ['claude'] };
       },
     },
-    // v0.2: the exec lives on the SESSION'S host, which the ready frame already named
+    // v0.2: the exec lives on the CONTAINER'S host, which the ready frame already named
     hosts: {
       backendFor: (hostId: string) => {
         backendLookups.push(hostId);
@@ -85,10 +85,10 @@ function makeCtx(): AppContext {
 
 function url(query: string): string {
   const { port } = server.address() as AddressInfo;
-  return `ws://127.0.0.1:${port}/api/terminals?${query}`;
+  return `ws://127.0.0.1:${port}/api/sessions?${query}`;
 }
 
-function connect(query = 'session=web&shell=bash&name=main&cols=100&rows=30'): WebSocket {
+function connect(query = 'container=web&shell=bash&session=main&cols=100&rows=30'): WebSocket {
   const ws = new WebSocket(url(query));
   ws.binaryType = 'arraybuffer';
   return ws;
@@ -111,9 +111,9 @@ function nextClose(ws: WebSocket): Promise<number> {
 beforeEach(async () => {
   authState.ok = true;
   openError = null;
-  sessionStateError = null;
-  sessionStateErrorAfter = 1;
-  sessionStateChecks = 0;
+  containerStateError = null;
+  containerStateErrorAfter = 1;
+  containerStateChecks = 0;
   execExitCode = 0;
   // INT-05: the real window is 250 ms x 3 s; the tests only care that it re-checks
   STOP_RECHECK.intervalMs = 5;
@@ -124,7 +124,7 @@ beforeEach(async () => {
   openedWith = null;
   stream = stubExecStream() as ReturnType<typeof stubExecStream> & TestStream;
   server = http.createServer((_req, res) => res.end('ok'));
-  handle = attachTerminalWs(server, makeCtx());
+  handle = attachSessionWs(server, makeCtx());
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
 });
 
@@ -134,7 +134,7 @@ afterEach(async () => {
   await new Promise<void>((resolve) => server.close(() => resolve()));
 });
 
-describe('attachTerminalWs', () => {
+describe('attachSessionWs', () => {
   it('refuses an unauthenticated upgrade with HTTP 401 before the handshake', async () => {
     authState.ok = false;
     const ws = connect();
@@ -149,7 +149,7 @@ describe('attachTerminalWs', () => {
 
   it('leaves upgrades on other paths to other handlers', async () => {
     const seen: string[] = [];
-    // registered after attachTerminalWs: it only ever runs if our handler left the socket alone
+    // registered after attachSessionWs: it only ever runs if our handler left the socket alone
     server.on('upgrade', (req, socket) => {
       seen.push(req.url ?? '');
       expect(socket.destroyed).toBe(false);
@@ -170,12 +170,12 @@ describe('attachTerminalWs', () => {
     const ready = await nextText(ws);
     expect(ready).toMatchObject({
       type: 'ready',
-      terminalId: 't1',
-      session: 'web',
+      sessionId: 't1',
+      container: 'web',
       hostId: 'edge',
       shell: 'bash',
       agentId: null,
-      name: 'main',
+      session: 'main',
       tmux: true,
       reattached: false,
       cols: 100,
@@ -185,7 +185,7 @@ describe('attachTerminalWs', () => {
   });
 
   it('decodes shell=agent:<id> and reports it back in ready', async () => {
-    const ws = connect('session=web&shell=agent:opencode&name=main');
+    const ws = connect('container=web&shell=agent:opencode&session=main');
     const ready = await nextText(ws);
     expect(openedWith).toEqual({ shell: 'agent', agentId: 'opencode' });
     expect(ready).toMatchObject({ type: 'ready', shell: 'agent', agentId: 'opencode' });
@@ -194,14 +194,14 @@ describe('attachTerminalWs', () => {
 
   // v0.1 clients (and bookmarked URLs) keep working
   it('accepts the deprecated shell=claude as agent:claude', async () => {
-    const ws = connect('session=web&shell=claude&name=main');
+    const ws = connect('container=web&shell=claude&session=main');
     const ready = await nextText(ws);
     expect(openedWith).toEqual({ shell: 'agent', agentId: 'claude' });
     expect(ready).toMatchObject({ shell: 'agent', agentId: 'claude' });
     ws.close();
   });
 
-  it('inspects the finished exec on the SESSION host', async () => {
+  it('inspects the finished exec on the CONTAINER host', async () => {
     const ws = connect();
     await nextText(ws);
     const closed = nextClose(ws);
@@ -261,39 +261,39 @@ describe('attachTerminalWs', () => {
     // the transport close code (1006 from the portainer exec socket) is NOT an exit status
     stream.emitClose(1006);
     expect(await exit).toEqual({ type: 'exit', code: 3 });
-    expect(await closed).toBe(TERMINAL_CLOSE.normal);
+    expect(await closed).toBe(SESSION_CLOSE.normal);
     expect(unregistered).toContain('t1');
   });
 
-  it('closes 4409 when the exec ends because the session was stopped', async () => {
-    sessionStateError = AppError.conflict("session 'web' is not running");
+  it('closes 4409 when the exec ends because the container was stopped', async () => {
+    containerStateError = AppError.conflict("container 'web' is not running");
     const ws = connect();
     await nextText(ws);
     const message = nextText(ws);
     const closed = nextClose(ws);
     stream.emitClose(1006);
-    expect(await message).toMatchObject({ type: 'error', code: 'session_not_running' });
-    expect(await closed).toBe(TERMINAL_CLOSE.sessionNotRunning);
+    expect(await message).toMatchObject({ type: 'error', code: 'container_not_running' });
+    expect(await closed).toBe(SESSION_CLOSE.containerNotRunning);
     expect(unregistered).toContain('t1');
   });
 
-  // INT-05: stopping a session kills the exec ~60 ms after the request, but the engine
+  // INT-05: stopping a container kills the exec ~60 ms after the request, but the engine
   // needs ~170 ms to report the container as exited - so the first state check still says
   // "running" and the pane used to get `exit 137` + 1000 ("[process exited (137)]").
   it.each([137, 143, null])(
     're-checks the container state after exit %s and closes 4409 once the stop lands',
     async (exitCode) => {
       execExitCode = exitCode;
-      sessionStateError = AppError.conflict("session 'web' is not running");
-      sessionStateErrorAfter = 3; // the first two checks race the stop and see "running"
+      containerStateError = AppError.conflict("container 'web' is not running");
+      containerStateErrorAfter = 3; // the first two checks race the stop and see "running"
       const ws = connect();
       await nextText(ws);
       const message = nextText(ws);
       const closed = nextClose(ws);
       stream.emitClose(1006);
-      expect(await message).toMatchObject({ type: 'error', code: 'session_not_running' });
-      expect(await closed).toBe(TERMINAL_CLOSE.sessionNotRunning);
-      expect(sessionStateChecks).toBeGreaterThanOrEqual(3);
+      expect(await message).toMatchObject({ type: 'error', code: 'container_not_running' });
+      expect(await closed).toBe(SESSION_CLOSE.containerNotRunning);
+      expect(containerStateChecks).toBeGreaterThanOrEqual(3);
     },
   );
 
@@ -305,8 +305,8 @@ describe('attachTerminalWs', () => {
     const closed = nextClose(ws);
     stream.emitClose(1006);
     expect(await exit).toEqual({ type: 'exit', code: 0 });
-    expect(await closed).toBe(TERMINAL_CLOSE.normal);
-    expect(sessionStateChecks).toBe(1);
+    expect(await closed).toBe(SESSION_CLOSE.normal);
+    expect(containerStateChecks).toBe(1);
   });
 
   it('reports exit 137 when the container is still running after the re-check window', async () => {
@@ -317,23 +317,23 @@ describe('attachTerminalWs', () => {
     const closed = nextClose(ws);
     stream.emitClose(1006);
     expect(await exit).toEqual({ type: 'exit', code: 137 });
-    expect(await closed).toBe(TERMINAL_CLOSE.normal);
-    expect(sessionStateChecks).toBeGreaterThan(1);
+    expect(await closed).toBe(SESSION_CLOSE.normal);
+    expect(containerStateChecks).toBeGreaterThan(1);
   });
 
-  it('closes 4404 when the exec ends because the session is gone', async () => {
-    sessionStateError = AppError.notFound("session 'web' does not exist");
+  it('closes 4404 when the exec ends because the container is gone', async () => {
+    containerStateError = AppError.notFound("container 'web' does not exist");
     const ws = connect();
     await nextText(ws);
     const message = nextText(ws);
     const closed = nextClose(ws);
     stream.emitClose(1006);
-    expect(await message).toMatchObject({ type: 'error', code: 'session_not_found' });
-    expect(await closed).toBe(TERMINAL_CLOSE.sessionNotFound);
+    expect(await message).toMatchObject({ type: 'error', code: 'container_not_found' });
+    expect(await closed).toBe(SESSION_CLOSE.containerNotFound);
   });
 
-  it('still reports a normal exit when the session state cannot be confirmed', async () => {
-    sessionStateError = new Error('portainer unreachable');
+  it('still reports a normal exit when the container state cannot be confirmed', async () => {
+    containerStateError = new Error('portainer unreachable');
     execExitCode = null;
     const ws = connect();
     await nextText(ws);
@@ -341,17 +341,17 @@ describe('attachTerminalWs', () => {
     const closed = nextClose(ws);
     stream.emitClose(1006);
     expect(await exit).toEqual({ type: 'exit', code: null });
-    expect(await closed).toBe(TERMINAL_CLOSE.normal);
+    expect(await closed).toBe(SESSION_CLOSE.normal);
   });
 
   it.each([
-    ['session=web&shell=bash', TERMINAL_CLOSE.badRequest],
-    ['session=Bad Name&shell=bash&name=main', TERMINAL_CLOSE.badRequest],
-    ['session=web&shell=fish&name=main', TERMINAL_CLOSE.badRequest],
-    ['session=web&shell=agent&name=main', TERMINAL_CLOSE.badRequest],
-    ['session=web&shell=agent:&name=main', TERMINAL_CLOSE.badRequest],
-    ['session=web&shell=agent:NOPE&name=main', TERMINAL_CLOSE.badRequest],
-    ['session=web&shell=bash&name=' + 'x'.repeat(60), TERMINAL_CLOSE.badRequest],
+    ['container=web&shell=bash', SESSION_CLOSE.badRequest],
+    ['container=Bad Name&shell=bash&session=main', SESSION_CLOSE.badRequest],
+    ['container=web&shell=fish&session=main', SESSION_CLOSE.badRequest],
+    ['container=web&shell=agent&session=main', SESSION_CLOSE.badRequest],
+    ['container=web&shell=agent:&session=main', SESSION_CLOSE.badRequest],
+    ['container=web&shell=agent:NOPE&session=main', SESSION_CLOSE.badRequest],
+    ['container=web&shell=bash&session=' + 'x'.repeat(60), SESSION_CLOSE.badRequest],
   ])('closes %s with %i', async (query, expected) => {
     const ws = connect(query);
     const code = await nextClose(ws);
@@ -359,23 +359,31 @@ describe('attachTerminalWs', () => {
   });
 
   it.each([
-    [AppError.notFound("session 'web' does not exist"), TERMINAL_CLOSE.sessionNotFound, 'session_not_found'],
-    [AppError.conflict("session 'web' is not running"), TERMINAL_CLOSE.sessionNotRunning, 'session_not_running'],
-    [AppError.backendNotConfigured(), TERMINAL_CLOSE.backendError, 'backend_error'],
-    // v0.2: both are TERMINAL conditions - the client must not auto-reconnect
     [
-      TerminalRefusal.agentNotAvailable("agent 'opencode' is not available in session 'web'"),
-      TERMINAL_CLOSE.agentNotAvailable,
+      AppError.notFound("container 'web' does not exist"),
+      SESSION_CLOSE.containerNotFound,
+      'container_not_found',
+    ],
+    [
+      AppError.conflict("container 'web' is not running"),
+      SESSION_CLOSE.containerNotRunning,
+      'container_not_running',
+    ],
+    [AppError.backendNotConfigured(), SESSION_CLOSE.backendError, 'backend_error'],
+    // v0.2: both are FINAL conditions - the client must not auto-reconnect
+    [
+      SessionRefusal.agentNotAvailable("agent 'opencode' is not available in container 'web'"),
+      SESSION_CLOSE.agentNotAvailable,
       'agent_not_available',
     ],
     [
-      TerminalRefusal.hostUnavailable("the host 'edge' of session 'web' no longer exists"),
-      TERMINAL_CLOSE.hostUnavailable,
+      SessionRefusal.hostUnavailable("the host 'edge' of container 'web' no longer exists"),
+      SESSION_CLOSE.hostUnavailable,
       'host_unavailable',
     ],
     // a host whose connection type this version cannot talk to (tcp/ssh) is the same thing
-    [AppError.notImplemented('connection type ssh is not implemented'), TERMINAL_CLOSE.hostUnavailable, 'host_unavailable'],
-    [new Error('boom'), TERMINAL_CLOSE.internal, 'internal'],
+    [AppError.notImplemented('connection type ssh is not implemented'), SESSION_CLOSE.hostUnavailable, 'host_unavailable'],
+    [new Error('boom'), SESSION_CLOSE.internal, 'internal'],
   ])('maps open failures to the documented close code', async (err, closeCode, errorCode) => {
     openError = err;
     const ws = connect();
@@ -402,7 +410,7 @@ describe('ending a pane for good', () => {
     await nextText(ws);
     const closed = nextClose(ws);
     ws.send(JSON.stringify({ type: 'kill' }));
-    expect(await closed).toBe(TERMINAL_CLOSE.normal);
+    expect(await closed).toBe(SESSION_CLOSE.normal);
     await vi.waitFor(() => expect(killed).toEqual(['web/main']));
     expect(stream.closed).toBe(true);
   });
@@ -410,7 +418,7 @@ describe('ending a pane for good', () => {
   it('kills it when the client closes with 4001', async () => {
     const ws = connect();
     await nextText(ws);
-    ws.close(TERMINAL_CLOSE.paneClosed, 'pane closed');
+    ws.close(SESSION_CLOSE.paneClosed, 'pane closed');
     await vi.waitFor(() => expect(killed).toEqual(['web/main']));
   });
 

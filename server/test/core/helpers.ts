@@ -13,9 +13,9 @@ import { CredentialStore } from '../../src/hosts/credentials.js';
 import { HostManager } from '../../src/hosts/manager.js';
 import { AgentRegistry } from '../../src/agents/registry.js';
 import { createAuthService } from '../../src/auth/index.js';
-import { SessionService } from '../../src/sessions/service.js';
+import { ContainerService } from '../../src/containers/service.js';
 import { ImageService } from '../../src/images/service.js';
-import { TerminalService } from '../../src/terminals/service.js';
+import { SessionService } from '../../src/sessions/service.js';
 import type { AppContext, ServiceDeps } from '../../src/context.js';
 
 export const TEST_PASSWORD = 'test-password';
@@ -69,9 +69,9 @@ export async function buildContext(env: Record<string, string> = {}): Promise<{ 
     secrets,
     auth: createAuthService({ config, secrets, env: parsed, log }),
     credentials,
-    sessions: new SessionService(deps),
+    containers: new ContainerService(deps),
     images,
-    terminals: new TerminalService(deps, new SessionService(deps), images),
+    sessions: new SessionService(deps, new ContainerService(deps), images),
     version: '0.0.0-test',
     startedAt: Date.now(),
   };

@@ -17,7 +17,7 @@ import {
 } from '../config/schema.js';
 import type { SanitizedSettings } from '../config/schema.js';
 import { socketAvailable } from '../backends/index.js';
-import { SESSION_COOKIE, shouldUseSecureCookie } from '../auth/index.js';
+import { AUTH_COOKIE, shouldUseSecureCookie } from '../auth/index.js';
 
 /**
  * GET  /api/settings                      -> SanitizedSettings
@@ -81,7 +81,7 @@ export function createSettingsRouter(ctx: AppContext, vendor?: VendorMountResult
       const input = parseBody(PasswordChangeInputSchema, req);
       await ctx.auth.changePassword(input.currentPassword, input.newPassword);
       const secure = shouldUseSecureCookie(ctx, req as unknown as { secure?: boolean; headers: Record<string, unknown> });
-      res.cookie(SESSION_COOKIE, ctx.auth.issueToken(), ctx.auth.cookieOptions(secure));
+      res.cookie(AUTH_COOKIE, ctx.auth.issueToken(), ctx.auth.cookieOptions(secure));
       res.json({ ok: true });
     }),
   );

@@ -89,7 +89,7 @@ export const HostOverridesSchema = z.object(GENERAL_FIELD_SCHEMAS).partial();
 export type HostOverrides = z.infer<typeof HostOverridesSchema>;
 
 export const HostAgentsConfigSchema = z.object({
-  /** agent ids installed into this host's tools volume and mounted into its sessions */
+  /** agent ids installed into this host's tools volume and mounted into its containers */
   enabled: z.array(AgentIdSchema).max(64).default([]),
 });
 
@@ -162,8 +162,8 @@ export interface HostView {
   settings: Record<string, unknown>;
   overrides: HostOverrides;
   agents: { enabled: string[] };
-  /** number of stored sessions pinned to this host */
-  sessionCount: number;
+  /** number of stored containers pinned to this host */
+  containerCount: number;
   notes: string | null;
   createdAt: string;
   updatedAt: string;

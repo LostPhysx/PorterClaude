@@ -17,7 +17,7 @@ import type { ServiceDeps } from '../context.js';
 import type { GeneralConfig } from '../config/schema.js';
 import type { BuildLogLine, DockerBackend, ImageSummary } from '../backends/types.js';
 import { AppError } from '../http/errors.js';
-import { CONTAINER_LABELS, IMAGE_LABELS } from '../sessions/model.js';
+import { CONTAINER_LABELS, IMAGE_LABELS } from '../containers/model.js';
 import type { HostConfig } from '../hosts/model.js';
 import type { AgentDefinition, ToolsAgentManifest } from '../agents/model.js';
 import { TOOLS_AGENTS_ENV, TOOLS_AGENT_MANIFEST, agentAuthVolumeFor } from '../agents/model.js';
@@ -72,8 +72,8 @@ export interface RecipeStatus extends RecipeDef {
 /**
  * One look INSIDE the tools volume: `error` separates "cannot read" from "there is none".
  *
- * `bootstrap` is what makes a session startable at all — every v0.2 container runs
- * `<toolsMount>/entrypoint.sh` as its entrypoint (sessions/container.ts), so a volume without
+ * `bootstrap` is what makes a container startable at all — every v0.2 container runs
+ * `<toolsMount>/entrypoint.sh` as its entrypoint (containers/container.ts), so a volume without
  * it crash-loops the container before anything else can go wrong. `null` means the volume
  * could not be looked into (no image on the engine to read it with), which callers must treat
  * as "unknown", never as "not synced".
@@ -133,7 +133,7 @@ export interface CustomImageCheck {
   pulled: boolean;
   architecture: string | null;
   user: string | null;
-  /** e.g. "no tmux: terminals will not survive a reload", "no package manager detected" */
+  /** e.g. "no tmux: sessions will not survive a reload", "no package manager detected" */
   warnings: string[];
   error: string | null;
 }
@@ -159,7 +159,7 @@ const TOOLS_BOOTSTRAP_MARKER = 'PC_TOOLS_BOOTSTRAP_OK';
 
 /**
  * One `sh -c` that answers both questions the tools volume is asked: is the bootstrap the
- * session entrypoint needs there, and what does AGENTS.json say. The marker carries no
+ * container entrypoint needs there, and what does AGENTS.json say. The marker carries no
  * braces, so `parseAgentManifest` (first `{` .. last `}`) is unaffected by it.
  */
 const TOOLS_PROBE_CMD =
@@ -269,7 +269,7 @@ interface JobRecord {
   /**
    * Settles when the runner is done, whatever the outcome (it never rejects — the status
    * carries the result). `awaitJob` is what lets a caller that is ALREADY running in the
-   * background — the session preparation — wait for a build/sync instead of polling.
+   * background — the container preparation — wait for a build/sync instead of polling.
    */
   done: Promise<void>;
 }
@@ -381,8 +381,8 @@ export class ImageService {
    *
    * A rebuild whose context hash still matches the built image is SKIPPED (exactly like
    * syncTools): a fully cached rebuild used to produce a new image id anyway - the labels
-   * carried a fresh timestamp - which untagged the image every existing session runs, so
-   * those sessions started reporting a bare `sha256:…` and the old image could not be
+   * carried a fresh timestamp - which untagged the image every existing container runs, so
+   * those containers started reporting a bare `sha256:…` and the old image could not be
    * collected. `force` (or `noCache`/`pull`, which only make sense when the user wants a
    * real rebuild, e.g. to pick up a new base image) always builds.
    */
@@ -781,7 +781,7 @@ export class ImageService {
       'mkdir -p /auth/claude',
       // Copy ENTRY BY ENTRY and never clobber, instead of "only into an empty directory":
       // the target volume is regularly non-empty by the time the first tools sync runs
-      // (v0.2 creates <prefix>auth-claude on the first session create, and an agent terminal
+      // (v0.2 creates <prefix>auth-claude on the first container create, and an agent session
       // opened before the sync already writes cache/ and projects/ into it). An
       // all-or-nothing guard skips the WHOLE import then — .credentials.json included — and
       // the marker below makes that permanent, so the operator silently loses the v0.1 login.
@@ -1026,14 +1026,14 @@ export class ImageService {
       result.architecture = inspect.architecture ?? null;
       result.user = inspect.user && inspect.user.length ? inspect.user : 'root';
 
-      // The per-agent auth volumes are seeded by the first session that mounts them and are
-      // owned by ONE uid (the recipes' 1000); the session's HOME is pinned to
+      // The per-agent auth volumes are seeded by the first container that mounts them and are
+      // owned by ONE uid (the recipes' 1000); the container's HOME is pinned to
       // general.containerHome so the agents write into them (backend.md v0.2 section 12.3).
       const uid = result.user.split(':')[0] ?? '';
       if (uid === 'root' || uid === '0') {
         result.warnings.push(
           'this image runs as root: the agents write into the shared auth volumes as root, ' +
-            'so recipe sessions (uid 1000) may not be able to read those files',
+            'so recipe containers (uid 1000) may not be able to read those files',
         );
       } else if (uid !== '1000' && uid !== 'dev') {
         result.warnings.push(
@@ -1045,11 +1045,11 @@ export class ImageService {
       const probe = await this.probeImage(backend, image);
       if (probe === null) {
         result.warnings.push(
-          'could not run a shell in this image: terminals may not work (distroless images are not supported)',
+          'could not run a shell in this image: sessions may not work (distroless images are not supported)',
         );
       } else {
         if (!probe.tmux) {
-          result.warnings.push('no tmux in this image: terminals will not survive a reload');
+          result.warnings.push('no tmux in this image: sessions will not survive a reload');
         }
         if (!probe.packageManager) {
           result.warnings.push('no package manager detected: git/tmux cannot be installed automatically');
@@ -1191,11 +1191,11 @@ export class ImageService {
   }
 
   /**
-   * Is the tools volume of `hostId` usable by a SESSION (INT2-2)?
+   * Is the tools volume of `hostId` usable by a CONTAINER (INT2-2)?
    *
    *   'ready'    - the volume carries `<toolsMount>/entrypoint.sh`, so a container created
    *                against it can actually start;
-   *   'unsynced' - the volume does not exist, or exists without the bootstrap: EVERY session
+   *   'unsynced' - the volume does not exist, or exists without the bootstrap: EVERY container
    *                on this host would crash-loop with
    *                `exec <toolsMount>/entrypoint.sh failed: No such file or directory`
    *                (docker creates the empty volume on the way, so the second attempt is no
@@ -1204,7 +1204,7 @@ export class ImageService {
    *                the engine to read the volume with). Like every other probe in this
    *                codebase, 'unknown' must never block something that would work.
    *
-   * `opts.probeImage` is an image known to exist ON THAT ENGINE (the session's own image): it
+   * `opts.probeImage` is an image known to exist ON THAT ENGINE (the container's own image): it
    * lets the volume be read even when the tools image was never built or has been pruned,
    * which is exactly the "never synced" case this gate is for.
    */
@@ -1221,7 +1221,7 @@ export class ImageService {
     try {
       const volumes = await backend.listVolumes();
       // the volume does not exist yet: nothing was ever synced here, and docker would create
-      // it empty on the way into the session
+      // it empty on the way into the container
       if (!volumes.some((v) => v.name === general.toolsVolume)) return 'unsynced';
     } catch (err) {
       this.deps.log.debug({ err, hostId }, 'listing volumes for the tools readiness failed');
@@ -1508,7 +1508,7 @@ export class ImageService {
   //
   // buildRecipe()/syncTools() are the USER-facing entry points: they refuse (409) when the
   // same job is already running, because a second click on "Build" is a mistake. The three
-  // methods below are the MACHINE-facing twins used by SessionService.prepare(): a session
+  // methods below are the MACHINE-facing twins used by ContainerService.prepare(): a container
   // that needs an image which is already being built must JOIN that build, not fail. They
   // are also the only place that decides "already fine, do nothing" -> `null`.
   // -------------------------------------------------------------------------
@@ -1544,7 +1544,7 @@ export class ImageService {
   }
 
   /**
-   * Make sure the tools volume of the host can carry a session. Returns the sync job, or
+   * Make sure the tools volume of the host can carry a container. Returns the sync job, or
    * `null` when the volume is already usable — or when readiness cannot be established
    * ('unknown'), which must never trigger a multi-minute sync on a guess.
    */

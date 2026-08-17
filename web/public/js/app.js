@@ -3,12 +3,12 @@
 // CONTRACT (FROZEN): every view module exports a default object implementing ViewModule:
 //   { init(ctx): Promise<void>|void, show(): void, hide(): void, refresh?(): void }
 // app.js calls init() once (after authentication), then show()/hide() on route changes.
-// F2 owns codeView; F1 owns sessionsView / settingsView. app.js never reaches inside them.
+// F2 owns codeView; F1 owns containersView / settingsView. app.js never reaches inside them.
 import { api, ApiError } from './api.js';
 import { bus, EVENTS } from './bus.js';
 import { byId, toast, toastError, storage, LS_PREFIX } from './util.js';
 import codeView from './code.js';
-import sessionsView from './sessions.js';
+import containersView from './containers.js';
 import settingsView from './settings.js';
 import { loadHosts, resolveUnknownStatuses, getHosts, getDefaultHostId, hostLabel } from './hosts.js';
 import { loadAgents } from './agents.js';
@@ -25,20 +25,20 @@ import { loadAgents } from './agents.js';
  * @typedef {Object} AppContext
  * @property {typeof api} api
  * @property {typeof bus} bus
- * @property {(view: 'code'|'sessions'|'settings') => void} navigate
+ * @property {(view: 'code'|'containers'|'settings') => void} navigate
  * @property {() => any} getSettings    last GET /api/settings payload (may be null)
  * @property {() => 'dark'|'light'} getTheme
  */
 
-export const VIEWS = /** @type {const} */ (['code', 'sessions', 'settings']);
+export const VIEWS = /** @type {const} */ (['code', 'containers', 'settings']);
 export const DEFAULT_VIEW = 'code';
 export const LS_LAST_VIEW = `${LS_PREFIX}lastView`;
 
-/** Session-poll interval used by sessions.js; F2 relies on SESSIONS_CHANGED, not on timing. */
-export const SESSION_POLL_MS = 5000;
+/** Container-poll interval used by containers.js; F2 relies on CONTAINERS_CHANGED, not timing. */
+export const CONTAINER_POLL_MS = 5000;
 
 /** @type {Record<string, ViewModule>} */
-const views = { code: codeView, sessions: sessionsView, settings: settingsView };
+const views = { code: codeView, containers: containersView, settings: settingsView };
 
 /** @type {any|null} last GET /api/settings payload */
 let appSettings = null;
@@ -262,7 +262,7 @@ export function navigate(view) {
 }
 
 /**
- * Hash routing: '#/code' | '#/sessions' | '#/settings' (anything else -> the last view
+ * Hash routing: '#/code' | '#/containers' | '#/settings' (anything else -> the last view
  * remembered in localStorage, else DEFAULT_VIEW).
  */
 export function route() {
@@ -297,7 +297,7 @@ export function route() {
 
 /**
  * v0.2: the host list and the agent registry are global state every view needs on its first
- * paint (F2's rail groups by host, its new-terminal menu labels agent ids). Both are loaded
+ * paint (F2's rail groups by host, its new-session menu labels agent ids). Both are loaded
  * ONCE here, before any view.init(), and refreshed through their own bus events afterwards.
  * Neither failure is fatal: the views degrade to ids/empty selects.
  */
@@ -427,16 +427,16 @@ export async function boot() {
     showLogin();
   });
 
-  let session = null;
+  let me = null;
   try {
-    session = await api.auth.session();
+    me = await api.auth.me();
   } catch (err) {
-    console.error('[app] /api/auth/session failed', err);
+    console.error('[app] /api/auth/me failed', err);
     setLoginError('Cannot reach the server.');
   }
 
   const hint = byId('login-setup-hint');
-  if (session && session.needsSetup) {
+  if (me && me.needsSetup) {
     if (hint) hint.classList.remove('d-none');
     const input = byId('login-password');
     if (input) input.disabled = true;
@@ -447,7 +447,7 @@ export async function boot() {
   }
   if (hint) hint.classList.add('d-none');
 
-  if (session && session.authenticated) {
+  if (me && me.authenticated) {
     await startApp();
   } else {
     showLogin();

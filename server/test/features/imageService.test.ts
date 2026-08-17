@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { ImageService, parseAgentManifest, parseClaudeVersion } from '../../src/images/service.js';
 import { RECIPES } from '../../src/images/recipes.js';
-import { IMAGE_LABELS } from '../../src/sessions/model.js';
+import { IMAGE_LABELS } from '../../src/containers/model.js';
 import { hashContext } from '../../src/images/tarContext.js';
 import {
   generalConfig,

@@ -8,7 +8,7 @@ Secrets live in `deploy/.env` (gitignored); [`.env.example`](.env.example) docum
 key with placeholders. **Never commit a real Portainer API key.**
 
 **Scope.** Everything in this directory is about *shipping the app container*. The docker
-hosts PorterClaude manages, the coding agents installed on each of them and the session
+hosts PorterClaude manages, the coding agents installed on each of them and the container
 images are configured **inside the app** — see [../docs/DEPLOYMENT.md](../docs/DEPLOYMENT.md)
 and [../docs/AGENTS.md](../docs/AGENTS.md). The rendered stack sets
 `PORTERCLAUDE_BACKEND=socket`, which seeds the *first* host as the engine the app runs on and
@@ -139,7 +139,7 @@ action flag, and `--dry-run` prints exactly what each one would do.
 |---|---|
 | `--clean` | remove containers labelled `porterclaude.managed=true` **and** named `pc-qa-*` / `pc-o1-*` (override with `HOST_PREP_PREFIXES`), together with their `porterclaude-ws-*` / `porterclaude-hist-*` volumes — the named volumes are read off the container *before* it is deleted, because `?v=1` only drops anonymous ones. The per-agent `porterclaude-auth-*` volumes (the logins) are never touched |
 | `--prune` | remove **dangling** images that carry a `porterclaude.*` label (a rebuild leaves 0.6–1.4 GB behind each time); `409 Conflict` = still referenced, kept |
-| `--vhost` | write `vhost.d/<portainer-host>` (long build + tools-sync streams) and `vhost.d/<app-host>` (idle terminal WebSockets). The host directory is read from the nginx-proxy container's own mount of `/etc/nginx/vhost.d`, falling back to `NGINX_VHOST_DIR` / `/srv/nginx/vhost.d`; the files are written by a throwaway `alpine` container with that directory bind-mounted |
+| `--vhost` | write `vhost.d/<portainer-host>` (long build + tools-sync streams) and `vhost.d/<app-host>` (idle session WebSockets). The host directory is read from the nginx-proxy container's own mount of `/etc/nginx/vhost.d`, falling back to `NGINX_VHOST_DIR` / `/srv/nginx/vhost.d`; the files are written by a throwaway `alpine` container with that directory bind-mounted |
 | `--reload` | `SIGHUP` the nginx-proxy container so it reloads |
 | `--all` | all four, in that order |
 | `--dry-run` | change nothing; print every action, the vhost file contents, and a final count |
@@ -173,7 +173,7 @@ A v0.1 env file that still carries the single `PROXY_NETWORKS=<app>,<edge>` keep
 app, second = edge) and logs the mapping, instead of ignoring the variable silently.
 
 `porterclaude-data` must persist: it holds `secret.key`, which encrypts the stored Portainer
-keys and signs session cookies. The **agent logins** are not in it — they live on each
+keys and signs login cookies. The **agent logins** are not in it — they live on each
 managed docker host in the per-agent volumes `porterclaude-auth-<agentId>`
 ([../docs/DEPLOYMENT.md](../docs/DEPLOYMENT.md#volumes-created-on-a-managed-host)).
 
@@ -192,4 +192,4 @@ managed docker host in the per-agent volumes `porterclaude-auth-<agentId>`
 | `could not detect the docker socket gid` | the probe container could not run; put `DOCKER_GID` (from `stat -c %g /var/run/docker.sock`) into `deploy/.env`. Symptom of getting it wrong: the app starts, but Settings reports the socket as unavailable |
 | `the build endpoint did not return Docker JSON output` | the response was an HTML/plain-text error page (proxy, WAF, wrong `PORTAINER_URL` path) rather than Docker's JSON lines |
 | `the build stream ended without a success marker` | the connection dropped mid-build, so the image is incomplete; the run stops instead of redeploying the previous image |
-| `health check timed out` | check the container logs for the stack in Portainer; the proxy also needs `Upgrade`/`Connection` forwarding for terminals |
+| `health check timed out` | check the container logs for the stack in Portainer; the proxy also needs `Upgrade`/`Connection` forwarding for the session WebSocket |

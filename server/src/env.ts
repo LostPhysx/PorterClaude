@@ -26,6 +26,10 @@ export const EnvSchema = z.object({
   /** 'auto' => secure cookie when the request arrived over https (X-Forwarded-Proto aware) */
   COOKIE_SECURE: z.enum(['auto', 'true', 'false']).default('auto'),
   TRUST_PROXY: z.string().default('1'),
+  /**
+   * Lifetime of the LOGIN cookie, in days. The NAME is frozen: it is read from deploy/.env
+   * on live installs, and renaming it silently reverts the TTL to the 30-day default there.
+   */
   SESSION_TTL_DAYS: z.coerce.number().int().positive().default(30),
   /** override the directory that holds docker/recipes + docker/tools (default <repo>/docker) */
   PORTERCLAUDE_DOCKER_DIR: z.string().optional(),

@@ -1,5 +1,5 @@
 // OWNER: B1. AgentRegistry: built-ins ∪ custom definitions, and how they resolve per
-// host / per session (that resolution is what sessions/container.ts mounts).
+// host / per container (that resolution is what containers/container.ts mounts).
 import { describe, it, expect, afterEach } from 'vitest';
 import { rm } from 'node:fs/promises';
 import { buildContext } from './helpers.js';
@@ -119,7 +119,7 @@ describe('AgentRegistry', () => {
     const ctx = await ctxFor();
     await ctx.agents.create(custom);
     await hostWith(ctx, ['claude', 'mycoder']);
-    await ctx.config.putSession({
+    await ctx.config.putContainer({
       name: 'web',
       hostId: 'local',
       agents: ['claude', 'mycoder'],
@@ -141,24 +141,24 @@ describe('AgentRegistry', () => {
     await ctx.agents.remove('mycoder', { force: true });
     expect(ctx.agents.get('mycoder')).toBeNull();
     expect(ctx.hosts.require('local').agents.enabled).toEqual(['claude']);
-    expect(ctx.config.getSession('web')?.agents).toEqual(['claude']);
+    expect(ctx.config.getContainer('web')?.agents).toEqual(['claude']);
   });
 
-  it('resolves the agents of a host and of a session, sorted and filtered to known ids', async () => {
+  it('resolves the agents of a host and of a container, sorted and filtered to known ids', async () => {
     const ctx = await ctxFor();
     await ctx.agents.create(custom);
     const host = await hostWith(ctx, ['opencode', 'claude', 'ghost']);
 
     expect(ctx.agents.enabledForHost(host).map((a) => a.id)).toEqual(['claude', 'opencode']);
-    expect(ctx.agents.resolveForSession(host, { agents: null }).map((a) => a.id)).toEqual([
+    expect(ctx.agents.resolveForContainer(host, { agents: null }).map((a) => a.id)).toEqual([
       'claude',
       'opencode',
     ]);
-    // an explicit session list wins over the host's, unknown ids are dropped
+    // an explicit container list wins over the host's, unknown ids are dropped
     expect(
-      ctx.agents.resolveForSession(host, { agents: ['mycoder', 'gone', 'claude'] }).map((a) => a.id),
+      ctx.agents.resolveForContainer(host, { agents: ['mycoder', 'gone', 'claude'] }).map((a) => a.id),
     ).toEqual(['claude', 'mycoder']);
-    expect(ctx.agents.resolveForSession(host, { agents: [] })).toEqual([]);
+    expect(ctx.agents.resolveForContainer(host, { agents: [] })).toEqual([]);
 
     expect(ctx.agents.installSpecsForHost(host)).toEqual([
       {

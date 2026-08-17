@@ -2,10 +2,18 @@
 
 > **v0.2 (uniform agent delivery): the [v0.2 section](#v02--uniform-agent-delivery-authoritative-from-here-down)
 > at the end of this file wins wherever it contradicts the v0.1 text above it.**
+>
+> **v0.3 (phase R, the rename): what v0.2 called a *session* is a **container**** (`users.md`
+> §0). Nothing in `docker/` changes: the env var **`PORTERCLAUDE_SESSION` keeps its name** —
+> it is part of the container spec hash and `entrypoint.sh` reads it out of a tools volume
+> that upgrades independently of the server, so renaming it would report every existing
+> container as *needs recreate* and break every container whose tools volume is older than
+> the app. The label `porterclaude.session` did become `porterclaude.container`, but that is
+> written by the server and read by nothing in this topic.
 
 Companion to [`api.md`](api.md) (wire contract) and [`backend.md`](backend.md) (server
 internals). This topic owns everything that *produces or ships images and deployments*:
-the session recipe images, the tools volume payload, the PorterClaude app image, the
+the container recipe images, the tools volume payload, the PorterClaude app image, the
 generic compose file, the reference deployment script and the GitHub workflows.
 
 Nothing here runs on the dev box: **there is no docker CLI on the Windows machine.** All
@@ -39,7 +47,7 @@ docker/
   tools/
     Dockerfile                     O1  builds the payload for the shared tools volume
     fetch-claude.sh                O1  downloads the native claude binaries (4 targets)
-    entrypoint.sh                  O1  runtime bootstrap for CUSTOM session images
+    entrypoint.sh                  O1  runtime bootstrap for CUSTOM container images
     populate.sh                    O1  container CMD: copies the payload into /out
     README.md                      O1
 deploy/
@@ -73,9 +81,9 @@ From `docs/design/backend.md` §7/§9 and the backend planner's handoff. Hard re
 | Recipe tags | `porterclaude/<name>:latest` (namespace = `general.imageNamespace`) |
 | Image labels | `porterclaude.recipe`, `porterclaude.claude-version` set by the Dockerfile; `porterclaude.context-hash`, `porterclaude.built-at` added by the server at build time — Dockerfiles must not set the latter two |
 | Recipe runtime | user `dev` **uid 1000**, `HOME=/home/dev`, `WORKDIR /workspace`, idles via `sleep infinity`, ships `git tmux ripgrep jq curl` (+ `gh`, `unzip`) |
-| Session mounts | `porterclaude-claude` → `/home/dev/.claude`, `porterclaude-claude-home` → `/home/dev/.claude-home`, workspace → `/workspace`, `porterclaude-tools` (ro) → `/opt/porterclaude`, `porterclaude-hist-<slug>` → `/home/dev/.claude/projects` |
+| Container mounts | `porterclaude-claude` → `/home/dev/.claude`, `porterclaude-claude-home` → `/home/dev/.claude-home`, workspace → `/workspace`, `porterclaude-tools` (ro) → `/opt/porterclaude`, `porterclaude-hist-<slug>` → `/home/dev/.claude/projects` |
 | Tools image | `docker/tools/Dockerfile`, tagged `porterclaude/tools:latest`; its default `CMD` populates `/out` and exits 0; the result contains an **executable** `entrypoint.sh` |
-| Custom sessions | entrypoint `["/opt/porterclaude/entrypoint.sh"]`, cmd `["sleep","infinity"]`, env `PORTERCLAUDE_TOOLS=/opt/porterclaude`, `PORTERCLAUDE_HOME=/home/dev`, `HOME=/home/dev` (pinned so exec'ed terminals do not inherit the image's `/root`), `PORTERCLAUDE_SESSION=<slug>` |
+| Custom containers | entrypoint `["/opt/porterclaude/entrypoint.sh"]`, cmd `["sleep","infinity"]`, env `PORTERCLAUDE_TOOLS=/opt/porterclaude`, `PORTERCLAUDE_HOME=/home/dev`, `HOME=/home/dev` (pinned so exec'ed sessions do not inherit the image's `/root`), `PORTERCLAUDE_SESSION=<slug>` |
 | App image | start command `node server/dist/index.js`, `PORT=8080`, `DATA_DIR=/data`, healthcheck `GET /api/health`, `docker/` copied next to `server/` (`PORTERCLAUDE_DOCKER_DIR` defaults to `<repoRoot>/docker`, and `repoRoot = dirname(serverRoot)`), `web/public` present, `node_modules` present (vendor assets are served out of it) |
 | Builds | classic Docker Engine `/build` API — **no BuildKit syntax, no `RUN --mount`, no heredoc `COPY <<EOF`, no `--platform`**. Native-arch builds only; the same Dockerfile must work on amd64 and arm64 |
 
@@ -110,7 +118,7 @@ Responsibilities, in order:
 1. `set -eu`, `export DEBIAN_FRONTEND=noninteractive`.
 2. `apt-get update` + install: `ca-certificates curl wget git tmux ripgrep jq unzip zip
    less procps psmisc openssh-client gnupg nano file xz-utils`
-   (**no `sudo`** — sessions are unprivileged by design). Keep the list short; heavy
+   (**no `sudo`** — containers are unprivileged by design). Keep the list short; heavy
    toolchains belong in the per-recipe Dockerfile. `rm -rf /var/lib/apt/lists/*` at the end.
 3. `gh` (GitHub CLI) from the official apt repo, using `$(dpkg --print-architecture)` in the
    sources line so amd64/arm64 both resolve. If the repo is unreachable: warn and continue —
@@ -124,9 +132,9 @@ Responsibilities, in order:
      `useradd -m -u 1000 -g dev -s /bin/bash dev`;
    * `mkdir -p /home/dev/.claude/projects /home/dev/.claude-home /workspace` and
      `chown -R 1000:1000` (`chmod 0700` on `projects`). `projects` **must** ship in the
-     image: when a `shareHistory:false` session mounts `porterclaude-hist-<slug>` at
+     image: when a `shareHistory:false` container mounts `porterclaude-hist-<slug>` at
      `/home/dev/.claude/projects`, docker creates a missing mountpoint inside the shared
-     volume as `root:root` and every uid-1000 session then gets `EACCES` on
+     volume as `root:root` and every uid-1000 container then gets `EACCES` on
      `~/.claude/projects`. Shipping it lets docker's copy-up seed both the shared volume
      and each fresh history volume with the right owner; the server repairs volumes that
      already exist (`backend.md` §7, `prepareHistoryVolume`/`ensureProjectsDir`).
@@ -146,7 +154,7 @@ Responsibilities, in order:
    `/etc/porterclaude/claude-version`. A failure here **fails the build** (a recipe without
    `claude` is useless).
 7. `/etc/profile.d/porterclaude.sh`: `export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"`,
-   `export TERM="${TERM:-xterm-256color}"`, `export COLORTERM=truecolor`. Terminals start
+   `export TERM="${TERM:-xterm-256color}"`, `export COLORTERM=truecolor`. Sessions start
    login shells (`bash -l`), so `profile.d` is the correct hook.
 8. Write `/usr/local/bin/pc-entrypoint.sh` (heredoc inside `common.sh`, `chmod 0755`),
    POSIX `sh`:
@@ -225,7 +233,7 @@ downloads.
 /opt/porterclaude/bin/claude-linux-arm64-musl   0755  musl   arm64
 ```
 
-Everything is world-readable/executable (`chmod -R a+rX`) because sessions mount the volume
+Everything is world-readable/executable (`chmod -R a+rX`) because containers mount the volume
 **read-only** and run as arbitrary uids.
 
 ### 4.2 `fetch-claude.sh` (build time)
@@ -275,17 +283,17 @@ file over its target in `/out` (creating missing directories first). Print what 
 `exit 0`. The server runs this container once with the tools volume mounted rw at `/out`
 and treats a non-zero exit as a failed job (`backend.md` §9).
 
-> Why not a plain `cp -a /payload/. /out/`: re-syncing while a session is running `claude`
+> Why not a plain `cp -a /payload/. /out/`: re-syncing while a container is running `claude`
 > straight off the volume overwrites a **busy executable** and fails with `ETXTBSY`
 > ("Text file busy"), leaving the volume half-updated. `rename(2)` has no such restriction —
 > the running process keeps the old (now unlinked) inode and the next start picks up the new
-> binary, which is exactly the "existing sessions pick the new payload up on their next
+> binary, which is exactly the "existing containers pick the new payload up on their next
 > restart" behaviour `docker/tools/README.md` promises. Stale `/out/.pc-stage.*` directories
 > from an interrupted run are removed at the start of the next sync.
 
 ### 4.4 `entrypoint.sh` (runtime, inside arbitrary user images)
 
-PID 1 in a **custom** session container with `PORTERCLAUDE_TOOLS=/opt/porterclaude` (ro),
+PID 1 in a **custom** container with `PORTERCLAUDE_TOOLS=/opt/porterclaude` (ro),
 `PORTERCLAUDE_HOME=/home/dev`, `PORTERCLAUDE_SESSION=<slug>`, cmd `sleep infinity`.
 Strict POSIX `sh` (busybox ash / dash must run it) and **nothing in it may abort the
 container** — every step logs on failure and continues.
@@ -296,8 +304,8 @@ container** — every step logs on failure and continues.
    login volumes, so honouring the image's own home (`/root` for the root images most
    people pick, which is what `runc` derives from the passwd entry when nothing pins `HOME`)
    would make `claude` write its credentials *outside* the shared volumes and break
-   "log in once, every session is authenticated". The server pins `HOME=<containerHome>` in
-   the container env as well, so `docker exec`ed terminals see the same home — the two
+   "log in once, every container is authenticated". The server pins `HOME=<containerHome>` in
+   the container env as well, so `docker exec`ed sessions see the same home — the two
    halves are independent on purpose.
    Remember the image's own home in `IMAGE_HOME` for step 6: **when `PORTERCLAUDE_HOME` is
    set, take it from the passwd entry of `id -u`, not from `$HOME`** — the server has
@@ -307,7 +315,7 @@ container** — every step logs on failure and continues.
    (then passwd is the fallback). `/` counts as no home.
 2. `PATH="$TOOLS/bin:$HOME/.local/bin:$PATH"`; export it and persist it best-effort:
    `/etc/profile.d/porterclaude.sh` (when writable), `$HOME/.profile`, `$HOME/.bashrc`,
-   each guarded by a marker comment so repeats are no-ops. Terminals open login shells, so
+   each guarded by a marker comment so repeats are no-ops. Sessions open login shells, so
    this is what makes `claude` resolvable.
 3. When running as root and `/usr/local/bin` is writable, drop a 3-line wrapper
    `/usr/local/bin/claude` that execs `$TOOLS/bin/claude "$@"` (covers non-login shells).
@@ -348,7 +356,7 @@ Settings -> Images -> "Sync tools"
       createVolume(porterclaude-tools) if missing
       createContainer(image=porterclaude/tools:latest, binds=[porterclaude-tools:/out])
       startContainer -> waitContainer (exit 0) -> removeContainer  <- CMD = populate.sh
-  volume now holds entrypoint.sh + bin/* -> custom sessions can start
+  volume now holds entrypoint.sh + bin/* -> custom containers can start
 ```
 
 ---
@@ -542,7 +550,7 @@ them arch-native and lets operators customise them.
 | `claude.ai/install.sh` unreachable during a recipe build | build fails loudly; the server surfaces the log lines through the job API |
 | `gh` apt repo unreachable | warning, build continues |
 | Cross-arch claude binary missing in `fetch-claude.sh` | warning + native-installer fallback; the job fails only if *no* binary was obtained |
-| Custom image without a package manager | `entrypoint.sh` logs "degraded", the container still starts and terminals still work; the UI warns via `ready.tmux:false` |
+| Custom image without a package manager | `entrypoint.sh` logs "degraded", the container still starts and sessions still work; the UI warns via `ready.tmux:false` |
 | Custom image where `$HOME` is not writable | log, skip the symlink, continue |
 | `sleep infinity` unsupported | entrypoint's portable idle loop takes over |
 | App container cannot read `/var/run/docker.sock` | documented `group_add`; Settings reports `socketAvailable:false` |
@@ -581,11 +589,11 @@ Integration QA (needs the reference host):
 
 9. Settings → Images → build the `base` recipe → job succeeds → `porterclaude/base:latest`
    carries `porterclaude.recipe`; `outdated` flips after touching `common.sh`.
-10. Sync tools → volume `porterclaude-tools` exists → create a session on `alpine:3.20`
-    (musl!) → the container stays up and `claude --version` works in a terminal.
-11. Session on the `node` recipe → `id -u` is 1000; `git tmux rg jq gh claude` all resolve;
+10. Sync tools → volume `porterclaude-tools` exists → create a container on `alpine:3.20`
+    (musl!) → the container stays up and `claude --version` works in a session.
+11. Container on the `node` recipe → `id -u` is 1000; `git tmux rg jq gh claude` all resolve;
     `claude --version` matches `/etc/porterclaude/claude-version`.
-12. `php` recipe: session with port 80 published → the sample page renders.
+12. `php` recipe: container with port 80 published → the sample page renders.
 13. `deploy/deploy.sh` end-to-end → image built on the arm64 host → stack created, then a
     second run updates the same stack → `https://$APP_HOSTNAME/api/health` is `{"status":"ok"}`.
 
@@ -601,7 +609,7 @@ instead of rewriting.
 ## 11 What v0.2 changes, in one paragraph
 
 Coding agents (claude, opencode, gemini, codex, aider, plus custom ones) are no longer baked
-into the recipe images. **Every** session — recipe *and* custom — mounts the per-host tools
+into the recipe images. **Every** container — recipe *and* custom — mounts the per-host tools
 volume read-only and is started with `<toolsMount>/entrypoint.sh` as its entrypoint. The
 tools volume is populated per host by the tools image, which now installs the host's
 **enabled agents** at *populate* time (not build time) from the `PORTERCLAUDE_AGENTS` spec
@@ -653,11 +661,11 @@ O2  docker-compose.yml (root), deploy/**, .github/**, docs/** (except docs/desig
 | tools → volume | `<toolsMount>/agents/<id>/…` | the agent's files |
 | tools → volume | `<toolsMount>/bin/<command>` | the executable shim that ends up on `PATH` |
 | tools → volume | `<toolsMount>/runtime/node/bin/node`, `<toolsMount>/runtime/python` | bundled runtimes |
-| tools → volume | `<toolsMount>/entrypoint.sh` | 0755, the entrypoint of **every** session |
-| server → session | env `PORTERCLAUDE_AGENT_IDS` | `claude,opencode` |
-| server → session | env `PORTERCLAUDE_AGENT_LINKS` | `target\|source\|kind;target\|source\|kind` (`encodeAgentLinks`) |
-| server → session | env `PORTERCLAUDE_TOOLS`, `PORTERCLAUDE_HOME`, `HOME`, `PATH`, `PORTERCLAUDE_SESSION`, `PORTERCLAUDE_HOST`, `TERM` | as v0.1, plus `PORTERCLAUDE_HOST` |
-| server → session | entrypoint | `["<toolsMount>/entrypoint.sh"]` for **every** session; `cmd ["sleep","infinity"]` only for custom images (recipes keep their image CMD) |
+| tools → volume | `<toolsMount>/entrypoint.sh` | 0755, the entrypoint of **every** container |
+| server → container | env `PORTERCLAUDE_AGENT_IDS` | `claude,opencode` |
+| server → container | env `PORTERCLAUDE_AGENT_LINKS` | `target\|source\|kind;target\|source\|kind` (`encodeAgentLinks`) |
+| server → container | env `PORTERCLAUDE_TOOLS`, `PORTERCLAUDE_HOME`, `HOME`, `PATH`, `PORTERCLAUDE_SESSION`, `PORTERCLAUDE_HOST`, `TERM` | as v0.1, plus `PORTERCLAUDE_HOST` |
+| server → container | entrypoint | `["<toolsMount>/entrypoint.sh"]` for **every** container; `cmd ["sleep","infinity"]` only for custom images (recipes keep their image CMD) |
 | server → container | `<toolsMount>/entrypoint.sh --porterclaude-bootstrap` | root exec after start: re-run the steps that need a writable `$HOME` |
 | server → container | `<toolsMount>/entrypoint.sh --porterclaude-share` | root exec / shim call: hand the agent dirs back to their owner |
 
@@ -675,7 +683,7 @@ them, nothing breaks when it does not:
 
 | Env | Default | Meaning |
 |---|---|---|
-| `PORTERCLAUDE_TOOLS_MOUNT` | `/opt/porterclaude` | the path sessions mount the volume at (§13.2 — the reason absolute paths baked by `npm`/`uv` are correct) |
+| `PORTERCLAUDE_TOOLS_MOUNT` | `/opt/porterclaude` | the path containers mount the volume at (§13.2 — the reason absolute paths baked by `npm`/`uv` are correct) |
 | `PORTERCLAUDE_TOOLS_FORCE` | `0` | `1` = reinstall every agent even when `SPEC.json` is unchanged |
 | `PORTERCLAUDE_AGENT_TIMEOUT` | `900` | per-agent install timeout in seconds |
 | `PORTERCLAUDE_NODE_VERSION` | pinned in `lib/runtime.sh` | Node runtime for npm agents |
@@ -694,7 +702,7 @@ it is recorded as `installed:false` + `error` in `AGENTS.json`, printed as
 ### 13.1 Payload layout (frozen)
 
 ```
-<toolsMount>/entrypoint.sh                    0755  session bootstrap (POSIX sh)
+<toolsMount>/entrypoint.sh                    0755  container bootstrap (POSIX sh)
 <toolsMount>/AGENTS.json                      0644  ToolsAgentManifest
 <toolsMount>/VERSION                          0644  claude's version, or empty (v0.1 compat)
 <toolsMount>/lib/pc-common.sh                 0644  sh helpers shared by shims + entrypoint
@@ -711,17 +719,17 @@ it is recorded as `installed:false` + `error` in `AGENTS.json`, printed as
 <toolsMount>/runtime/python/…                       uv-managed CPython (glibc; musl best effort)
 ```
 
-Everything is world-readable/executable (`chmod -R a+rX`, `0755` on executables): sessions
+Everything is world-readable/executable (`chmod -R a+rX`, `0755` on executables): containers
 mount the volume **read-only** and run as arbitrary uids. `bin/claude-linux-*` of v0.1 is
 gone — `bin/claude` is now the generic shim, so v0.1 containers keep working after an
 upgrade.
 
 ### 13.2 The `/opt/porterclaude` symlink trick (why absolute paths survive)
 
-The populate container mounts the volume at **`/out`**, sessions mount it at
+The populate container mounts the volume at **`/out`**, containers mount it at
 **`<toolsMount>`** (`/opt/porterclaude` by default). `npm` bin shims, `uv` tool scripts and
 `pyvenv.cfg` bake **absolute** paths at install time, so installing under `/out/...` would
-produce launchers that point at a path no session has.
+produce launchers that point at a path no container has.
 
 Rule: before installing anything, `populate.sh` creates the staging directory and points the
 runtime path at it **inside the populate container only**:
@@ -734,7 +742,7 @@ rm -rf "$MOUNT"; mkdir -p "$(dirname "$MOUNT")"; ln -sfn "$STAGE" "$MOUNT"
 ```
 
 Every installer then works with `$MOUNT/agents/<id>`, `$MOUNT/runtime/...` paths, so every
-absolute path any third-party installer records is already the path the sessions will see.
+absolute path any third-party installer records is already the path the containers will see.
 Promotion (§13.4) moves the staged trees into `$OUT` and drops the symlink.
 
 ### 13.3 Install-time vs populate-time
@@ -756,7 +764,7 @@ disabling an agent must not destroy a login).
 
 ### 13.4 Promotion (ETXTBSY, still the rule)
 
-Sessions execute binaries straight off this volume, so nothing may be written in place.
+Containers execute binaries straight off this volume, so nothing may be written in place.
 * **files** (`entrypoint.sh`, `AGENTS.json`, `bin/*`, `lib/*`, `VERSION`): staged, then
   `mv -f` over the target — `rename(2)` is allowed on a busy executable.
 * **directories** (`agents/<id>`, `runtime/<name>`): staged, then swapped —
@@ -812,11 +820,11 @@ the later one is installed but gets no shim and is recorded with
 
 `uname -m` in the populate container is the host architecture (`x86*64|amd64 → x64`,
 `aarch*64|arm64 → arm64`); **never** hardcode an architecture literal anywhere under
-`docker/`. The libc of a *session* is not known at install time — an arm64 host can run
-`debian:bookworm` (glibc) and `alpine:3.20` (musl) sessions side by side — so anything that
+`docker/`. The libc of a *container* is not known at install time — an arm64 host can run
+`debian:bookworm` (glibc) and `alpine:3.20` (musl) containers side by side — so anything that
 can cover both must:
 
-| Agent kind | glibc sessions | musl sessions |
+| Agent kind | glibc containers | musl containers |
 |---|---|---|
 | `claude` (override) | native binary `linux-<arch>` | native binary `linux-<arch>-musl` |
 | `script` (generic, e.g. opencode) | installer output | works when the installer produces a static/musl-compatible binary — **best effort** |
@@ -844,7 +852,7 @@ docker/tools/
   agents/<id>.sh        optional per-agent override (currently only claude.sh)
   README.md
 ```
-Only `entrypoint.sh` and `lib/pc-common.sh` run **inside session images**: strict POSIX sh,
+Only `entrypoint.sh` and `lib/pc-common.sh` run **inside container images**: strict POSIX sh,
 no bashisms, no GNU-only flags. Everything else runs only in the Debian-based tools image and
 may use bash + `jq`.
 
@@ -869,7 +877,7 @@ The driver writes `SPEC.json`, `VERSION` (by running `versionCommand` through th
 
 ---
 
-## 14 `entrypoint.sh`, v2 (runtime, every session)
+## 14 `entrypoint.sh`, v2 (runtime, every container)
 
 Still PID 1 in every managed container, still strict POSIX `sh`, still **nothing in it may
 abort the container**. What changes: it is agent-generic and reads its work from the
@@ -893,7 +901,7 @@ environment instead of hardcoding `~/.claude`.
 4. `claim_agents()` **(new, replaces `claim_shared`)** — root only: determine the owner as
    the first non-root owner among `<home>/.porterclaude/agents/*`, falling back to
    `1000:1000` (the recipe user), then `chown -R` `<home>/.porterclaude` and every link
-   target it created. Non-root sessions only warn when an agent dir belongs to a foreign uid.
+   target it created. Non-root containers only warn when an agent dir belongs to a foreign uid.
 5. `install_agent_wrappers()` **(new, replaces `install_claude_wrapper`)** — root only:
    for every `$TOOLS/bin/*` shim whose name does not already resolve to something outside
    `$TOOLS`, write a 3-line `/usr/local/bin/<name>` that execs it (covers non-login shells).
@@ -906,9 +914,9 @@ environment instead of hardcoding `~/.claude`.
    idle loop.
 
 Ordering note for QA: on a **fresh** auth volume the mountpoint is `root:root`, so a recipe
-session (uid 1000) cannot create the link sources — step 3 warns, the server chowns and
+container (uid 1000) cannot create the link sources — step 3 warns, the server chowns and
 re-runs `--porterclaude-bootstrap`, and only then are the links complete. That is by design;
-the session is usable either way.
+the container is usable either way.
 
 ---
 
@@ -979,9 +987,9 @@ this time it is *required*: an operator who does not rebuild keeps images with a
 | an agent times out | same as a failure, with `error:"timed out after Ns"` |
 | the Node/uv runtime cannot be fetched | every agent of that kind fails with a shared error; other kinds are unaffected |
 | an agent's `versionCommand` fails | `installed:true`, `version:null` (it may need credentials to start) |
-| a musl session starts a pip agent | the shim exits non-zero with "aider requires a glibc image on this host" |
+| a musl container starts a pip agent | the shim exits non-zero with "aider requires a glibc image on this host" |
 | the auth volume mountpoint is still `root:root` | `link_agents` warns; the server's chown + `--porterclaude-bootstrap` completes the wiring |
-| an upgraded install has never re-synced tools | sessions come up, `PATH` has no agents, the shims are absent; the UI shows "no agents installed on this host" |
+| an upgraded install has never re-synced tools | containers come up, `PATH` has no agents, the shims are absent; the UI shows "no agents installed on this host" |
 
 ---
 
@@ -1010,14 +1018,14 @@ Static, on the dev box (no docker CLI):
 Integration (reference host, after a real sync):
 
 8. Sync tools on a migrated v0.1 host → `AGENTS.json` lists `claude` installed with a
-   version → a recipe session opens an `agent:claude` terminal → **no** `/login` prompt (the
+   version → a recipe container opens an `agent:claude` session → **no** `/login` prompt (the
    legacy import worked) → `which claude` resolves into `/opt/porterclaude/bin`.
 9. Enable `opencode` + `gemini` → sync → both `installed:true` with versions; the Node
-   runtime exists; a session recreate later `agent:gemini` starts.
-10. A session on `alpine:3.20` (musl): `claude` works, `gemini` works or fails with a clear
+   runtime exists; a container recreate later `agent:gemini` starts.
+10. A container on `alpine:3.20` (musl): `claude` works, `gemini` works or fails with a clear
     message, `aider` fails with the documented glibc message — the container stays up either
     way.
-11. Re-sync while a session is running `claude`: no `ETXTBSY`, the running agent keeps
+11. Re-sync while a container is running `claude`: no `ETXTBSY`, the running agent keeps
     working, a newly started one is the new version.
 12. Disable an agent → sync → its `agents/<id>` directory disappears from the volume, its
     **auth volume still exists**, re-enabling + syncing restores it with the login intact.

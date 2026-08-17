@@ -5,18 +5,18 @@
 //   2. createLogger(env)                  -> Logger
 //   3. resolvePaths(env), mkdir -p dataDir
 //   4. loadOrCreateMasterSecret() -> new SecretBox()
-//   5. new ConfigStore({...}); await store.init()      (migrates v1 -> v2, seeds APP_PASSWORD / PORTAINER_*)
+//   5. new ConfigStore({...}); await store.init()      (migrates v1 -> v2 -> v3, seeds APP_PASSWORD / PORTAINER_*)
 //   6. new CredentialStore(...), new HostManager(...), new AgentRegistry(...)
 //      config.on('change', () => hosts.invalidateChanged())
-//   7. new ImageService(deps), new SessionService(deps, images),
-//      new TerminalService(deps, sessions, images)
+//   7. new ImageService(deps), new ContainerService(deps, images),
+//      new SessionService(deps, containers, images)
 //   8. createAuthService(...) -> AppContext
 //   9. createApp(ctx) -> http.createServer(app)
-//  10. attachTerminalWs(server, ctx)      (B2, terminals/ws.ts)
+//  10. attachSessionWs(server, ctx)       (B2, sessions/ws.ts)
 //  11. server.listen(env.PORT, env.HOST)
-//  12. best-effort startup reconcile: ctx.sessions.reconcile() (log-only on failure --
+//  12. best-effort startup reconcile: ctx.containers.reconcile() (log-only on failure --
 //      a missing/unreachable backend must NOT prevent the server from starting)
-//  13. SIGINT/SIGTERM -> terminals.closeAll(), server.close(), backends.close(), exit
+//  13. SIGINT/SIGTERM -> sessions.closeAll(), server.close(), backends.close(), exit
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import http from 'node:http';
@@ -34,10 +34,10 @@ import { CredentialStore } from './hosts/credentials.js';
 import { HostManager } from './hosts/manager.js';
 import { AgentRegistry } from './agents/registry.js';
 import { createAuthService } from './auth/index.js';
-import { SessionService } from './sessions/service.js';
+import { ContainerService } from './containers/service.js';
 import { ImageService } from './images/service.js';
-import { TerminalService } from './terminals/service.js';
-import { attachTerminalWs } from './terminals/ws.js';
+import { SessionService } from './sessions/service.js';
+import { attachSessionWs } from './sessions/ws.js';
 
 export interface StartedServer {
   server: Server;
@@ -72,17 +72,17 @@ export async function start(): Promise<StartedServer> {
   const hosts = new HostManager({ config, env, log, credentials });
   const agents = new AgentRegistry({ config, log });
   // only rebuild a host transport when THAT host's connection changed: 'change' also fires
-  // for UI layout autosave / session writes / password changes, and tearing a transport
+  // for UI layout autosave / container writes / password changes, and tearing a transport
   // down there would abort in-flight builds, pulls and execs.
   config.on('change', () => hosts.invalidateChanged());
 
   const deps: ServiceDeps = { env, log, paths, config, hosts, agents, backends: hosts.legacyAccess() };
   const images = new ImageService(deps);
-  // the second argument is the tools-volume gate for CREATING a session: a host that was
-  // never synced can only produce crash-looping containers (see SessionService)
-  const sessions = new SessionService(deps, images);
-  // the third argument is the tools-volume gate for `shell=agent:<id>` (see TerminalService)
-  const terminals = new TerminalService(deps, sessions, images);
+  // the second argument is the tools-volume gate for CREATING a container: a host that was
+  // never synced can only produce crash-looping containers (see ContainerService)
+  const containers = new ContainerService(deps, images);
+  // the third argument is the tools-volume gate for `shell=agent:<id>` (see SessionService)
+  const sessions = new SessionService(deps, containers, images);
   const auth = createAuthService({ config, secrets, env, log });
 
   const ctx: AppContext = {
@@ -90,16 +90,16 @@ export async function start(): Promise<StartedServer> {
     secrets,
     auth,
     credentials,
-    sessions,
+    containers,
     images,
-    terminals,
+    sessions,
     version: readVersion(),
     startedAt: Date.now(),
   };
 
   const app = createApp(ctx);
   const server = http.createServer(app);
-  const ws = attachTerminalWs(server, ctx);
+  const ws = attachSessionWs(server, ctx);
 
   await new Promise<void>((resolve, reject) => {
     const onError = (err: Error) => reject(err);
@@ -121,7 +121,7 @@ export async function start(): Promise<StartedServer> {
   // 12. best-effort reconcile; a broken/absent backend must never block startup
   void (async () => {
     try {
-      const report = await sessions.reconcile();
+      const report = await containers.reconcile();
       log.info({ report }, 'startup reconcile complete');
     } catch (err) {
       log.warn({ err: (err as Error).message }, 'startup reconcile skipped');
@@ -133,9 +133,9 @@ export async function start(): Promise<StartedServer> {
     if (closed) return;
     closed = true;
     try {
-      terminals.closeAll();
+      sessions.closeAll();
     } catch (err) {
-      log.debug({ err: (err as Error).message }, 'closing terminals failed');
+      log.debug({ err: (err as Error).message }, 'closing sessions failed');
     }
     try {
       await ws.close();

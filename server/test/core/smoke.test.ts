@@ -8,8 +8,8 @@ import { parseTrustProxy } from '../../src/app.js';
 import { readCookie, shouldUseSecureCookie } from '../../src/auth/index.js';
 import type { AppContext } from '../../src/context.js';
 
-vi.mock('../../src/sessions/routes.js', () => ({
-  createSessionsRouter: () => (_req: Request, _res: Response, next: NextFunction) => next(),
+vi.mock('../../src/containers/routes.js', () => ({
+  createContainersRouter: () => (_req: Request, _res: Response, next: NextFunction) => next(),
 }));
 vi.mock('../../src/images/routes.js', () => ({
   createImagesRouter: () => (_req: Request, _res: Response, next: NextFunction) => next(),
@@ -39,7 +39,7 @@ afterAll(async () => {
 describe('route table (api.md v0.2)', () => {
   const core: Array<[string, string]> = [
     ['GET', '/api/health'],
-    ['GET', '/api/auth/session'],
+    ['GET', '/api/auth/me'],
     ['POST', '/api/auth/logout'],
     ['GET', '/api/settings'],
     ['GET', '/api/settings/vendor'],
@@ -167,9 +167,9 @@ describe('small helpers', () => {
   });
 
   it('parses cookies out of a raw header', () => {
-    expect(readCookie('a=1; pc_session=abc.def; b=2', 'pc_session')).toBe('abc.def');
-    expect(readCookie(undefined, 'pc_session')).toBeUndefined();
-    expect(readCookie('other=1', 'pc_session')).toBeUndefined();
+    expect(readCookie('a=1; pc_auth=abc.def; b=2', 'pc_auth')).toBe('abc.def');
+    expect(readCookie(undefined, 'pc_auth')).toBeUndefined();
+    expect(readCookie('other=1', 'pc_auth')).toBeUndefined();
   });
 
   it('derives the secure cookie flag from the request when COOKIE_SECURE=auto', () => {

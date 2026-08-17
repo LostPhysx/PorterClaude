@@ -1,5 +1,8 @@
 // OWNER: B1. Cookie-based single-user auth. Public API FROZEN — B2 uses
-// `authenticateUpgradeRequest` in the terminal websocket upgrade handler.
+// `authenticateUpgradeRequest` in the session websocket upgrade handler.
+//
+// "session" used to mean three things in this repo; here it always meant the LOGIN, so the
+// names are AUTH_*, never `container` (docs/design/users.md §0).
 import type { IncomingMessage } from 'node:http';
 import type { RequestHandler } from 'express';
 import jwt from 'jsonwebtoken';
@@ -7,10 +10,10 @@ import type { AppContext } from '../context.js';
 import { AppError } from '../http/errors.js';
 import { hashPassword, verifyPassword } from '../config/crypto.js';
 
-/** Name of the signed session cookie. Frontend never reads it (httpOnly). */
-export const SESSION_COOKIE = 'pc_session';
+/** Name of the signed login cookie. Frontend never reads it (httpOnly). */
+export const AUTH_COOKIE = 'pc_auth';
 
-export interface SessionToken {
+export interface AuthToken {
   sub: 'admin';
   /** config.auth.tokenVersion at issue time; a password change invalidates old cookies */
   v: number;
@@ -24,7 +27,7 @@ export interface AuthService {
   /** Sign a JWT for the current tokenVersion. */
   issueToken(): string;
   /** Returns null for missing/invalid/expired/stale-version tokens. */
-  verifyToken(token: string | undefined): SessionToken | null;
+  verifyToken(token: string | undefined): AuthToken | null;
   /** Change the password: verify current, hash new, bump tokenVersion. */
   changePassword(currentPassword: string, newPassword: string): Promise<void>;
   /** True when no password has been configured yet (UI shows a setup hint). */
@@ -52,7 +55,7 @@ export function createAuthService(ctx: Pick<AppContext, 'config' | 'secrets' | '
       });
     },
 
-    verifyToken(token: string | undefined): SessionToken | null {
+    verifyToken(token: string | undefined): AuthToken | null {
       if (!token) return null;
       try {
         const payload = jwt.verify(token, ctx.secrets.jwtSecret(), { algorithms: ['HS256'] });
@@ -106,7 +109,7 @@ export function createAuthService(ctx: Pick<AppContext, 'config' | 'secrets' | '
 export function requireAuth(ctx: AppContext): RequestHandler {
   return (req, _res, next) => {
     const cookies = (req as unknown as { cookies?: Record<string, string> }).cookies;
-    const token = cookies?.[SESSION_COOKIE] ?? readCookie(req.headers.cookie, SESSION_COOKIE);
+    const token = cookies?.[AUTH_COOKIE] ?? readCookie(req.headers.cookie, AUTH_COOKIE);
     if (!ctx.auth.verifyToken(token)) {
       next(AppError.unauthorized());
       return;
@@ -116,11 +119,11 @@ export function requireAuth(ctx: AppContext): RequestHandler {
 }
 
 /**
- * FROZEN SIGNATURE (used by terminals/ws.ts, owner B2).
- * Parses the Cookie header of an HTTP upgrade request and verifies the session token.
+ * FROZEN SIGNATURE (used by sessions/ws.ts, owner B2).
+ * Parses the Cookie header of an HTTP upgrade request and verifies the login token.
  */
 export function authenticateUpgradeRequest(req: IncomingMessage, ctx: AppContext): boolean {
-  const token = readCookie(req.headers.cookie, SESSION_COOKIE);
+  const token = readCookie(req.headers.cookie, AUTH_COOKIE);
   return ctx.auth.verifyToken(token) !== null;
 }
 

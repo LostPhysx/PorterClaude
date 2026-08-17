@@ -1,6 +1,6 @@
-// OWNER: B1. Public API FROZEN — B2 (sessions / terminals / images) only ever calls
+// OWNER: B1. Public API FROZEN — B2 (containers / sessions / images) only ever calls
 // `hosts.requireHostId()`, `hosts.settingsFor(hostId)`, `hosts.backendFor(hostId)`,
-// `hosts.require(hostId)` and `hosts.hostForSession(...)`. Everything else is B1 internals.
+// `hosts.require(hostId)` and `hosts.hostForContainer(...)`. Everything else is B1 internals.
 //
 // Replaces v0.1's `BackendManager`: instead of ONE cached DockerBackend it keeps one per
 // host, keyed by host id, with the same fingerprint rule (drop an instance only when THAT
@@ -127,12 +127,12 @@ export class HostManager {
     return (hosts[0] as HostConfig).id;
   }
 
-  /** The host a stored session belongs to. `AppError.notFound` when it is gone (dangling). */
-  hostForSession(session: { name: string; hostId: string }): HostConfig {
-    const host = this.get(session.hostId);
+  /** The host a stored container belongs to. `AppError.notFound` when it is gone (dangling). */
+  hostForContainer(container: { name: string; hostId: string }): HostConfig {
+    const host = this.get(container.hostId);
     if (!host) {
       throw AppError.notFound(
-        `session '${session.name}' points at host '${session.hostId}', which does not exist`,
+        `container '${container.name}' points at host '${container.hostId}', which does not exist`,
       );
     }
     return host;
@@ -362,25 +362,25 @@ export class HostManager {
   }
 
   /**
-   * Delete a host. `409 conflict` while sessions still reference it unless `force`, which
+   * Delete a host. `409 conflict` while containers still reference it unless `force`, which
    * only drops the host (containers are never touched — a deleted host means "PorterClaude
    * forgets this engine", not "wipe it"). Deleting the default host promotes the first
    * remaining host.
    */
   async remove(hostId: string, opts?: { force?: boolean }): Promise<void> {
     this.require(hostId);
-    const sessions = this.deps.config.listSessions().filter((s) => s.hostId === hostId);
-    if (sessions.length > 0 && !opts?.force) {
+    const containers = this.deps.config.listContainers().filter((c) => c.hostId === hostId);
+    if (containers.length > 0 && !opts?.force) {
       throw AppError.conflict(
-        `host '${hostId}' still has ${sessions.length} session(s): ${sessions.map((s) => s.name).join(', ')} — delete them or repeat with ?force=1`,
-        { sessions: sessions.map((s) => s.name) },
+        `host '${hostId}' still has ${containers.length} container(s): ${containers.map((c) => c.name).join(', ')} — delete them or repeat with ?force=1`,
+        { containers: containers.map((c) => c.name) },
       );
     }
     // the engine itself is never touched: only PorterClaude forgets this host
     await this.deps.config.deleteHost(hostId);
     this.invalidate(hostId);
     this.deps.log.info(
-      { hostId, force: !!opts?.force, sessions: sessions.length },
+      { hostId, force: !!opts?.force, containers: containers.length },
       'host removed (containers and volumes on that engine are untouched)',
     );
   }
@@ -564,7 +564,7 @@ export class HostManager {
       settings: { ...this.settingsForHost(host) },
       overrides: host.overrides,
       agents: { enabled: [...host.agents.enabled] },
-      sessionCount: this.deps.config.listSessions().filter((s) => s.hostId === host.id).length,
+      containerCount: this.deps.config.listContainers().filter((c) => c.hostId === host.id).length,
       notes: host.notes,
       createdAt: host.createdAt,
       updatedAt: host.updatedAt,

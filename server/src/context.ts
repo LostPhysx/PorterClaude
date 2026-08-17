@@ -9,9 +9,9 @@ import type { AuthService } from './auth/index.js';
 import type { Env } from './env.js';
 import type { Logger } from './logger.js';
 import type { Paths } from './paths.js';
-import type { SessionService } from './sessions/service.js';
+import type { ContainerService } from './containers/service.js';
 import type { ImageService } from './images/service.js';
-import type { TerminalService } from './terminals/service.js';
+import type { SessionService } from './sessions/service.js';
 
 /** What every service constructor receives (first argument). */
 export interface ServiceDeps {
@@ -21,7 +21,7 @@ export interface ServiceDeps {
   config: ConfigStore;
   /** v0.2: hosts own the docker transports and the per-host effective settings */
   hosts: HostManager;
-  /** v0.2: agent definitions (built-in + custom) and their per-host/-session resolution */
+  /** v0.2: agent definitions (built-in + custom) and their per-host/-container resolution */
   agents: AgentRegistry;
   /**
    * @deprecated v0.1 compatibility shim (`hosts.legacyAccess()`), pinned to the DEFAULT
@@ -35,9 +35,11 @@ export interface AppContext extends ServiceDeps {
   secrets: SecretBox;
   auth: AuthService;
   credentials: CredentialStore;
-  sessions: SessionService;
+  /** v0.3: the long-lived project containers (was `sessions`) */
+  containers: ContainerService;
   images: ImageService;
-  terminals: TerminalService;
+  /** v0.3: the shell connections inside a container (was `terminals`) */
+  sessions: SessionService;
   /** app version reported by /api/health */
   version: string;
   startedAt: number;

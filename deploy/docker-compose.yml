@@ -17,7 +17,7 @@
 #
 # PORTERCLAUDE_BACKEND below only SEEDS THE FIRST HOST, and only while /data holds none.
 # Everything after that — more docker hosts (Settings -> Hosts, incl. Portainer credentials
-# and endpoint import), the coding agents installed on each host, images and sessions — is
+# and endpoint import), the coding agents installed on each host, images and containers — is
 # configured in the app. See docs/DEPLOYMENT.md and docs/AGENTS.md.
 services:
   porterclaude:
@@ -36,7 +36,7 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-info}
     volumes:
       # MUST persist: holds secret.key (encrypts the stored Portainer keys) + config.json
-      # (hosts, agents, sessions). Losing it logs everyone out and makes the stored keys
+      # (hosts, agents, containers). Losing it logs everyone out and makes the stored keys
       # undecryptable. The AGENT LOGINS are not in here: they live on each managed docker
       # host, in the per-agent volumes porterclaude-auth-<agentId>.
       - porterclaude-data:/data

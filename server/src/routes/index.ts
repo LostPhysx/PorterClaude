@@ -11,13 +11,13 @@ import { createDockerRouter } from './docker.js';
 import { createHostsRouter } from '../hosts/routes.js';
 import { createCredentialsRouter } from '../hosts/credentialRoutes.js';
 import { createAgentsRouter, createHostAgentsRouter } from '../agents/routes.js';
-import { createSessionsRouter } from '../sessions/routes.js';
+import { createContainersRouter } from '../containers/routes.js';
 import { createImagesRouter } from '../images/routes.js';
 
 /**
  * Mount order matters:
  *   /api/health                     public
- *   /api/auth                       public (login/logout/session)
+ *   /api/auth                       public (login/logout/me)
  *   requireAuth                     gate for everything below
  *   /api/hosts/:hostId/images       B2   (host-scoped: images, recipes, jobs, tools)
  *   /api/hosts/:hostId/docker       B1   (host-scoped read-only helpers)
@@ -27,10 +27,16 @@ import { createImagesRouter } from '../images/routes.js';
  *   /api/credentials                B1
  *   /api/agents                     B1   (definitions)
  *   /api/settings                   B1   (general/ui/password only — the backend section is gone)
- *   /api/sessions                   B2   (flat: session names are unique across hosts)
+ *   /api/containers                 B2   (flat: container names are unique across hosts)
  *
  * The host-scoped routers are created with `Router({ mergeParams: true })` so they see
  * `req.params.hostId` from their mount path (hosts/model.ts `HostIdParamsSchema`).
+ *
+ * v0.3 (phase R): `/api/sessions` is NOT an express route any more — it is the websocket
+ * path of the shell connections (sessions/ws.ts `SESSION_WS_PATH`). The HTTP container CRUD
+ * moved to `/api/containers`. The two constants must always change together: mount one
+ * without the other and either the upgrade handler never matches or express answers on the
+ * path the websocket owns.
  */
 export function registerRoutes(app: Express, ctx: AppContext): void {
   app.use('/api/health', createHealthRouter(ctx));
@@ -44,5 +50,5 @@ export function registerRoutes(app: Express, ctx: AppContext): void {
   app.use('/api/credentials', gate, createCredentialsRouter(ctx));
   app.use('/api/agents', gate, createAgentsRouter(ctx));
   app.use('/api/settings', gate, createSettingsRouter(ctx));
-  app.use('/api/sessions', gate, createSessionsRouter(ctx));
+  app.use('/api/containers', gate, createContainersRouter(ctx));
 }

@@ -33,7 +33,7 @@ const spec: CreateContainerSpec = {
   cmd: ['sleep', 'infinity'],
   entrypoint: ['/opt/porterclaude/entrypoint.sh'],
   env: { PORTERCLAUDE_SESSION: 'web', TERM: 'xterm-256color' },
-  labels: { 'porterclaude.managed': 'true', 'porterclaude.session': 'web' },
+  labels: { 'porterclaude.managed': 'true', 'porterclaude.container': 'web' },
   workingDir: '/workspace',
   user: '1000:1000',
   init: true,
@@ -110,7 +110,7 @@ describe('dockerMap', () => {
       State: 'running',
       Status: 'Up 3 hours',
       Created: 1700000000,
-      Labels: { 'porterclaude.session': 'web' },
+      Labels: { 'porterclaude.container': 'web' },
       Ports: [{ IP: '0.0.0.0', PrivatePort: 3000, PublicPort: 32768, Type: 'tcp' }],
     });
     expect(summary.name).toBe('pc-web');

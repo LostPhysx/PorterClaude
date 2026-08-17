@@ -2,6 +2,14 @@
 
 > **v0.2 (hosts + agents): jump to the [v0.2 section](#v02--hosts-and-agents-authoritative-from-here-down)
 > at the bottom. It supersedes every v0.1 statement it contradicts.**
+>
+> **v0.3 (phase R, the rename): every name in this file is the post-rename one.** A
+> **container** is the long-lived box (was *session*), a **session** is one connection to a
+> shell inside it (was *terminal* / *pane*), and the login cookie is `pc_auth` (was
+> `pc_session`). So `/api/containers` is the REST resource and `/api/sessions` is the
+> **WebSocket** — the path `/api/sessions` changed meaning, it is not an Express route any
+> more. The vocabulary table is `users.md` §0, the rename table `users.md` §7. tmux keeps its
+> own word (`tmux new-session`, `pc_<session>`) and the xterm widget is still a terminal.
 
 Status: authoritative. Server (topic BACKEND) implements it; the web UI consumes it.
 Anything not listed here does not exist. Changes require a note in both design docs.
@@ -11,17 +19,17 @@ Base URL: same origin as the UI. All REST lives under `/api`. All bodies are JSO
 
 ## Conventions
 
-* **Auth**: a single-user session cookie `pc_session` (httpOnly, SameSite=Lax, signed JWT).
+* **Auth**: a single-user login cookie `pc_auth` (httpOnly, SameSite=Lax, signed JWT).
   The browser never reads it; it is sent automatically, including on the WebSocket upgrade.
 * **Public endpoints** (no cookie): `GET /api/health`, `POST /api/auth/login`,
-  `POST /api/auth/logout`, `GET /api/auth/session`, and everything outside `/api`
+  `POST /api/auth/logout`, `GET /api/auth/me`, and everything outside `/api`
   (`/`, `/vendor/**`, static assets).
 * **Everything else** returns `401 { "error": { "code": "unauthorized", ... } }` without a
   valid cookie.
 * **Error envelope** — every non-2xx response:
 
 ```json
-{ "error": { "code": "not_found", "message": "session 'web' does not exist", "details": null } }
+{ "error": { "code": "not_found", "message": "container 'web' does not exist", "details": null } }
 ```
 
 | code | status | when |
@@ -30,8 +38,8 @@ Base URL: same origin as the UI. All REST lives under `/api`. All bodies are JSO
 | `validation_error` | 422 | zod validation failed; `details` = zod issues array |
 | `unauthorized` | 401 | missing/expired/invalidated cookie, or wrong password |
 | `forbidden` | 403 | reserved |
-| `not_found` | 404 | unknown session/recipe/job/route |
-| `conflict` | 409 | name already taken, job already running, session not running |
+| `not_found` | 404 | unknown container/recipe/job/route |
+| `conflict` | 409 | name already taken, job already running, container not running |
 | `backend_not_configured` | 409 | no Docker backend selected/complete yet |
 | `backend_error` | 502 | Docker/Portainer refused or is unreachable (`details.dockerStatus`) |
 | `rate_limited` | 429 | login throttle |
@@ -48,13 +56,13 @@ Base URL: same origin as the UI. All REST lives under `/api`. All bodies are JSO
 
 ### `POST /api/auth/login` (public)
 Request `{ "password": "..." }`
-Response `200 { "authenticated": true }` + `Set-Cookie: pc_session=...`
+Response `200 { "authenticated": true }` + `Set-Cookie: pc_auth=...`
 Errors `401 unauthorized`, `429 rate_limited` (10 attempts / 15 min / IP).
 
 ### `POST /api/auth/logout` (public)
 Response `200 { "authenticated": false }` + cookie cleared.
 
-### `GET /api/auth/session` (public)
+### `GET /api/auth/me` (public)
 Response `200 { "authenticated": boolean, "needsSetup": boolean }`
 `needsSetup` is true when no password has ever been configured (no `APP_PASSWORD`, no
 stored hash) — the UI then tells the operator to set `APP_PASSWORD` and restart.
@@ -136,7 +144,7 @@ values fall back to what is stored. Response `{ "endpoints": PortainerEndpoint[]
 Partial `general` object. Response: full sanitized settings.
 
 Every field is validated where it enters the system (an unchecked value would otherwise
-fail deep inside docker on the *next* session create), so a bad value is a `422
+fail deep inside docker on the *next* container create), so a bad value is a `422
 validation_error` naming the field:
 
 | field | rule |
@@ -145,7 +153,7 @@ validation_error` naming the field:
 | `sharedClaudeVolume`, `sharedClaudeHomeVolume`, `toolsVolume`, `sessionNetwork` | docker object name `[a-zA-Z0-9][a-zA-Z0-9_.-]*` (max 128); `sessionNetwork` may be `null` |
 | `workspacesRoot`, `containerHome`, `workspaceMount`, `toolsMount` | absolute POSIX path, no `.`/`..` segment (max 512) |
 
-Session `env` keys are validated the same way by `SessionInput`: `[A-Za-z_][A-Za-z0-9_]*`.
+Container `env` keys are validated the same way by `ContainerInput`: `[A-Za-z_][A-Za-z0-9_]*`.
 
 ### `PUT /api/settings/ui`
 `{ "layout"?: any, "theme"?: "auto"|"light"|"dark" }` — the UI persists its GoldenLayout
@@ -153,7 +161,7 @@ state here. Response `{ "ui": { "layout": ..., "theme": ... } }`.
 
 ### `POST /api/settings/password`
 `{ "currentPassword": "...", "newPassword": "..." }` (min 8 chars). Response
-`200 { "ok": true }` plus a fresh cookie; every other session cookie is invalidated.
+`200 { "ok": true }` plus a fresh cookie; every other login cookie is invalidated.
 `401 unauthorized` when `currentPassword` is wrong.
 
 ### `GET /api/settings/vendor`
@@ -175,14 +183,14 @@ Debug aid: `{ "routes": [ { "route": "/vendor/bootstrap", "dir": "…", "mounted
 
 These four are the **raw engine view** and are deliberately NOT scoped to this install:
 on a shared engine they also show the containers/volumes of another PorterClaude (look at
-`porterclaude.instance` to tell them apart). `GET /api/sessions` is the scoped one — nothing
+`porterclaude.instance` to tell them apart). `GET /api/containers` is the scoped one — nothing
 outside this install ever appears there.
 
 ---
 
-## Sessions
+## Containers
 
-`SessionInput` (request body for create/update):
+`ContainerInput` (request body for create/update):
 
 ```json
 {
@@ -208,10 +216,10 @@ outside this install ever appears there.
 }
 ```
 
-`SessionView` (every response) = the stored config plus:
+`ContainerView` (every response) = the stored config plus:
 
 ```json
-{ "...": "all SessionInput fields",
+{ "...": "all ContainerInput fields",
   "createdAt": "2026-08-15T10:00:00.000Z", "updatedAt": "…", "specHash": "…",
   "status": "running",            // created|running|paused|restarting|removing|exited|dead|unknown|absent
   "containerId": "3f2a…", "containerName": "pc-web",
@@ -229,33 +237,33 @@ outside this install ever appears there.
 
 | Method | Path | Body | Response |
 |---|---|---|---|
-| GET | `/api/sessions` | – | `{ "sessions": SessionView[] }` |
-| POST | `/api/sessions` | `SessionInput` | `201 { "session": SessionView }` |
-| GET | `/api/sessions/:name` | – | `{ "session": SessionView }` |
-| PUT | `/api/sessions/:name` | `SessionInput` | `{ "session": SessionView }` (recreates the container) |
-| DELETE | `/api/sessions/:name?removeVolumes=1` | – | `204` |
-| POST | `/api/sessions/:name/start` | – | `{ "session": SessionView }` |
-| POST | `/api/sessions/:name/stop` | – | `{ "session": SessionView }` |
-| POST | `/api/sessions/:name/restart` | – | `{ "session": SessionView }` |
-| POST | `/api/sessions/:name/recreate` | – | `{ "session": SessionView }` |
-| GET | `/api/sessions/:name/logs?tail=200&timestamps=0` | – | `{ "logs": "…" }` |
-| POST | `/api/sessions/reconcile` | – | `{ "report": { "known": 3, "running": 2, "orphans": [], "adopted": ["x"], "missing": ["y"] } }` |
+| GET | `/api/containers` | – | `{ "containers": ContainerView[] }` |
+| POST | `/api/containers` | `ContainerInput` | `201 { "container": ContainerView }` |
+| GET | `/api/containers/:name` | – | `{ "container": ContainerView }` |
+| PUT | `/api/containers/:name` | `ContainerInput` | `{ "container": ContainerView }` (recreates the container) |
+| DELETE | `/api/containers/:name?removeVolumes=1` | – | `204` |
+| POST | `/api/containers/:name/start` | – | `{ "container": ContainerView }` |
+| POST | `/api/containers/:name/stop` | – | `{ "container": ContainerView }` |
+| POST | `/api/containers/:name/restart` | – | `{ "container": ContainerView }` |
+| POST | `/api/containers/:name/recreate` | – | `{ "container": ContainerView }` |
+| GET | `/api/containers/:name/logs?tail=200&timestamps=0` | – | `{ "logs": "…" }` |
+| POST | `/api/containers/reconcile` | – | `{ "report": { "known": 3, "running": 2, "orphans": [], "adopted": ["x"], "missing": ["y"] } }` |
 
 Notes
 * `resolvedImage` is never the raw docker value: a recipe rebuild retags
   `<ns>/<recipe>:latest`, after which docker reports a bare `sha256:…` for every container
   created before it. That digest is `containerImage`; `imageOutdated` says whether
-  recreating the session would pick up a newer image (`false` without a container, and
+  recreating the container would pick up a newer image (`false` without a container, and
   `false` while the image ref cannot be inspected).
 * `PUT` = edit = **recreate**: stop → remove container (volumes kept) → create → start if
-  it was running or `autoStart`. `name` is immutable; a rename is a new session.
+  it was running or `autoStart`. `name` is immutable; a rename is a new container.
 * `DELETE` removes the container and the stored definition; `removeVolumes=1` also deletes
   `porterclaude-ws-<name>` and `porterclaude-hist-<name>` (never the shared volumes).
 * `409 conflict` when creating a name that already exists (config or container).
-* **Preparation (v0.2.2).** A host that is not ready for the session is no longer refused;
-  the server does the missing work. `POST /api/sessions`, `PUT /api/sessions/:name` and
-  `POST /api/sessions/:name/start` answer **`202 Accepted`** (instead of 201/200) when they
-  started one, with `session.preparing` set:
+* **Preparation (v0.2.2).** A host that is not ready for the container is no longer refused;
+  the server does the missing work. `POST /api/containers`, `PUT /api/containers/:name` and
+  `POST /api/containers/:name/start` answer **`202 Accepted`** (instead of 201/200) when they
+  started one, with `container.preparing` set:
 
   ```json
   { "preparing": { "phase": "building-image", "detail": "building the 'node' image",
@@ -267,23 +275,23 @@ Notes
   ordinary image jobs, so `GET /api/hosts/:hostId/images/jobs/:id?since=` streams their log.
   The definition is **persisted before** the preparation starts — nothing the user typed is
   lost — and the container is created and started when it finishes. `preparing` is `null` on
-  every other session, and the whole path is skipped (fully synchronous 201/200) when the
-  host is already ready. A preparation that fails leaves the stored session in place with the
-  reason in `warnings`; `POST …/start` retries the whole thing. Two calls for the same session
+  every other container, and the whole path is skipped (fully synchronous 201/200) when the
+  host is already ready. A preparation that fails leaves the stored container in place with the
+  reason in `warnings`; `POST …/start` retries the whole thing. Two calls for the same container
   join the first preparation instead of starting a second build.
 * `409 conflict` with `details.reason: "tools_not_synced"` is what remains of the v0.2.1
   behaviour: it is only reachable when the server cannot prepare (a deployment whose image
   service is absent) or when a sync ran and the volume still carries no
   `<toolsMount>/entrypoint.sh` — every container runs that bootstrap as its entrypoint, so
-  the session could only crash-loop. The check never blocks on a maybe: an unreachable host or
+  the container could only crash-loop. The check never blocks on a maybe: an unreachable host or
   a volume that cannot be read lets the create through as before.
 * Route order: `/reconcile` is registered before `/:name`.
 * `POST /reconcile` **adopts**: every container labelled `porterclaude.managed=true` that
   has no stored definition is written back into `config.json` (reconstructed from its
-  labels/inspect) and reported under `adopted`; those sessions answer `orphan:false`
+  labels/inspect) and reported under `adopted`; those containers answer `orphan:false`
   afterwards and are editable again. `orphans` therefore only lists the containers that
-  could *not* be adopted (e.g. a container name that is not a valid session slug), and
-  `known` is the session count **after** the adoption. The reconcile that runs at startup
+  could *not* be adopted (e.g. a docker name that is not a valid container slug), and
+  `known` is the container count **after** the adoption. The reconcile that runs at startup
   never adopts — there an orphan stays visible as `orphan:true`.
 
 ---
@@ -321,7 +329,7 @@ Body `{ "noCache"?: boolean, "pull"?: boolean, "force"?: boolean }` → `202 { "
 
 A build whose context hash still matches the built image is **skipped** (the job succeeds
 and logs `… is up to date`): rebuilding an unchanged recipe would only produce a new image
-id, untag the image every existing session runs and leave those sessions on an
+id, untag the image every existing container runs and leave those containers on an
 orphaned image. `force`, `noCache` or `pull` build unconditionally — that is how a new base
 image is picked up.
 
@@ -361,7 +369,7 @@ had installed.)
 
 `POST /api/images/tools/sync` body `{ "force"?: boolean }` → `202 { "job": JobSummary }`.
 The sync **rebuilds `<ns>/tools:latest` whenever it is missing or outdated** and only then
-re-populates the volume, so upgrading PorterClaude replaces the entrypoint of every session
+re-populates the volume, so upgrading PorterClaude replaces the entrypoint of every container
 without any extra step.
 
 `force: true` means **upgrade**, and does two things:
@@ -388,15 +396,15 @@ Body `{ "image": "…" }` → `202 { "job": JobSummary }`.
 
 ---
 
-## WebSocket: terminals
+## WebSocket: sessions
 
 ```
-GET /api/terminals?session=<slug>&shell=bash|claude|sh&name=<terminal>&cols=<n>&rows=<n>
-Upgrade: websocket          Cookie: pc_session=…   (sent automatically, same origin)
+GET /api/sessions?container=<slug>&shell=bash|claude|sh&session=<name>&cols=<n>&rows=<n>
+Upgrade: websocket          Cookie: pc_auth=…   (sent automatically, same origin)
 ```
 
-* `name` is the stable pane identity chosen by the UI (e.g. `main`, `claude-1`). It maps to
-  the tmux session `pc_<name>`; reconnecting with the same `name` **reattaches**.
+* `session` is the stable pane identity chosen by the UI (e.g. `main`, `claude-1`). It maps
+  to the tmux session `pc_<session>`; reconnecting with the same `session` **reattaches**.
 * `cols`/`rows` default to 80×24; the client should still send a `resize` after `ready`.
 * The browser must set `ws.binaryType = 'arraybuffer'`.
 
@@ -417,7 +425,7 @@ Upgrade: websocket          Cookie: pc_session=…   (sent automatically, same o
 { "type": "kill" }
 ```
 
-`kill` = **the user closed this pane**. The server runs `tmux kill-session -t pc_<name>`
+`kill` = **the user closed this pane**. The server runs `tmux kill-session -t pc_<session>`
 and closes the socket with `1000`, so the pane's shell (and everything running in it) does
 not stay alive in the container forever. Closing the socket with code `4001` does the same
 thing and is the fallback for a pane teardown that cannot send a frame first. Nothing else
@@ -426,10 +434,10 @@ running, which is what makes reconnecting re-attach.
 
 `ServerMessage`:
 ```json
-{ "type": "ready", "terminalId": "8f…", "session": "web", "shell": "bash",
-  "name": "main", "tmux": true, "reattached": false, "cols": 120, "rows": 32 }
+{ "type": "ready", "sessionId": "8f…", "container": "web", "shell": "bash",
+  "session": "main", "tmux": true, "reattached": false, "cols": 120, "rows": 32 }
 { "type": "info",  "message": "reattached to tmux session pc_main" }
-{ "type": "error", "code": "session_not_running", "message": "session 'web' is not running" }
+{ "type": "error", "code": "container_not_running", "message": "container 'web' is not running" }
 { "type": "exit",  "code": 0 }
 { "type": "pong" }
 ```
@@ -440,11 +448,11 @@ tmux — the UI must warn that a reload kills the shell.
 `exit.code` is the **process** exit status of the exec (read back with `exec inspect`), never
 a transport code, and may be `null` when the engine cannot report it. When the exec ends
 because the container is no longer running, the server does not send `exit` at all: it sends
-`{"type":"error","code":"session_not_running"}` and closes `4409` (`session_not_found` /
-`4404` when the session is gone), so the pane can offer "Start session" instead of claiming
+`{"type":"error","code":"container_not_running"}` and closes `4409` (`container_not_found` /
+`4404` when the container is gone), so the pane can offer "Start container" instead of claiming
 the shell exited.
 
-**Deciding which one it was (INT-05).** Stopping a session kills the exec within ~60 ms while
+**Deciding which one it was (INT-05).** Stopping a container kills the exec within ~60 ms while
 the engine needs longer (~170 ms, more through Portainer) to report the container as exited, so
 a single state check right after the exec died still answers "running". When the exit status
 is `137`/`143` (128+SIGKILL / 128+SIGTERM, what stopping a container produces) or cannot be
@@ -454,24 +462,24 @@ the end of that window does it send `exit` and close `1000`. Any other status (`
 answered on the first check, as before — a normal shell exit is never delayed.
 
 Client rule for the same reason: a pane must **not** print "[process exited] press Enter to
-restart" for `exit.code` `137`/`143` or after a `4409` close — it shows the "session … is not
-running" note with its **Start session** action instead (and replaces an exit line it had
-already printed when a late `4409` / session-state answer contradicts it).
+restart" for `exit.code` `137`/`143` or after a `4409` close — it shows the "container … is not
+running" note with its **Start container** action instead (and replaces an exit line it had
+already printed when a late `4409` / container-state answer contradicts it).
 
 ### Close codes
 
 | code | meaning |
 |---|---|
 | 1000 | normal (the shell itself exited, or the client closed the socket) |
-| 4001 | client → server: the user closed the pane — kill `pc_<name>` (same as `{"type":"kill"}`) |
+| 4001 | client → server: the user closed the pane — kill `pc_<session>` (same as `{"type":"kill"}`) |
 | 4400 | bad request (invalid query) |
 | 4401 | unauthorized — the upgrade is rejected with an HTTP `401` before the handshake |
-| 4404 | session not found |
-| 4409 | session exists but is not running |
+| 4404 | container not found |
+| 4409 | container exists but is not running |
 | 4502 | backend error (Docker/Portainer) |
 | 4500 | internal error |
 
-Client side (INT-06): `TerminalPane.dispose({ kill: true })` sends the `kill` frame and then
+Client side (INT-06): `SessionPane.dispose({ kill: true })` sends the `kill` frame and then
 closes with `4001`. `code.js` passes `kill: true` **only** for an explicit pane close (the
 tab close button, the "Close pane" note action); a layout restore, a `resetLayout()` and the
 auth-loss teardown dispose without it, so those panes reattach when they come back. Nothing
@@ -479,7 +487,7 @@ is sent when the socket is not open — there is no live exec to kill from the c
 
 ### Reconnect semantics
 
-The server keeps **no** per-terminal state. A reconnect is a fresh exec; continuity comes
+The server keeps **no** per-session state. A reconnect is a fresh exec; continuity comes
 from tmux inside the container. Client rule: on close with code ≥ 4400 other than 4401,
 reconnect with exponential backoff (1 s → 15 s, jitter); on 4401 redirect to the login
 screen; on 1000 do not reconnect automatically. The server pings every 30 s and terminates
@@ -535,18 +543,18 @@ Non-blocking. These are clarifications of existing endpoints, not new calls — 
 built assuming the answers below. Backend: confirm or correct; no code change is expected
 unless a bullet says otherwise.
 
-1. **`SessionInput.ports[].hostPort` is optional.** `sessions/model.ts` already has
-   `hostPort: z.number().int().min(1).max(65535).optional()`. The session modal leaves the
+1. **`ContainerInput.ports[].hostPort` is optional.** `containers/model.ts` already has
+   `hostPort: z.number().int().min(1).max(65535).optional()`. The container modal leaves the
    host-port input blank by default and then **omits the property** (never sends `null` or
    `0`), meaning "let Docker choose". The chosen port comes back in
-   `SessionView.runtimePorts[]` and is what the table renders.
+   `ContainerView.runtimePorts[]` and is what the table renders.
 
 2. **"Keep the stored Portainer key" is expressed by omission.** `PUT /api/settings/backend`
    and `POST /api/settings/backend/test` are sent **without** `portainer.apiKey` when the
    user leaves the (always-empty) key field untouched. The UI never sends `""`.
 
-3. **Terminal `name` charset.** The UI only ever generates
-   `^[a-z0-9][a-z0-9_-]{0,39}$` (`<session>-<shell>-<n>`, e.g. `web-claude-2`) so
+3. **`session` (pane name) charset.** The UI only ever generates
+   `^[a-z0-9][a-z0-9_-]{0,39}$` (`<container>-<shell>-<n>`, e.g. `web-claude-2`) so
    `tmuxSessionName()` is a no-op transform. The server should still validate and reject
    `4400` on anything else.
 
@@ -557,27 +565,27 @@ unless a bullet says otherwise.
    swallows save failures silently.
 
 5. **Polling cadence the UI uses** (so rate limits, if any, are sized for it):
-   `GET /api/sessions` every 5 s while a browser tab is visible (30 s after three
+   `GET /api/containers` every 5 s while a browser tab is visible (30 s after three
    consecutive failures), `GET /api/images/jobs/:id?since=` every 1 s only while a job
-   modal is open, `GET /api/sessions/:name/logs` only on demand.
+   modal is open, `GET /api/containers/:name/logs` only on demand.
 
 6. **`GET /api/settings/vendor`** is used by QA as the vendor-mount smoke test; please keep
    `mounted:false` entries in the response rather than omitting them.
 
-7. **`SessionView` image identity (INT-01).** The UI no longer renders `resolvedImage` when
-   it is a bare `sha256:…` digest — that happens for every session created before a recipe
+7. **`ContainerView` image identity (INT-01).** The UI no longer renders `resolvedImage` when
+   it is a bare `sha256:…` digest — that happens for every container created before a recipe
    rebuild and reads as noise. It renders the *recipe ref* instead plus an
    "image updated — recreate" badge. It reads, in order of preference and all optional:
 
-   * `SessionView.imageRef` — the ref the session's image spec points at *now*
+   * `ContainerView.imageRef` — the ref the container's image spec points at *now*
      (`RecipeStatus.imageRef` for `image.type === 'recipe'`, `image.ref` for custom).
-   * `SessionView.imageOutdated` (aliases accepted: `imageUpdated`, `imageStale`,
+   * `ContainerView.imageOutdated` (aliases accepted: `imageUpdated`, `imageStale`,
      `resolvedImageOutdated`) — `true` when the container runs an image id that is no longer
      what `imageRef` resolves to, i.e. recreating the container would pick up a newer build.
 
    **Answered (backend, 2026-08-16).** `resolvedImage` IS that stable ref now — it is never
    a digest — so the requested `imageRef` is not added as a second name for the same value.
-   `SessionView.imageOutdated` exists exactly as described, and `SessionView.containerImage`
+   `ContainerView.imageOutdated` exists exactly as described, and `ContainerView.containerImage`
    carries the raw docker value (the bare digest) for anyone who wants to show it. The
    client-side derivation ("`resolvedImage` looks like a digest") no longer fires and can be
    dropped. A cached rebuild also no longer moves the tag at all
@@ -585,8 +593,8 @@ unless a bullet says otherwise.
    build that really changed something.
 
    **Confirmed (frontend, 2026-08-16).** The UI renders `resolvedImage` plus an
-   "image updated — recreate" badge driven by `imageOutdated`, in the Sessions table and as
-   a ⟳ marker in the Code tab's session rail; it never renders `containerImage`. The
+   "image updated — recreate" badge driven by `imageOutdated`, in the Containers table and as
+   a ⟳ marker in the Code tab's container rail; it never renders `containerImage`. The
    digest-looking-`resolvedImage` derivation is kept only as an inert fallback for an older
    server, so the two sides can ship independently.
 
@@ -607,9 +615,9 @@ section wins.** v0.2 is allowed to break the v0.1 API; every change is listed be
 | 4 | Backend settings routes | `PUT /api/settings/backend`, `POST /api/settings/backend/test` | **REMOVED** → `POST/PUT /api/hosts`, `POST /api/hosts/test`, `POST /api/hosts/:hostId/test` |
 | 5 | Docker helpers | `/api/docker/*` | `/api/hosts/:hostId/docker/*` |
 | 6 | Images / recipes / jobs / tools | `/api/images/*` | `/api/hosts/:hostId/images/*` |
-| 7 | Sessions | flat, one engine | still flat (names are globally unique) **+ `hostId` in the body (create only) and in every `SessionView`**, `GET /api/sessions?hostId=` filter |
+| 7 | Containers | flat, one engine | still flat (names are globally unique) **+ `hostId` in the body (create only) and in every `ContainerView`**, `GET /api/containers?hostId=` filter |
 | 8 | Agents | Claude Code hard-wired | `AgentDefinition` registry: `/api/agents` (built-in + custom), `/api/hosts/:hostId/agents` (enable + install state) |
-| 9 | Terminal `shell` | `bash \| claude \| sh` | `bash \| sh \| agent:<agentId>` (`claude` still accepted = `agent:claude`) |
+| 9 | Session `shell` | `bash \| claude \| sh` | `bash \| sh \| agent:<agentId>` (`claude` still accepted = `agent:claude`) |
 | 10 | `ready` frame | – | adds `hostId` and `agentId` |
 | 11 | Close codes | – | adds `4410 agent_not_available`, `4411 host_unavailable` |
 | 12 | `GET /api/health` | `backend: {kind, configured}` | `hosts: {count, configured, defaultHostId}` |
@@ -619,7 +627,7 @@ section wins.** v0.2 is allowed to break the v0.1 API; every change is listed be
 
 Unchanged: auth (`/api/auth/*`, cookie, rate limit), the error envelope and codes, the
 static/vendor mounts, `PUT /api/settings/general|ui`, `POST /api/settings/password`,
-`GET /api/settings/vendor`, the terminal frame protocol and every other close code.
+`GET /api/settings/vendor`, the session frame protocol and every other close code.
 
 ## Vocabulary
 
@@ -634,7 +642,14 @@ static/vendor mounts, `PUT /api/settings/general|ui`, `POST /api/settings/passwo
 * **Agent** — a coding agent (`claude`, `opencode`, `gemini`, `codex`, `aider`, or a custom
   one). Installed into a host's tools volume by the tools sync; its shared state lives in the
   per-host volume `<volumePrefix>auth-<agentId>`.
-* **Default host** — `defaultHostId`; used when a request omits a host (session create).
+* **Default host** — `defaultHostId`; used when a request omits a host (container create).
+* **Container** (v0.3; *session* before the rename) — one project's box on a host: image,
+  workspace, mounts, env, agents. `/api/containers`, `config.containers[]`, label
+  `porterclaude.container`.
+* **Session** (v0.3; *terminal* / *pane* before the rename) — one connection to a shell
+  inside a container, carried by the `/api/sessions` websocket and backed by the tmux session
+  `pc_<session>`.
+* **Login** — the authenticated browser: the `pc_auth` cookie. Never called a session.
 
 ## Host-scoped URLs
 
@@ -648,8 +663,8 @@ an unsupported connection type is `501 not_implemented`.
 /api/hosts/:hostId/agents            (per-host agent state)
 ```
 
-Sessions deliberately stay flat at `/api/sessions/:name`: **session names are unique across
-hosts**, which is also what lets the terminal websocket route `session → host` with nothing
+Containers deliberately stay flat at `/api/containers/:name`: **container names are unique across
+hosts**, which is also what lets the session websocket route `container → host` with nothing
 but the name. Creating a name that exists on any host is `409 conflict`.
 
 ---
@@ -674,7 +689,7 @@ but the name. Creating a name that exists on any host is `409 conflict`.
   "settings": { "...": "effective general settings of this host (general + overrides)" },
   "overrides": { "workspacesRoot": "/srv/other" },
   "agents": { "enabled": ["claude"] },
-  "sessionCount": 3,
+  "containerCount": 3,
   "notes": null,
   "createdAt": "…", "updatedAt": "…"
 }
@@ -711,7 +726,7 @@ Rules
   dead engine; `probe=1` refreshes every host in parallel. A host that has not been probed yet
   therefore reports `status: "unknown"` with `info: null` — that is the first-render state,
   not an error; the UI resolves it with a probe.
-* `DELETE` is `409 conflict` while sessions still reference the host; `force=1` deletes the
+* `DELETE` is `409 conflict` while containers still reference the host; `force=1` deletes the
   host only — **containers, volumes and images on that engine are never touched**.
 * Deleting the default host promotes the first remaining host; the last host leaves
   `defaultHostId: null` (first-run state).
@@ -769,7 +784,7 @@ imported host becomes the default.
 ```json
 {
   "id": "claude", "name": "Claude Code",
-  "description": "Anthropic's terminal coding agent",
+  "description": "Anthropic's session coding agent",
   "command": "claude", "args": [],
   "versionCommand": ["claude", "--version"],
   "install": { "kind": "script", "url": "https://claude.ai/install.sh", "binPath": "bin/claude" },
@@ -777,7 +792,7 @@ imported host becomes the default.
                    { "path": "~/.claude.json", "kind": "file" } ],
   "historyPath": "~/.claude/projects",
   "env": {},
-  "loginHint": "Open an agent terminal and run /login once per host.",
+  "loginHint": "Open an agent session and run /login once per host.",
   "homepage": "https://claude.com/claude-code",
   "builtin": true
 }
@@ -809,14 +824,14 @@ Ids are part of the API (volume names, `shell=agent:<id>`) and never change.
   `422 validation_error` — they would be the same directory in the auth volume.
 * Every `sharedPaths[].path` and `historyPath` must start with `~/` or `/` and must not
   contain a `..` segment (`422 validation_error`): the bootstrap turns them into symlinks
-  inside the session container, so a traversal would point the link — and everything the
+  inside the container, so a traversal would point the link — and everything the
   agent writes through it — outside that agent's auth volume.
 * The rest of the input hygiene, all `422 validation_error` with the field in
   `error.details[].path` (v0.2):
 
   | field | rule | why |
   |---|---|---|
-  | `command`, npm/pip `install.bin` | `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$` | it is an executable NAME, not a command line: the tools volume links `<toolsMount>/bin/<command>` and a terminal execs it. `"evil; rm -rf /"` used to be accepted here and refused hours later in a sync job log |
+  | `command`, npm/pip `install.bin` | `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$` | it is an executable NAME, not a command line: the tools volume links `<toolsMount>/bin/<command>` and a session execs it. `"evil; rm -rf /"` used to be accepted here and refused hours later in a sync job log |
   | `sharedPaths[].path`, `historyPath` | no whitespace, no shell metacharacters (allowed: letters, digits `. _ - ~ / @ +`) | the links travel to the container as `target\|source\|kind;…` (`PORTERCLAUDE_AGENT_LINKS`), so a `;` or `\|` splits one link into two malformed ones and the entrypoint silently drops them |
   | `env` keys | `^[A-Za-z_][A-Za-z0-9_]*$` | anything else is unusable by any shell in the container |
   | `historyPath` | must sit inside one of the `sharedPaths` entries with `kind:"dir"` | it is mounted at the matching path INSIDE the auth volume; outside them there is nothing to mount, so `shareHistory:false` would silently share the history anyway |
@@ -824,8 +839,8 @@ Ids are part of the API (volume names, `shell=agent:<id>`) and never change.
   These rules apply to the API only. A definition **already stored** in `config.json` keeps
   loading even when it breaks them — tightening the stored shape would drop the agent from
   every host that enables it — so an old definition is corrected on the next `PUT`.
-* `DELETE` is `409` while a host enables the agent or a session pins it; `force=1` also
-  strips the id from those hosts/sessions (their containers keep the mount until recreated).
+* `DELETE` is `409` while a host enables the agent or a container pins it; `force=1` also
+  strips the id from those hosts/containers (their containers keep the mount until recreated).
 
 ### Per host
 
@@ -842,18 +857,18 @@ plus an `error` string instead of a 502 — the same transport error `GET
 is empty.
 
 Enabling an agent does **not** install it: run `POST /api/hosts/:hostId/images/tools/sync`
-afterwards (the UI offers it right there), and recreate the sessions that should mount it.
+afterwards (the UI offers it right there), and recreate the containers that should mount it.
 
 **Upgrading an installed agent needs `{"force": true}`.** The tools sync carries an agent
 over whenever its install spec is unchanged, and a spec does not change when upstream ships a
 new release — so a plain sync leaves `version` where it is forever. `force:true` passes
 `PORTERCLAUDE_TOOLS_FORCE=1` into the populate container: no carry-over, every enabled agent
 (and the bundled Node/Python runtime) is reinstalled, resolving its channel / `latest` again.
-Sessions that are running keep the payload they started with until they are restarted.
+Containers that are running keep the payload they started with until they are restarted.
 
-## Sessions
+## Containers
 
-`SessionInput` gains two fields; everything else is unchanged:
+`ContainerInput` gains two fields; everything else is unchanged:
 
 ```json
 { "name": "web",
@@ -862,31 +877,31 @@ Sessions that are running keep the payload they started with until they are rest
   "...": "image, workspace, env, ports, extraMounts, limits, shareHistory, autoStart, network, user" }
 ```
 
-`SessionView` gains:
+`ContainerView` gains:
 
 ```json
 { "hostId": "prod", "hostName": "Prod (portainer)", "hostMissing": false,
   "agents": null, "resolvedAgents": ["claude", "opencode"] }
 ```
 
-* `PUT /api/sessions/:name` with a different `hostId` is `422 validation_error`
-  ("the host of a session is immutable"). Moving = create the session on the other host.
+* `PUT /api/containers/:name` with a different `hostId` is `422 validation_error`
+  ("the host of a container is immutable"). Moving = create the container on the other host.
 * An `agents` list naming an id the registry does not know is `422 validation_error`
   ("unknown agent id(s): …") on create and update — the same rule as
   `PUT /api/hosts/:hostId/agents`. `null` (inherit the host) and `[]` stay legal.
-* `GET /api/sessions?hostId=<id>` filters; without it every host's sessions are returned
-  (sorted by name). A host that is unreachable does not fail the call: its sessions come back
+* `GET /api/containers?hostId=<id>` filters; without it every host's containers are returned
+  (sorted by name). A host that is unreachable does not fail the call: its containers come back
   with `status:"absent"` and a warning.
-* `hostMissing: true` marks a session whose host was deleted with `force=1`: it is read-only
+* `hostMissing: true` marks a container whose host was deleted with `force=1`: it is read-only
   until it is deleted or a host with that id exists again.
 * `resolvedAgents` is what the container really mounts. Changing the host's enabled set makes
-  the stored sessions report `needsRecreate: true` (the spec hash covers the agent mounts) —
+  the stored containers report `needsRecreate: true` (the spec hash covers the agent mounts) —
   that is intentional: the new agent only appears after a recreate.
-* `shareHistory: false` now gives the session one private history volume **per agent that
+* `shareHistory: false` now gives the container one private history volume **per agent that
   declares a `historyPath`**: `<volumePrefix>hist-<slug>` for claude (the v0.1 name, so an
-  upgraded session keeps its history) and `<volumePrefix>hist-<slug>-<agentId>` for the rest.
+  upgraded container keeps its history) and `<volumePrefix>hist-<slug>-<agentId>` for the rest.
 * `DELETE …?removeVolumes=1` removes the workspace volume and those history volumes — never
-  an auth volume (that would delete the login of every session on the host).
+  an auth volume (that would delete the login of every container on the host).
 
 ## Images, jobs and the tools volume (per host)
 
@@ -935,13 +950,13 @@ POST /api/hosts/:hostId/images/pull                 202 { job }
   content of the v0.1 `sharedClaudeVolume` / `sharedClaudeHomeVolume` is copied into
   `<volumePrefix>auth-claude` (marker `.pc-import-v1`). The old volumes are never deleted.
 
-## WebSocket: terminals
+## WebSocket: sessions
 
 ```
-GET /api/terminals?session=<slug>&shell=bash|sh|agent:<agentId>&name=<terminal>&cols=<n>&rows=<n>
+GET /api/sessions?container=<slug>&shell=bash|sh|agent:<agentId>&session=<name>&cols=<n>&rows=<n>
 ```
 
-* No host parameter: the server resolves `session → hostId → backend`.
+* No host parameter: the server resolves `container → hostId → backend`.
 * `shell=claude` is still accepted and means `agent:claude` (deprecated; the UI must send
   `agent:claude`).
 * An unknown `shell` value is close `4400`.
@@ -949,8 +964,8 @@ GET /api/terminals?session=<slug>&shell=bash|sh|agent:<agentId>&name=<terminal>&
 `ready` (first text frame) gains two fields:
 
 ```json
-{ "type": "ready", "terminalId": "8f…", "session": "web", "hostId": "prod",
-  "shell": "agent", "agentId": "claude", "name": "main",
+{ "type": "ready", "sessionId": "8f…", "container": "web", "hostId": "prod",
+  "shell": "agent", "agentId": "claude", "session": "main",
   "tmux": true, "reattached": false, "cols": 120, "rows": 32 }
 ```
 
@@ -958,17 +973,18 @@ New error codes / close codes:
 
 | code | close | when |
 |---|---|---|
-| `agent_not_available` | `4410` | the agent is unknown, not mounted into this session, or mounted but missing from the host's tools volume (`AGENTS.json` says not installed — run the tools sync) |
-| `host_unavailable` | `4411` | the session's host is gone or its connection type is unsupported |
+| `agent_not_available` | `4410` | the agent is unknown, not mounted into this container, or mounted but missing from the host's tools volume (`AGENTS.json` says not installed — run the tools sync) |
+| `host_unavailable` | `4411` | the container's host is gone or its connection type is unsupported |
 
-Both are **terminal** conditions: the client must not auto-reconnect on 4410/4411 (same rule
-as 4401), it shows the reason and offers "open a bash terminal" / "check the host".
+Both are **terminal** conditions (in the "final" sense): the client must not auto-reconnect
+on 4410/4411 (same rule as 4401), it shows the reason and offers "open a bash session" /
+"check the host".
 
 ## Container contract (what the UI can rely on)
 
 ```
 labels   porterclaude.managed=true
-         porterclaude.session=<slug>
+         porterclaude.container=<slug>
          porterclaude.host=<hostId>            (v0.2)
          porterclaude.instance=<instanceId>    (v0.2 — the INSTALL that created it)
          porterclaude.agents=<id,id,…>          (v0.2)
@@ -979,30 +995,37 @@ labels   porterclaude.managed=true
 mounts   <volumePrefix>auth-<agentId> -> <containerHome>/.porterclaude/agents/<agentId>
          <volumePrefix>hist-<slug>[-<agentId>] -> <agentDir>/<sharedPathSlug>/…  (shareHistory=false)
          workspace                    -> <workspaceMount>
-         <toolsVolume> (read-only)    -> <toolsMount>          (EVERY session in v0.2)
+         <toolsVolume> (read-only)    -> <toolsMount>          (EVERY container in v0.2)
 env      PORTERCLAUDE_SESSION, PORTERCLAUDE_HOST, PORTERCLAUDE_TOOLS, PORTERCLAUDE_HOME,
          HOME, PATH, PORTERCLAUDE_AGENT_IDS, PORTERCLAUDE_AGENT_LINKS, TERM
 entrypoint ["<toolsMount>/entrypoint.sh"]      (recipes keep their image CMD)
 ```
 
+**`porterclaude.container` was `porterclaude.session` before v0.3** (the rename, see
+`users.md` §7). The server **writes the new label and reads either**: a container created by
+v0.2 keeps `porterclaude.session` until its next recreate and is still discovered, listed and
+adopted. The env var `PORTERCLAUDE_SESSION` deliberately keeps its name — it is part of the
+spec hash and is read by the tools entrypoint, so renaming it would report every existing
+container as *needs recreate*. The compatibility read on the label goes away in v0.4.
+
 **`porterclaude.instance`** is the identity of this PorterClaude install: a `pc-<12 hex>` id
 generated once on first boot and stored in `config.json` (`instanceId`). Every container AND
-volume an install creates carries it, and `GET /api/sessions`, `POST /api/sessions/reconcile`
+volume an install creates carries it, and `GET /api/containers`, `POST /api/containers/reconcile`
 and every lookup by name only ever see containers that carry **this** install's id **or no id
 at all** (a v0.1 / v0.2.0 container — nothing else ever wrote the label). Two installs sharing
 one engine therefore no longer list each other's containers as adoptable orphans, and neither
-can open a terminal into, recreate or destroy the other's sessions. Creating a session whose
-container NAME is already taken is still a `409 conflict`, whoever owns that container.
+can open a session into, recreate or destroy the other's containers. Creating a container
+whose docker NAME is already taken is still a `409 conflict`, whoever owns that container.
 
 The agent's own paths are **symlinks** into its auth volume, created by the bootstrap:
 `~/.claude -> <agentDir>/claude`, `~/.claude.json -> <agentDir>/claude.json`. The slug of a
 shared path is the whole path with `~/` and leading dots stripped and `/` replaced by `-`
 (`~/.local/share/opencode` → `local-share-opencode`).
 
-## Config file (v2)
+## Config file (v3)
 
 ```json
-{ "version": 2,
+{ "version": 3,
   "instanceId": "pc-9f86d081a1b2",
   "auth": { "...": "unchanged" },
   "hosts": [ HostConfig ],
@@ -1010,14 +1033,19 @@ shared path is the whole path with `~/` and leading dots stripped and `/` replac
   "credentials": { "portainer": [ PortainerCredentialConfig ] },
   "agents": { "custom": [ AgentDefinition ] },
   "general": { "...": "+ volumePrefix; sharedClaude*Volume are legacy-only now" },
-  "sessions": [ "SessionConfig + hostId + agents" ],
+  "containers": [ "ContainerConfig + hostId + agents" ],
   "ui": { "...": "unchanged" } }
 ```
 
 Migration v1 → v2 runs on first boot, is lossless, and writes `config.json.v1.bak` before the
 first v2 write: the single backend becomes the host `default` (+ a `portainer-1` credential
-when it was a Portainer backend, re-using the already-encrypted key), every session gets
+when it was a Portainer backend, re-using the already-encrypted key), every container gets
 `hostId: "default"` and `agents: null`, and `general` is carried over unchanged.
+
+Migration v2 → v3 (v0.3, the rename) is the key rename `sessions` → `containers` and nothing
+else; it writes `config.json.v2.bak` before the first v3 write. The steps chain in one pass,
+so a v1 file is migrated v1 → v2 → v3 on a single boot and keeps every entry. `general.sessionNetwork`
+deliberately keeps its key — it is not part of this migration.
 
 `instanceId` needs no migration: a config without one (v0.1, v0.2.0) gets a fresh id on the
 next boot, and the containers it created carry no `porterclaude.instance` label — which is

@@ -1,17 +1,17 @@
-// OWNER: B2. The six-row terminal command matrix + shell-quoting safety, and the v0.2
-// agent resolution of TerminalService.open (an agent that is not mounted is refused).
+// OWNER: B2. The six-row session command matrix + shell-quoting safety, and the v0.2
+// agent resolution of SessionService.open (an agent that is not mounted is refused).
 import { describe, expect, it } from 'vitest';
 import type { ContainerInspect } from '../../src/backends/types.js';
-import { SessionService } from '../../src/containers/service.js';
-import { TerminalService, buildTerminalCommand } from '../../src/sessions/service.js';
-import { TERMINAL_CLOSE } from '../../src/sessions/protocol.js';
+import { ContainerService } from '../../src/containers/service.js';
+import { SessionService, buildSessionCommand } from '../../src/sessions/service.js';
+import { SESSION_CLOSE } from '../../src/sessions/protocol.js';
 import { tmuxSessionName } from '../../src/util/slug.js';
 import {
+  containerConfig,
   containerSummary,
   hostConfig,
   imageInspect,
   serviceDeps,
-  sessionConfig,
   stubBackend,
   stubHostManager,
   stubHosts,
@@ -47,9 +47,9 @@ function outsideQuotes(script: string): string {
   return out;
 }
 
-describe('buildTerminalCommand', () => {
+describe('buildSessionCommand', () => {
   it('tmux + bash', () => {
-    expect(buildTerminalCommand({ shell: 'bash', name: 'main', tmux: true, hasBash: true })).toEqual([
+    expect(buildSessionCommand({ shell: 'bash', name: 'main', tmux: true, hasBash: true })).toEqual([
       'sh',
       '-lc',
       "exec tmux new-session -A -s 'pc_main' bash -l",
@@ -58,24 +58,24 @@ describe('buildTerminalCommand', () => {
 
   it('tmux + agent (every argv element shell quoted)', () => {
     expect(
-      buildTerminalCommand({ shell: 'agent', agentCommand: ['claude'], name: 'main', tmux: true, hasBash: true }),
+      buildSessionCommand({ shell: 'agent', agentCommand: ['claude'], name: 'main', tmux: true, hasBash: true }),
     ).toEqual(['sh', '-lc', `exec tmux new-session -A -s 'pc_main' sh -lc ${q("'claude'; exec bash -l")}`]);
   });
 
   it('tmux + agent falls back to sh -l after the agent when the image has no bash (BE-3)', () => {
     expect(
-      buildTerminalCommand({ shell: 'agent', agentCommand: ['claude'], name: 'main', tmux: true, hasBash: false }),
+      buildSessionCommand({ shell: 'agent', agentCommand: ['claude'], name: 'main', tmux: true, hasBash: false }),
     ).toEqual(['sh', '-lc', `exec tmux new-session -A -s 'pc_main' sh -lc ${q("'claude'; exec sh -l")}`]);
   });
 
   it('no tmux + agent falls back to sh -l when the image has no bash (BE-3)', () => {
     expect(
-      buildTerminalCommand({ shell: 'agent', agentCommand: ['claude'], name: 'main', tmux: false, hasBash: false }),
+      buildSessionCommand({ shell: 'agent', agentCommand: ['claude'], name: 'main', tmux: false, hasBash: false }),
     ).toEqual(['sh', '-lc', "'claude'; exec sh -l"]);
   });
 
   it('tmux + sh', () => {
-    expect(buildTerminalCommand({ shell: 'sh', name: 'main', tmux: true, hasBash: true })).toEqual([
+    expect(buildSessionCommand({ shell: 'sh', name: 'main', tmux: true, hasBash: true })).toEqual([
       'sh',
       '-lc',
       "exec tmux new-session -A -s 'pc_main' sh -l",
@@ -83,11 +83,11 @@ describe('buildTerminalCommand', () => {
   });
 
   it('no tmux + bash (and the sh fallback when bash is missing)', () => {
-    expect(buildTerminalCommand({ shell: 'bash', name: 'main', tmux: false, hasBash: true })).toEqual([
+    expect(buildSessionCommand({ shell: 'bash', name: 'main', tmux: false, hasBash: true })).toEqual([
       'bash',
       '-l',
     ]);
-    expect(buildTerminalCommand({ shell: 'bash', name: 'main', tmux: false, hasBash: false })).toEqual([
+    expect(buildSessionCommand({ shell: 'bash', name: 'main', tmux: false, hasBash: false })).toEqual([
       'sh',
       '-l',
     ]);
@@ -95,19 +95,19 @@ describe('buildTerminalCommand', () => {
 
   it('no tmux + agent', () => {
     expect(
-      buildTerminalCommand({ shell: 'agent', agentCommand: ['claude'], name: 'main', tmux: false, hasBash: true }),
+      buildSessionCommand({ shell: 'agent', agentCommand: ['claude'], name: 'main', tmux: false, hasBash: true }),
     ).toEqual(['sh', '-lc', "'claude'; exec bash -l"]);
   });
 
   it('no tmux + sh', () => {
-    expect(buildTerminalCommand({ shell: 'sh', name: 'main', tmux: false, hasBash: true })).toEqual([
+    expect(buildSessionCommand({ shell: 'sh', name: 'main', tmux: false, hasBash: true })).toEqual([
       'sh',
       '-l',
     ]);
   });
 
   it('passes the agent args through, each of them quoted', () => {
-    const cmd = buildTerminalCommand({
+    const cmd = buildSessionCommand({
       shell: 'agent',
       agentCommand: ['opencode', 'run', '--model', 'claude-sonnet'],
       name: 'main',
@@ -118,7 +118,7 @@ describe('buildTerminalCommand', () => {
   });
 
   it('uses the tmux session name pc_<name> so a reconnect reattaches', () => {
-    const cmd = buildTerminalCommand({ shell: 'bash', name: 'web-claude-2', tmux: true, hasBash: true });
+    const cmd = buildSessionCommand({ shell: 'bash', name: 'web-claude-2', tmux: true, hasBash: true });
     expect(cmd[2]).toContain("-s 'pc_web-claude-2'");
   });
 
@@ -128,7 +128,7 @@ describe('buildTerminalCommand', () => {
     'a"b`c$d',
     '../../etc/passwd',
   ])('cannot break out of sh -lc: %s', (name) => {
-    const cmd = buildTerminalCommand({ shell: 'bash', name, tmux: true, hasBash: true });
+    const cmd = buildSessionCommand({ shell: 'bash', name, tmux: true, hasBash: true });
     const script = cmd[2] ?? '';
     const target = tmuxSessionName(name);
 
@@ -154,18 +154,18 @@ describe('buildTerminalCommand', () => {
     const pane = `${argv.map(q).join(' ')}; exec bash -l`;
 
     // no tmux: the pane command IS the exec command
-    expect(buildTerminalCommand({ shell: 'agent', agentCommand: argv, name: 'main', tmux: false, hasBash: true })[2]).toBe(
+    expect(buildSessionCommand({ shell: 'agent', agentCommand: argv, name: 'main', tmux: false, hasBash: true })[2]).toBe(
       pane,
     );
     // tmux: the pane command is quoted AS A WHOLE for the outer shell
-    expect(buildTerminalCommand({ shell: 'agent', agentCommand: argv, name: 'main', tmux: true, hasBash: true })[2]).toBe(
+    expect(buildSessionCommand({ shell: 'agent', agentCommand: argv, name: 'main', tmux: true, hasBash: true })[2]).toBe(
       `exec tmux new-session -A -s 'pc_main' sh -lc ${q(pane)}`,
     );
 
     // and nothing of the payload ends up OUTSIDE the quotes, where a shell would run it
     for (const tmux of [false, true]) {
       const script =
-        buildTerminalCommand({ shell: 'agent', agentCommand: argv, name: 'main', tmux, hasBash: true })[2] ?? '';
+        buildSessionCommand({ shell: 'agent', agentCommand: argv, name: 'main', tmux, hasBash: true })[2] ?? '';
       expect(outsideQuotes(script)).not.toMatch(/touch|rm -rf|\$\(|`|\bid\b/);
     }
   });
@@ -175,7 +175,7 @@ describe('buildTerminalCommand', () => {
 // non-root image cannot persist PATH in any rc file - so the exec carries the PATH itself
 // and the command re-exports it after the login shell sourced /etc/profile (which resets
 // PATH on Debian).
-describe('terminal PATH (BE-6)', () => {
+describe('session PATH (BE-6)', () => {
   const PREFIX = "PATH='/opt/porterclaude/bin:/home/dev/.local/bin':$PATH; export PATH; ";
 
   it('injects the tools PATH into the tmux rows', () => {
@@ -185,21 +185,21 @@ describe('terminal PATH (BE-6)', () => {
       hasBash: true,
       pathPrefix: ['/opt/porterclaude/bin', '/home/dev/.local/bin'],
     };
-    expect(buildTerminalCommand({ ...opts, shell: 'bash' })[2]).toBe(
+    expect(buildSessionCommand({ ...opts, shell: 'bash' })[2]).toBe(
       `${PREFIX}exec tmux new-session -A -s 'pc_main' bash -l`,
     );
-    expect(buildTerminalCommand({ ...opts, shell: 'sh' })[2]).toBe(
+    expect(buildSessionCommand({ ...opts, shell: 'sh' })[2]).toBe(
       `${PREFIX}exec tmux new-session -A -s 'pc_main' sh -l`,
     );
     // the pane command is a login shell too, so it re-exports the PATH as well
-    expect(buildTerminalCommand({ ...opts, shell: 'agent' as const, agentCommand: ['claude'] })[2]).toBe(
+    expect(buildSessionCommand({ ...opts, shell: 'agent' as const, agentCommand: ['claude'] })[2]).toBe(
       `${PREFIX}exec tmux new-session -A -s 'pc_main' sh -lc ${q(`${PREFIX}'claude'; exec bash -l`)}`,
     );
   });
 
   it('injects the tools PATH into the no-tmux agent row', () => {
     expect(
-      buildTerminalCommand({
+      buildSessionCommand({
         shell: 'agent',
         agentCommand: ['claude'],
         name: 'main',
@@ -212,20 +212,21 @@ describe('terminal PATH (BE-6)', () => {
 
   it('changes nothing without a prefix', () => {
     expect(
-      buildTerminalCommand({ shell: 'agent', agentCommand: ['claude'], name: 'main', tmux: false, hasBash: true })[2],
+      buildSessionCommand({ shell: 'agent', agentCommand: ['claude'], name: 'main', tmux: false, hasBash: true })[2],
     ).toBe("'claude'; exec bash -l");
-    expect(buildTerminalCommand({ shell: 'bash', name: 'm', tmux: true, hasBash: true, pathPrefix: [] })[2]).toBe(
+    expect(buildSessionCommand({ shell: 'bash', name: 'm', tmux: true, hasBash: true, pathPrefix: [] })[2]).toBe(
       "exec tmux new-session -A -s 'pc_m' bash -l",
     );
   });
 });
 
-describe('TerminalService.open', () => {
-  function makeTerminals(
+describe('SessionService.open', () => {
+  function makeSessions(
     opts: {
       custom?: boolean;
       hostAgents?: string[];
-      sessionAgents?: string[] | null;
+      /** what the stored CONTAINER config pins in `agents` (null = inherit the host) */
+      configAgents?: string[] | null;
       /** what the CONTAINER really mounts: porterclaude.agents label (B-2) */
       containerAgents?: string[];
       /** ... or only PORTERCLAUDE_AGENT_IDS, for a container whose label was lost */
@@ -234,15 +235,15 @@ describe('TerminalService.open', () => {
       installState?: 'installed' | 'missing' | 'unknown';
     } = {},
   ) {
-    const session = opts.custom
-      ? sessionConfig({
+    const container = opts.custom
+      ? containerConfig({
           name: 'usr',
           image: { type: 'custom', ref: 'alpine:3.20' },
           user: '1000:1000',
-          agents: opts.sessionAgents ?? null,
+          agents: opts.configAgents ?? null,
         })
-      : sessionConfig({ name: 'usr', agents: opts.sessionAgents ?? null });
-    const cfg = stubConfigStore([session]);
+      : containerConfig({ name: 'usr', agents: opts.configAgents ?? null });
+    const cfg = stubConfigStore([container]);
     const sb = stubBackend({
       inspectContainer: async (id: string): Promise<ContainerInspect> => ({
         id,
@@ -268,16 +269,16 @@ describe('TerminalService.open', () => {
         names: ['pc-usr'],
         labels: {
           'porterclaude.managed': 'true',
-          'porterclaude.session': 'usr',
+          'porterclaude.container': 'usr',
           ...(opts.containerAgents ? { 'porterclaude.agents': opts.containerAgents.join(',') } : {}),
         },
       }),
     );
     const host = hostConfig({ agents: { enabled: opts.hostAgents ?? ['claude'] } });
     const deps = serviceDeps({ config: cfg.store, hosts: stubHostManager(sb.backend, { host }) });
-    const sessions = new SessionService(deps);
+    const containers = new ContainerService(deps);
     const images = { agentInstallState: async () => opts.installState ?? 'installed' };
-    return { terminals: new TerminalService(deps, sessions, images), sb, deps, cfg };
+    return { sessions: new SessionService(deps, containers, images), sb, deps, cfg };
   }
 
   const execSpec = (sb: ReturnType<typeof stubBackend>) =>
@@ -288,12 +289,12 @@ describe('TerminalService.open', () => {
     };
 
   it('runs the resolved agent command and carries the tools PATH (custom image)', async () => {
-    const { terminals, sb } = makeTerminals({ custom: true });
-    const opened = await terminals.open({
-      session: 'usr',
+    const { sessions, sb } = makeSessions({ custom: true });
+    const opened = await sessions.open({
+      container: 'usr',
       shell: 'agent',
       agentId: 'claude',
-      name: 'main',
+      session: 'main',
       cols: 80,
       rows: 24,
     });
@@ -303,45 +304,45 @@ describe('TerminalService.open', () => {
     const exec = execSpec(sb);
     expect(exec.env?.PATH).toBe('/opt/porterclaude/bin:/home/dev/.local/bin:/usr/bin:/bin');
     // OPS-7: the re-export after /etc/profile carries the image's own PATH entries too,
-    // otherwise a golang/rust custom image loses its toolchain in every terminal.
+    // otherwise a golang/rust custom image loses its toolchain in every session.
     expect(exec.cmd[2]).toContain("PATH='/opt/porterclaude/bin:/home/dev/.local/bin:/usr/bin:/bin':$PATH");
     expect(exec.cmd[2]).toContain("'claude'");
     expect(exec.user).toBe('1000:1000');
   });
 
   // v0.2: recipes no longer bake an agent in, so they need the tools PATH as well
-  it('carries the tools PATH for a RECIPE session too', async () => {
-    const { terminals, sb } = makeTerminals();
-    await terminals.open({ session: 'usr', shell: 'agent', agentId: 'claude', name: 'main', cols: 80, rows: 24 });
+  it('carries the tools PATH for a RECIPE container too', async () => {
+    const { sessions, sb } = makeSessions();
+    await sessions.open({ container: 'usr', shell: 'agent', agentId: 'claude', session: 'main', cols: 80, rows: 24 });
     const exec = execSpec(sb);
     expect(exec.env?.PATH).toBe('/opt/porterclaude/bin:/home/dev/.local/bin:/usr/bin:/bin');
     expect(exec.cmd[2]).toContain('/opt/porterclaude/bin');
   });
 
-  it('refuses an agent the session does not mount (agent_not_available / 4410)', async () => {
-    const { terminals } = makeTerminals({ hostAgents: ['claude'] });
+  it('refuses an agent the container does not mount (agent_not_available / 4410)', async () => {
+    const { sessions } = makeSessions({ hostAgents: ['claude'] });
     await expect(
-      terminals.open({ session: 'usr', shell: 'agent', agentId: 'opencode', name: 'main', cols: 80, rows: 24 }),
+      sessions.open({ container: 'usr', shell: 'agent', agentId: 'opencode', session: 'main', cols: 80, rows: 24 }),
     ).rejects.toMatchObject({
-      terminalCode: 'agent_not_available',
-      closeCode: TERMINAL_CLOSE.agentNotAvailable,
+      sessionCode: 'agent_not_available',
+      closeCode: SESSION_CLOSE.agentNotAvailable,
     });
   });
 
   it('refuses an unknown agent id as well', async () => {
-    const { terminals } = makeTerminals();
+    const { sessions } = makeSessions();
     await expect(
-      terminals.open({ session: 'usr', shell: 'agent', agentId: 'nope', name: 'main', cols: 80, rows: 24 }),
-    ).rejects.toMatchObject({ terminalCode: 'agent_not_available' });
+      sessions.open({ container: 'usr', shell: 'agent', agentId: 'nope', session: 'main', cols: 80, rows: 24 }),
+    ).rejects.toMatchObject({ sessionCode: 'agent_not_available' });
   });
 
-  it('opens an agent the SESSION pins explicitly even when the host enables more', async () => {
-    const { terminals, sb } = makeTerminals({ hostAgents: ['claude', 'opencode'], sessionAgents: ['opencode'] });
-    const opened = await terminals.open({
-      session: 'usr',
+  it('opens an agent the CONTAINER pins explicitly even when the host enables more', async () => {
+    const { sessions, sb } = makeSessions({ hostAgents: ['claude', 'opencode'], configAgents: ['opencode'] });
+    const opened = await sessions.open({
+      container: 'usr',
       shell: 'agent',
       agentId: 'opencode',
-      name: 'main',
+      session: 'main',
       cols: 80,
       rows: 24,
     });
@@ -349,46 +350,46 @@ describe('TerminalService.open', () => {
     expect(execSpec(sb).cmd[2]).toContain("'opencode'");
     // ...and the one it does NOT mount stays refused
     await expect(
-      terminals.open({ session: 'usr', shell: 'agent', agentId: 'claude', name: 'main', cols: 80, rows: 24 }),
-    ).rejects.toMatchObject({ terminalCode: 'agent_not_available' });
+      sessions.open({ container: 'usr', shell: 'agent', agentId: 'claude', session: 'main', cols: 80, rows: 24 }),
+    ).rejects.toMatchObject({ sessionCode: 'agent_not_available' });
   });
 
   // B-2: the gate is what the CONTAINER mounts, not `agents ?? host.agents.enabled`.
   // Enabling an agent on the host does not retro-mount an auth volume into a container that
   // was created before that, so answering `ready` would start an UNAUTHENTICATED instance.
   it('refuses an agent enabled on the host AFTER the container was created', async () => {
-    const { terminals } = makeTerminals({
+    const { sessions } = makeSessions({
       hostAgents: ['claude', 'opencode'], // enabled today ...
       containerAgents: ['claude'], // ... but the running container only mounts claude
     });
     await expect(
-      terminals.open({ session: 'usr', shell: 'agent', agentId: 'opencode', name: 'main', cols: 80, rows: 24 }),
+      sessions.open({ container: 'usr', shell: 'agent', agentId: 'opencode', session: 'main', cols: 80, rows: 24 }),
     ).rejects.toMatchObject({
-      terminalCode: 'agent_not_available',
-      closeCode: TERMINAL_CLOSE.agentNotAvailable,
+      sessionCode: 'agent_not_available',
+      closeCode: SESSION_CLOSE.agentNotAvailable,
     });
     // the agent it really mounts still opens
     await expect(
-      terminals.open({ session: 'usr', shell: 'agent', agentId: 'claude', name: 'main', cols: 80, rows: 24 }),
+      sessions.open({ container: 'usr', shell: 'agent', agentId: 'claude', session: 'main', cols: 80, rows: 24 }),
     ).resolves.toMatchObject({ agentId: 'claude' });
   });
 
   it('reads the mounted agents from PORTERCLAUDE_AGENT_IDS when the label is gone', async () => {
-    const { terminals } = makeTerminals({ hostAgents: ['claude', 'opencode'], containerAgentsEnv: ['claude'] });
+    const { sessions } = makeSessions({ hostAgents: ['claude', 'opencode'], containerAgentsEnv: ['claude'] });
     await expect(
-      terminals.open({ session: 'usr', shell: 'agent', agentId: 'opencode', name: 'main', cols: 80, rows: 24 }),
-    ).rejects.toMatchObject({ terminalCode: 'agent_not_available' });
+      sessions.open({ container: 'usr', shell: 'agent', agentId: 'opencode', session: 'main', cols: 80, rows: 24 }),
+    ).rejects.toMatchObject({ sessionCode: 'agent_not_available' });
   });
 
   // the mirror image: an agent DROPPED from the host config is still mounted (and logged in)
-  // in the running container, so its pane keeps working until the session is recreated.
+  // in the running container, so its pane keeps working until the container is recreated.
   it('opens an agent the container mounts but the host no longer enables', async () => {
-    const { terminals, sb } = makeTerminals({ hostAgents: ['claude'], containerAgents: ['claude', 'opencode'] });
-    const opened = await terminals.open({
-      session: 'usr',
+    const { sessions, sb } = makeSessions({ hostAgents: ['claude'], containerAgents: ['claude', 'opencode'] });
+    const opened = await sessions.open({
+      container: 'usr',
       shell: 'agent',
       agentId: 'opencode',
-      name: 'main',
+      session: 'main',
       cols: 80,
       rows: 24,
     });
@@ -397,76 +398,76 @@ describe('TerminalService.open', () => {
   });
 
   it('refuses an agent the container mounts but the registry no longer defines', async () => {
-    const { terminals } = makeTerminals({ hostAgents: ['claude'], containerAgents: ['claude', 'ghost'] });
+    const { sessions } = makeSessions({ hostAgents: ['claude'], containerAgents: ['claude', 'ghost'] });
     await expect(
-      terminals.open({ session: 'usr', shell: 'agent', agentId: 'ghost', name: 'main', cols: 80, rows: 24 }),
-    ).rejects.toMatchObject({ terminalCode: 'agent_not_available' });
+      sessions.open({ container: 'usr', shell: 'agent', agentId: 'ghost', session: 'main', cols: 80, rows: 24 }),
+    ).rejects.toMatchObject({ sessionCode: 'agent_not_available' });
   });
 
-  // B-9: enabling an agent does not INSTALL it - that needs a tools sync. A session recreated
+  // B-9: enabling an agent does not INSTALL it - that needs a tools sync. A container recreated
   // in between mounts the agent, so the mount gate passes, and the pane used to answer `ready`
   // and die with `bash: <cmd>: command not found`.
   it('refuses an agent the container mounts but the tools volume never received', async () => {
-    const { terminals } = makeTerminals({ containerAgents: ['claude'], installState: 'missing' });
+    const { sessions } = makeSessions({ containerAgents: ['claude'], installState: 'missing' });
     await expect(
-      terminals.open({ session: 'usr', shell: 'agent', agentId: 'claude', name: 'main', cols: 80, rows: 24 }),
-    ).rejects.toMatchObject({ terminalCode: 'agent_not_available' });
+      sessions.open({ container: 'usr', shell: 'agent', agentId: 'claude', session: 'main', cols: 80, rows: 24 }),
+    ).rejects.toMatchObject({ sessionCode: 'agent_not_available' });
     await expect(
-      terminals.open({ session: 'usr', shell: 'agent', agentId: 'claude', name: 'main', cols: 80, rows: 24 }),
+      sessions.open({ container: 'usr', shell: 'agent', agentId: 'claude', session: 'main', cols: 80, rows: 24 }),
     ).rejects.toThrow(/tools sync/);
   });
 
   // ...but a manifest that could not be READ (unreachable host, pre-v0.2 tools volume with no
   // AGENTS.json) must never block a pane that would work.
   it('opens the pane when the tools manifest says nothing about the agent', async () => {
-    const { terminals } = makeTerminals({ containerAgents: ['claude'], installState: 'unknown' });
-    const opened = await terminals.open({
-      session: 'usr',
+    const { sessions } = makeSessions({ containerAgents: ['claude'], installState: 'unknown' });
+    const opened = await sessions.open({
+      container: 'usr',
       shell: 'agent',
       agentId: 'claude',
-      name: 'main',
+      session: 'main',
       cols: 80,
       rows: 24,
     });
     expect(opened.agentId).toBe('claude');
   });
 
-  it('refuses a terminal on a session whose host is gone (host_unavailable / 4411)', async () => {
-    const cfg = stubConfigStore([sessionConfig({ name: 'usr', hostId: 'ghost' })]);
+  it('refuses a session on a container whose host is gone (host_unavailable / 4411)', async () => {
+    const cfg = stubConfigStore([containerConfig({ name: 'usr', hostId: 'ghost' })]);
     const sb = stubBackend();
     const deps = serviceDeps({ config: cfg.store, hosts: stubHosts([{ host: hostConfig(), backend: sb.backend }]) });
-    const terminals = new TerminalService(deps, new SessionService(deps));
+    const sessions = new SessionService(deps, new ContainerService(deps));
     await expect(
-      terminals.open({ session: 'usr', shell: 'bash', name: 'main', cols: 80, rows: 24 }),
+      sessions.open({ container: 'usr', shell: 'bash', session: 'main', cols: 80, rows: 24 }),
     ).rejects.toMatchObject({
-      terminalCode: 'host_unavailable',
-      closeCode: TERMINAL_CLOSE.hostUnavailable,
+      sessionCode: 'host_unavailable',
+      closeCode: SESSION_CLOSE.hostUnavailable,
     });
   });
 
-  it('refuses a terminal on a host without a usable transport', async () => {
-    const cfg = stubConfigStore([sessionConfig({ name: 'usr' })]);
+  it('refuses a session on a host without a usable transport', async () => {
+    const cfg = stubConfigStore([containerConfig({ name: 'usr' })]);
     const deps = serviceDeps({
       config: cfg.store,
       hosts: stubHosts([{ host: hostConfig(), backend: null }]),
     });
-    const terminals = new TerminalService(deps, new SessionService(deps));
+    const sessions = new SessionService(deps, new ContainerService(deps));
     await expect(
-      terminals.open({ session: 'usr', shell: 'bash', name: 'main', cols: 80, rows: 24 }),
+      sessions.open({ container: 'usr', shell: 'bash', session: 'main', cols: 80, rows: 24 }),
     ).rejects.toMatchObject({ code: 'backend_not_configured' });
   });
 
   // INT-06: only an explicit pane close reaches this; a reload must never call it.
-  it('kills the tmux session of a closed pane on the session host', async () => {
-    const { terminals, sb } = makeTerminals();
-    await expect(terminals.killTmuxSession('usr', 'usr-bash-2')).resolves.toBe(true);
+  it('kills the tmux session of a closed pane on the container host', async () => {
+    const { sessions, sb } = makeSessions();
+    await expect(sessions.killTmuxSession('usr', 'usr-bash-2')).resolves.toBe(true);
     const exec = sb.log.filter((c) => c.method === 'runExec').pop()!.args[1] as string[];
     expect(exec[2]).toContain('tmux kill-session -t');
     expect(exec[2]).toContain("'pc_usr-bash-2'");
   });
 
-  it('swallows a kill for a session that is not running', async () => {
-    const { terminals } = makeTerminals();
-    await expect(terminals.killTmuxSession('gone', 'main')).resolves.toBe(false);
+  it('swallows a kill for a container that is not running', async () => {
+    const { sessions } = makeSessions();
+    await expect(sessions.killTmuxSession('gone', 'main')).resolves.toBe(false);
   });
 });

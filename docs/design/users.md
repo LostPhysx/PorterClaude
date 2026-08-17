@@ -1,7 +1,8 @@
 # Users and permissions (v0.3 proposal)
 
-Status: **proposal / not implemented**. Written against shipped v0.2.2 (single shared
-password, `sub:'admin'` JWT, 54 authenticated routes, one `config.json`).
+Status: **proposal**; §7 (phase R, the rename) is **shipped** — everything else is not
+implemented. Written against shipped v0.2.2 (single shared password, `sub:'admin'` JWT, 54
+authenticated routes, one `config.json`).
 
 The model is deliberately small: **one admin flag, two kinds of grant, no verbs.**
 
@@ -79,9 +80,9 @@ bare `web` inside a single host's list and the qualified `hetzner-1.web` everywh
 grant editor, flat lists, search, toasts, session tab titles.
 
 > **Prerequisite, and its own phase (§8).** v0.2.2 enforces names unique *across* hosts, and
-> that invariant is what lets the terminal websocket route name → host with nothing else.
+> that invariant is what lets the session websocket route name → host with nothing else.
 > Per-host names touch: the store's helpers (its public API is marked FROZEN), the flat
-> `/api/sessions/:name` route shape, the websocket URL and the web client, and everywhere the
+> `/api/containers/:name` route shape, the websocket URL and the web client, and everywhere the
 > UI keys a row or a pane by name. Docker-level names (`<prefix><container>`,
 > `<prefix>ws-<container>`) stay unqualified — they only have to be unique per **engine** —
 > and where one is already taken it gets a numeric suffix (§5.7).
@@ -146,11 +147,12 @@ grant references something that exists, and dies with it.
 JWT becomes `{ sub: '<userId>', v: <user.tokenVersion> }` — same lifetime, cookie renamed
 (§7). `config.auth.tokenVersion` stays as the global "log everyone out" switch.
 
-**Migration v2 → v3**: the existing password hash becomes user `admin` with `admin: true`;
+**Migration v3 → v4** (phase R already took version 3 for the `sessions` → `containers` key
+rename, §7): the existing password hash becomes user `admin` with `admin: true`;
 `APP_PASSWORD` keeps seeding that one user while no user exists (it only ever seeds when no
-password is set, so this is unchanged behaviour). Stored containers are not touched beyond
-the key rename — no owner field, because the model has no owner. Same shape as the v1 → v2
-migration, and it writes `config.v2.bak`.
+password is set, so this is unchanged behaviour). Stored containers are not touched — no owner
+field, because the model has no owner. Same shape as the v1 → v2 and v2 → v3 migrations, and
+it writes `config.v3.bak`.
 
 ## 4. What the model cannot hide
 
@@ -219,7 +221,7 @@ points ever supply a real user.
 
 **5.3 Revoking access closes open sessions.** A websocket is authorised once, at connect;
 without this a pane stays live after the grant is taken away, until the server restarts.
-Each connection is tagged with its user (`terminals/ws.ts` already walks its client list on
+Each connection is tagged with its user (`sessions/ws.ts` already walks its client list on
 shutdown), and removing a grant, disabling or deleting a user closes the matching panes with
 `4403`. Disabling also bumps that user's `tokenVersion`, which invalidates their cookie.
 
@@ -273,7 +275,8 @@ mirroring is the problem, not mirroring.
 
 ## 6. Work list
 
-1. `config/{schema,store}.ts` — `users[]`, `grants[]`, `CONFIG_VERSION` 3 + v2→v3 migration.
+1. `config/{schema,store}.ts` — `users[]`, `grants[]`, `CONFIG_VERSION` 4 + v3→v4 migration
+   (phase R shipped 3).
 2. New `server/src/users/{model,service,routes}.ts` — user CRUD, grant add/remove, both
    admin-only. ~7 routes.
 3. `auth/index.ts` — verify against `users[]`, put `req.user` on the request. The FROZEN
@@ -293,7 +296,7 @@ mirroring is the problem, not mirroring.
 8. The §4.1 spec rule in the container service, on create **and** update.
 9. `GET /api/me` → `{ user, admin, hosts: [...], containers: [...] }` so the UI hides what
    the server would refuse instead of re-deriving the rules. This also replaces
-   `GET /api/auth/session`, which frees that word (§7).
+   `GET /api/auth/me`, which phase R put in place of `GET /api/auth/session` (§7).
 10. Login by username + password; keep the per-IP limiter, add a per-username lockout.
 11. Web: username field on login; a **Users** sub-tab in Settings (list, add, password reset,
     disable, and a grant editor that is two pickers); gating driven by `/api/me`.
@@ -319,10 +322,10 @@ cookie (`pc_session`, `GET /api/auth/session`). v0.3 gives each its own word (§
 | `server/src/terminals/**` | `server/src/sessions/**` |
 | `/api/sessions` | `/api/containers` |
 | `/api/terminals?session=&name=` | `/api/sessions?container=&session=` |
-| `config.sessions[]` | `config.containers[]` (v2→v3 migration, same pass as §3) |
+| `config.sessions[]` | `config.containers[]` (its own v2→v3 migration; §3 moves up to v3→v4) |
 | `porterclaude.session` label | `porterclaude.container` |
 | `pc_session` cookie | `pc_auth` |
-| `GET /api/auth/session` | folded into `GET /api/me` (§6.9) |
+| `GET /api/auth/session` | `GET /api/auth/me` in phase R; folded into `GET /api/me` in phase A (§6.9) |
 | `web/public/js/sessions.js` | `containers.js`; terminal pane code keeps its file, renamed to `session.js` |
 
 Two things stop this from being a blind find-and-replace:
@@ -339,6 +342,18 @@ Two things stop this from being a blind find-and-replace:
 
 Do this **first**, as its own commit, with no behaviour change in it — every later phase
 references these names, and a rename mixed into a behaviour change is unreviewable.
+
+**Shipped.** Two commits: the module moves, then the moves plus every content edit (git only
+pairs unmatched adds/deletes, so `src/sessions` had to be vacated before `src/terminals` could
+claim the name, or both `service.ts` files lose rename detection). What actually landed beside
+the table above: `GET /api/auth/me` (not yet `/api/me`); `CONFIG_VERSION` 3 with a v2 → v3 step
+that chains after v1 → v2 and writes `config.json.v2.bak`; `LEGACY_CONTAINER_LABEL` +
+`containerLabelOf()` as the single read seam for the label; `PaneState.session` →
+`.container` with `LAYOUT_VERSION` 3 and a read-either `normalizeState()`. Not renamed, each
+for a stated reason: `PORTERCLAUDE_SESSION` (spec hash + the tools entrypoint reads it),
+`PORTERCLAUDE_AGENT_IDS` / `_LINKS` values, `general.sessionNetwork` (needs its own
+migration), `SESSION_TTL_DAYS` (read from the deployment's `.env`), the GoldenLayout
+componentType `'terminal'` and every localStorage key string, and tmux's own words.
 
 ## 8. Effort
 

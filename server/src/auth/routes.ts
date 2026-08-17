@@ -1,4 +1,4 @@
-// OWNER: B1. Mounted at /api/auth (see routes/index.ts). Public: login + session.
+// OWNER: B1. Mounted at /api/auth (see routes/index.ts). Public: login + me.
 import { Router } from 'express';
 import rateLimit from 'express-rate-limit';
 import { z } from 'zod';
@@ -6,7 +6,7 @@ import type { AppContext } from '../context.js';
 import { AppError } from '../http/errors.js';
 import { asyncHandler } from '../http/async.js';
 import { parseBody } from '../http/validate.js';
-import { SESSION_COOKIE, shouldUseSecureCookie } from './index.js';
+import { AUTH_COOKIE, shouldUseSecureCookie } from './index.js';
 
 export const LoginInputSchema = z.object({ password: z.string().min(1) });
 
@@ -17,7 +17,7 @@ export const LOGIN_MAX_ATTEMPTS = 10;
  * POST /api/auth/login    { password }            -> 200 { authenticated: true } + Set-Cookie
  *                                                    401 { error: { code: 'unauthorized' } }
  * POST /api/auth/logout                           -> 200 { authenticated: false } + clear cookie
- * GET  /api/auth/session                          -> 200 { authenticated, needsSetup }
+ * GET  /api/auth/me                               -> 200 { authenticated, needsSetup }
  *
  * Login is rate limited to 10 attempts / 15 min / IP; the throttle answers with the
  * canonical error envelope (code 'rate_limited'). Successful logins do not consume budget.
@@ -49,7 +49,7 @@ export function createAuthRouter(ctx: AppContext): Router {
         throw AppError.unauthorized('invalid password');
       }
       const secure = shouldUseSecureCookie(ctx, req as unknown as { secure?: boolean; headers: Record<string, unknown> });
-      res.cookie(SESSION_COOKIE, ctx.auth.issueToken(), ctx.auth.cookieOptions(secure));
+      res.cookie(AUTH_COOKIE, ctx.auth.issueToken(), ctx.auth.cookieOptions(secure));
       res.json({ authenticated: true });
     }),
   );
@@ -57,13 +57,13 @@ export function createAuthRouter(ctx: AppContext): Router {
   router.post('/logout', (req, res) => {
     const secure = shouldUseSecureCookie(ctx, req as unknown as { secure?: boolean; headers: Record<string, unknown> });
     const { maxAge: _maxAge, ...clearOpts } = ctx.auth.cookieOptions(secure);
-    res.clearCookie(SESSION_COOKIE, clearOpts);
+    res.clearCookie(AUTH_COOKIE, clearOpts);
     res.json({ authenticated: false });
   });
 
-  router.get('/session', (req, res) => {
+  router.get('/me', (req, res) => {
     const cookies = (req as unknown as { cookies?: Record<string, string> }).cookies;
-    const token = cookies?.[SESSION_COOKIE];
+    const token = cookies?.[AUTH_COOKIE];
     res.json({
       authenticated: ctx.auth.verifyToken(token) !== null,
       needsSetup: ctx.auth.needsSetup(),

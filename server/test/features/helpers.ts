@@ -21,8 +21,8 @@ import type {
   VolumeSummary,
 } from '../../src/backends/types.js';
 import type { Paths } from '../../src/paths.js';
-import type { SessionConfig, SessionInput } from '../../src/sessions/model.js';
-import { SessionInputSchema } from '../../src/sessions/model.js';
+import type { ContainerConfig, ContainerInput } from '../../src/containers/model.js';
+import { ContainerInputSchema, LEGACY_CONTAINER_LABEL } from '../../src/containers/model.js';
 
 export const silentLog = pino({ level: 'silent' });
 
@@ -51,8 +51,8 @@ export const TEST_HOST_ID = 'default';
 /** `config.instanceId()` of the stub store — the porterclaude.instance label of the tests. */
 export const TEST_INSTANCE_ID = 'pc-test';
 
-export function sessionInput(overrides: Partial<SessionInput> = {}): SessionInput {
-  return SessionInputSchema.parse({
+export function containerInput(overrides: Partial<ContainerInput> = {}): ContainerInput {
+  return ContainerInputSchema.parse({
     name: 'web',
     hostId: TEST_HOST_ID,
     image: { type: 'recipe', recipe: 'node' },
@@ -74,10 +74,10 @@ export function hostConfig(overrides: Partial<HostConfig> = {}): HostConfig {
   };
 }
 
-export function sessionConfig(overrides: Partial<SessionConfig> = {}): SessionConfig {
+export function containerConfig(overrides: Partial<ContainerConfig> = {}): ContainerConfig {
   const { createdAt, updatedAt, specHash, hostId, ...rest } = overrides;
   return {
-    ...sessionInput(rest),
+    ...containerInput(rest),
     hostId: hostId ?? TEST_HOST_ID,
     createdAt: createdAt ?? '2026-01-01T00:00:00.000Z',
     updatedAt: updatedAt ?? '2026-01-01T00:00:00.000Z',
@@ -91,27 +91,27 @@ export function sessionConfig(overrides: Partial<SessionConfig> = {}): SessionCo
 
 export interface StubConfigStore {
   store: ConfigStore;
-  sessions: Map<string, SessionConfig>;
+  containers: Map<string, ContainerConfig>;
   general: GeneralConfig;
 }
 
 export function stubConfigStore(
-  sessions: SessionConfig[] = [],
+  containers: ContainerConfig[] = [],
   general: GeneralConfig = generalConfig(),
 ): StubConfigStore {
-  const map = new Map(sessions.map((s) => [s.name, s]));
+  const map = new Map(containers.map((c) => [c.name, c]));
   const store = {
     general: () => general,
     instanceId: () => TEST_INSTANCE_ID,
-    listSessions: () => [...map.values()],
-    getSession: (name: string) => map.get(name) ?? null,
-    putSession: async (cfg: SessionConfig) => {
+    listContainers: () => [...map.values()],
+    getContainer: (name: string) => map.get(name) ?? null,
+    putContainer: async (cfg: ContainerConfig) => {
       map.set(cfg.name, cfg);
       return cfg;
     },
-    deleteSession: async (name: string) => map.delete(name),
+    deleteContainer: async (name: string) => map.delete(name),
   } as unknown as ConfigStore;
-  return { store, sessions: map, general };
+  return { store, containers: map, general };
 }
 
 /** `hostConfig()` with another id/name (the second host of the multi-host tests). */
@@ -146,13 +146,39 @@ export function containerSummary(overrides: Partial<ContainerSummary> = {}): Con
     createdAt: Math.floor(Date.parse('2026-01-01T00:00:00.000Z') / 1000),
     labels: {
       'porterclaude.managed': 'true',
-      'porterclaude.session': 'web',
+      'porterclaude.container': 'web',
       'porterclaude.image-type': 'recipe',
       'porterclaude.recipe': 'node',
     },
     ports: [],
     ...overrides,
   };
+}
+
+/**
+ * A container created BEFORE v0.3: it carries only the legacy `porterclaude.session` label.
+ *
+ * Its docker name deliberately does NOT match `<containerPrefix><name>`, so `matchContainer`'s
+ * second fallback (match by derived name) cannot mask a missing compatibility read — without
+ * `containerLabelOf`'s `?? LEGACY_CONTAINER_LABEL` this container is invisible.
+ */
+export function legacyContainerSummary(
+  name: string,
+  overrides: Partial<ContainerSummary> = {},
+): ContainerSummary {
+  return containerSummary({
+    id: `c-legacy-${name}`,
+    // NOT `pc-${name}`: the derived-name fallback must not be able to find this one
+    name: `renamed-${name}`,
+    names: [`renamed-${name}`],
+    labels: {
+      'porterclaude.managed': 'true',
+      [LEGACY_CONTAINER_LABEL]: name,
+      'porterclaude.image-type': 'recipe',
+      'porterclaude.recipe': 'node',
+    },
+    ...overrides,
+  });
 }
 
 export function imageInspect(overrides: Partial<ImageInspect> = {}): ImageInspect {
@@ -301,8 +327,8 @@ export interface StubHostEntry {
 /**
  * A HostManager stub over N hosts. `backendFor` throws for a host without a transport (like
  * the real manager does for an incomplete connection), `tryBackendFor` answers null, and
- * `hostForSession` throws for a session whose host was deleted — which is exactly what the
- * multi-host paths of SessionService and TerminalService have to survive.
+ * `hostForContainer` throws for a container whose host was deleted — which is exactly what the
+ * multi-host paths of ContainerService and SessionService have to survive.
  */
 export function stubHosts(entries: StubHostEntry[], defaultHostId?: string): HostManager {
   const byId = new Map(entries.map((e) => [e.host.id, e]));
@@ -329,7 +355,7 @@ export function stubHosts(entries: StubHostEntry[], defaultHostId?: string): Hos
       if (!fallbackId) throw AppError.backendNotConfigured('no docker host configured');
       return fallbackId;
     },
-    hostForSession: (session: { name: string; hostId: string }) => entryFor(session.hostId).host,
+    hostForContainer: (container: { name: string; hostId: string }) => entryFor(container.hostId).host,
     settingsFor: (id: string) => settingsOf(id),
     settingsForHost: (host: HostConfig) => byId.get(host.id)?.general ?? generalConfig(),
     backendFor: (id: string) => backendOf(id),
@@ -371,8 +397,8 @@ export function stubAgentRegistry(agents: AgentDefinition[] = BUILTIN_AGENTS): A
     isBuiltin: (id: string) => byId.has(id),
     enabledForHost: (host: HostConfig) =>
       host.agents.enabled.map((id) => byId.get(id)).filter((a): a is AgentDefinition => Boolean(a)),
-    resolveForSession: (host: HostConfig, session: { agents: string[] | null }) =>
-      (session.agents ?? host.agents.enabled)
+    resolveForContainer: (host: HostConfig, container: { agents: string[] | null }) =>
+      (container.agents ?? host.agents.enabled)
         .map((id) => byId.get(id))
         .filter((a): a is AgentDefinition => Boolean(a)),
     installSpecsForHost: () => [],

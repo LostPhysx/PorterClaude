@@ -3,6 +3,43 @@
 All notable changes to PorterClaude. Versions are git tags (`vX.Y.Z`); each tag is also
 published as `ghcr.io/lostphysx/porterclaude:<version>`.
 
+## Unreleased
+
+- **One word, three meanings — fixed.** "Session" used to mean the long-lived box, the shell
+  you open inside it, and the login cookie. It now means exactly one thing each: a
+  **container** is the box (image, workspace, mounts, agents), a **session** is one connection
+  to a shell inside a container, and the **login** is the login. The Sessions tab is the
+  **Containers** tab, a pane holds a session, and the xterm widget inside it is still a
+  terminal. Vocabulary: `docs/design/users.md` §0, rename table §7.
+- **Routes.** `/api/sessions` → `/api/containers` (same shapes; response envelopes
+  `{ containers }` / `{ container }`, `POST /api/containers/reconcile` still ahead of
+  `/:name`). The websocket moved from `/api/terminals?session=&name=` to
+  **`/api/sessions?container=&session=`** — so the path `/api/sessions` changed owner and is
+  no longer an HTTP route. Frames keep their numbers: `ready` now carries `sessionId`,
+  `container` and `session`, and the error codes are `container_not_found` /
+  `container_not_running` behind the unchanged close codes 4404 / 4409.
+- **Login cookie `pc_session` → `pc_auth`, and `GET /api/auth/session` → `GET /api/auth/me`**
+  (same body). **Everyone is logged out once** by the upgrade — log back in, nothing else
+  about auth changed. `SESSION_TTL_DAYS` keeps its name, so a configured TTL survives.
+- **Config `sessions[]` → `containers[]`, `version` 2 → 3.** Migrated on first boot, with
+  `config.json.v2.bak` written before the first v3 write; a v1 file still chains
+  v1 → v2 → v3 in one pass. Back up `/data` before upgrading. `general.sessionNetwork` keeps
+  its key (only its label reads "Container network").
+- **Label `porterclaude.session` → `porterclaude.container`, read-either.** Running containers
+  carry the old label and are discovered, listed and adopted exactly as before; **containers
+  are relabelled on their next recreate**, and no container reports *needs recreate* because
+  of this (the spec hash covers env, not labels). The compatibility read is removed in v0.4.
+  The container env var stays `PORTERCLAUDE_SESSION` for the same reason.
+- **Upgrade note.** A browser tab still running the old JavaScript talks to `/api/sessions`
+  as REST and `/api/terminals` as the websocket, and the new server serves neither — reload
+  the tab. Do not serve `index.html` or `/js/**` with a long cache lifetime through this
+  upgrade, and point any proxy rule pinned to `/api/terminals` at `/api/sessions`.
+- Modules and files follow the words: `server/src/sessions` → `server/src/containers`,
+  `server/src/terminals` → `server/src/sessions`, `web/public/js/sessions.js` →
+  `containers.js`, `web/public/js/terminal.js` → `session.js`. tmux keeps its own vocabulary
+  (`tmux new-session`, `pc_<session>`), so **running shells survive the upgrade** and panes
+  reattach.
+
 ## v0.2.2 — 2026-08-17
 
 - **Sessions prepare their host instead of refusing.** Creating (or editing, or starting) a

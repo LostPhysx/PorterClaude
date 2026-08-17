@@ -99,8 +99,8 @@ describe('HostManager CRUD', () => {
     expect(ctx.hosts.requireHostId()).toBe(b.id);
     expect(ctx.hosts.requireHostId('a')).toBe('a');
     expect(() => ctx.hosts.requireHostId('nope')).toThrow(/does not exist/);
-    expect(ctx.hosts.hostForSession({ name: 'web', hostId: 'a' }).id).toBe('a');
-    expect(() => ctx.hosts.hostForSession({ name: 'web', hostId: 'gone' })).toThrow(/does not exist/);
+    expect(ctx.hosts.hostForContainer({ name: 'web', hostId: 'a' }).id).toBe('a');
+    expect(() => ctx.hosts.hostForContainer({ name: 'web', hostId: 'gone' })).toThrow(/does not exist/);
   });
 
   it('updates a host without touching the fields that were not sent', async () => {
@@ -150,10 +150,10 @@ describe('HostManager CRUD', () => {
     await expect(ctx.hosts.remove('b')).rejects.toMatchObject({ code: 'not_found' });
   });
 
-  it('refuses to delete a host with sessions unless force is given', async () => {
+  it('refuses to delete a host with containers unless force is given', async () => {
     const ctx = await ctxFor();
     await ctx.hosts.create({ name: 'A', connection: { type: 'socket', socketPath: '/a.sock' } });
-    await ctx.config.putSession({
+    await ctx.config.putContainer({
       name: 'web',
       hostId: 'a',
       agents: null,
@@ -174,8 +174,8 @@ describe('HostManager CRUD', () => {
     await expect(ctx.hosts.remove('a')).rejects.toMatchObject({ code: 'conflict' });
     await ctx.hosts.remove('a', { force: true });
     expect(ctx.hosts.list()).toEqual([]);
-    // the stored session survives as a dangling one; nothing on the engine was removed
-    expect(ctx.config.listSessions().map((s) => s.name)).toEqual(['web']);
+    // the stored container survives as a dangling one; nothing on the engine was removed
+    expect(ctx.config.listContainers().map((c) => c.name)).toEqual(['web']);
   });
 
   it('validates the enabled agent list of a host through setEnabledAgents', async () => {
@@ -281,7 +281,7 @@ describe('HostView', () => {
       info: null,
       error: null,
       notes: 'note',
-      sessionCount: 0,
+      containerCount: 0,
     });
     expect(views[0]?.connectionLabel).toBe('socket: /definitely/not/here.sock');
 

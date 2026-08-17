@@ -43,11 +43,11 @@ export function getSettings() {
  */
 export const GENERAL_FIELDS = [
   { key: 'workspacesRoot', label: 'Workspaces root', help: 'host directory used for bind workspaces' },
-  { key: 'volumePrefix', label: 'Volume prefix', help: 'every volume PorterClaude creates starts with this (porterclaude-ws-<session>, porterclaude-auth-<agent>, ...)' },
-  { key: 'toolsVolume', label: 'Tools volume', help: 'read-only volume holding the coding agents; mounted into every session' },
+  { key: 'volumePrefix', label: 'Volume prefix', help: 'every volume PorterClaude creates starts with this (porterclaude-ws-<container>, porterclaude-auth-<agent>, ...)' },
+  { key: 'toolsVolume', label: 'Tools volume', help: 'read-only volume holding the coding agents; mounted into every container' },
   { key: 'defaultRecipe', label: 'Default recipe' },
-  { key: 'containerPrefix', label: 'Container prefix', help: 'containers are named <prefix><session>' },
-  { key: 'sessionNetwork', label: 'Session network', help: 'blank = the default bridge network', nullable: true },
+  { key: 'containerPrefix', label: 'Container prefix', help: 'containers are named <prefix><container>' },
+  { key: 'sessionNetwork', label: 'Container network', help: 'blank = the default bridge network', nullable: true },
   { key: 'imageNamespace', label: 'Image namespace', help: 'recipe images are tagged <namespace>/<recipe>:latest' },
   { key: 'containerHome', label: 'Container home' },
   { key: 'workspaceMount', label: 'Workspace mount' },
@@ -159,25 +159,25 @@ async function changePassword(event) {
     if (currentEl) currentEl.value = '';
     if (newEl) newEl.value = '';
     setPasswordError(null);
-    toast('Password changed - other sessions were signed out', { variant: 'success' });
+    toast('Password changed - other logins were signed out', { variant: 'success' });
   } catch (err) {
     const unauthorized = !!err && (err.status === 401 || err.code === 'unauthorized');
     if (!unauthorized) {
       setPasswordError((err && err.message) || 'Could not change the password');
       return;
     }
-    // 401 here means the typed *current password* was wrong - the session cookie is
+    // 401 here means the typed *current password* was wrong - the auth cookie is
     // untouched (api.md), so api.js keeps this path out of the AUTH_REQUIRED flow and we
     // report inline. Only if the cookie really did expire do we hand over to the re-login.
     let stillSignedIn = true;
     try {
-      const sess = await api.auth.session();
-      stillSignedIn = !!(sess && sess.authenticated);
+      const me = await api.auth.me();
+      stillSignedIn = !!(me && me.authenticated);
     } catch {
-      stillSignedIn = true; // network hiccup: assume the session is fine, stay put
+      stillSignedIn = true; // network hiccup: assume the login is fine, stay put
     }
     if (!stillSignedIn) {
-      setPasswordError('Your session expired - sign in again');
+      setPasswordError('Your login expired - sign in again');
       bus.emit(EVENTS.AUTH_REQUIRED, {});
       return;
     }
