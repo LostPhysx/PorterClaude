@@ -650,3 +650,85 @@ describe('static assets and error handling', () => {
     expect(res.body.error.code).toBe('not_found');
   });
 });
+
+// ---------------------------------------------------------------------------
+// QA R1-INT2-4 / R2-INT2-7: a custom agent definition is admin-supplied config that ends up
+// in a docker create, in an installer script and in a terminal argv. Everything that cannot
+// work there is refused HERE (422), not hours later in a tools-sync job log.
+// ---------------------------------------------------------------------------
+describe('/api/agents input hygiene', () => {
+  const base = {
+    id: 'mycoder',
+    name: 'My Coder',
+    command: 'mycoder',
+    args: [],
+    versionCommand: ['mycoder', '--version'],
+    install: { kind: 'npm', package: 'mycoder' },
+    sharedPaths: [{ path: '~/.mycoder', kind: 'dir' }],
+    historyPath: null,
+    env: {},
+  };
+
+  async function post(body: Record<string, unknown>, cookie: string) {
+    return request(h.app).post('/api/agents').set('Cookie', cookie).send({ ...base, ...body });
+  }
+
+  it('422s a `command` that is not a plain executable name', async () => {
+    const cookie = await login();
+    for (const command of ['evil; rm -rf /', 'my coder', '$(id)', 'a`b`', '/usr/bin/mycoder', '-x', '']) {
+      const res = await post({ command }, cookie);
+      expect(res.status, command).toBe(422);
+      expect(res.body.error.code).toBe('validation_error');
+    }
+    expect((await post({ command: 'my-coder_2.0' }, cookie)).status).toBe(201);
+  });
+
+  it('422s an npm/pip `bin` with shell metacharacters', async () => {
+    const cookie = await login();
+    expect((await post({ install: { kind: 'npm', package: 'mycoder', bin: 'a;b' } }, cookie)).status).toBe(422);
+    expect((await post({ install: { kind: 'pip', package: 'mycoder', bin: 'a b' } }, cookie)).status).toBe(422);
+    expect((await post({ install: { kind: 'npm', package: 'mycoder', bin: 'mycoder' } }, cookie)).status).toBe(201);
+  });
+
+  it('422s a sharedPath with whitespace or shell metacharacters', async () => {
+    const cookie = await login();
+    // `;` and `|` also break the PORTERCLAUDE_AGENT_LINKS encoding: the entrypoint drops the
+    // entry as malformed and the agent's real directory is never linked
+    for (const path of ['~/.qa;touch /tmp/x', '~/.qb $(id)', '~/.qc`id`', '~/.qd|x', '~/.q e']) {
+      const res = await post({ id: 'bad', sharedPaths: [{ path, kind: 'dir' }] }, cookie);
+      expect(res.status, path).toBe(422);
+    }
+  });
+
+  it('422s an env key that is not an identifier', async () => {
+    const cookie = await login();
+    for (const key of ['BAD KEY', '1BAD', 'BAD-KEY', 'BAD=KEY']) {
+      const res = await post({ id: 'bad', env: { [key]: '1' } }, cookie);
+      expect(res.status, key).toBe(422);
+    }
+    expect((await post({ env: { MYCODER_HOME: '/x' } }, cookie)).status).toBe(201);
+  });
+
+  // docs/AGENTS.md: historyPath must sit inside one of the shared paths - it is mounted at
+  // agentHistoryTarget(), which is null anywhere else, so `shareHistory:false` would
+  // silently never get its own volume.
+  it('422s a historyPath outside every shared DIRECTORY', async () => {
+    const cookie = await login();
+    expect((await post({ id: 'bad', historyPath: '~/.other/hist' }, cookie)).status).toBe(422);
+    // a shared FILE is not a directory the history can live in either
+    expect(
+      (
+        await post(
+          {
+            id: 'bad2',
+            sharedPaths: [{ path: '~/.mycoder.json', kind: 'file' }],
+            historyPath: '~/.mycoder.json/hist',
+          },
+          cookie,
+        )
+      ).status,
+    ).toBe(422);
+    // ...and the documented layout is accepted
+    expect((await post({ historyPath: '~/.mycoder/chats' }, cookie)).status).toBe(201);
+  });
+});

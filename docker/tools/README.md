@@ -117,7 +117,7 @@ from source (the channel/`latest` an install kind resolves is re-resolved, so th
 picks up a new upstream version).
 
 The server sets it for `POST /api/hosts/:hostId/images/tools/sync {"force":true}` — in the
-UI: Settings → Agents → the caret next to *Install / update on this host* → **Upgrade all
+UI: Settings → Agents → the caret next to *Sync tools* → **Upgrade all
 agents**. That request also rebuilds `<ns>/tools:latest` without the layer cache, so expect
 the cost of a first sync again. A plain sync (`force:false`) stays the cheap "install what is
 missing" path.

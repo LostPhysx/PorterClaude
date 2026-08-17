@@ -29,8 +29,10 @@ gives each of them **one auth volume per host**:
 porterclaude-auth-<agentId>   ->   /home/dev/.porterclaude/agents/<agentId>
 ```
 
-Log in once on a host and every session on that host is authenticated. **Nothing is shared
-between hosts** — not images, not the tools volume, not logins. A login on host `prod` says
+That volume is created by the **first session that mounts the agent**, not by the sync — so
+right after enabling a new agent and syncing, only the auth volumes of agents that already
+ran a session exist on the host. Log in once on a host and every session on that host is
+authenticated. **Nothing is shared between hosts** — not images, not the tools volume, not logins. A login on host `prod` says
 nothing about host `lab`.
 
 **Session** — a container on one host. It mounts the tools volume read-only at
@@ -127,13 +129,13 @@ host, and are enabled per host exactly like the built-ins.
 | `id` | yes | slug, unique across built-ins and custom agents, **immutable** (it names the auth volume `porterclaude-auth-<id>`) |
 | `name` | yes | label in the UI |
 | `description` | no | one line shown on the card |
-| `command` | yes | what must be callable inside the session; the tools volume puts it on `PATH` as `/opt/porterclaude/bin/<command>` |
+| `command` | yes | what must be callable inside the session; the tools volume puts it on `PATH` as `/opt/porterclaude/bin/<command>`. A plain executable **name** — letters, digits, `.`, `_`, `-` — never a command line (put extra argv in `args`) |
 | `args` | no | extra argv appended when a terminal opens the agent (default `[]`) |
 | `versionCommand` | yes | argv that prints the version, e.g. `["my-agent","--version"]`; its first output line becomes the version in the Agents panel |
 | `install` | yes | one of the four kinds below |
 | `sharedPaths` | yes (≥1) | the paths that must survive a session recreate and be shared by every session on the host |
 | `historyPath` | no | a path **inside** one of the shared dirs holding conversation history; sessions that opt out of shared history get their own volume for it (`null` when the agent has none) |
-| `env` | no | extra container environment for sessions that mount this agent |
+| `env` | no | extra container environment for sessions that mount this agent; keys must be identifiers (`[A-Za-z_][A-Za-z0-9_]*`) |
 | `loginHint` | no | one line telling the user how to authenticate |
 | `homepage` | no | link shown on the card |
 
@@ -259,7 +261,14 @@ can rebuild, per-project state) is better left out: it only makes the auth volum
   not produce the same name** — the app rejects such a definition when you save it, because
   both would land in the same place.
 * `historyPath` must sit inside one of the shared **dir** paths, otherwise the "private
-  history" option of a session has nothing to mount over.
+  history" option of a session has nothing to mount over. **The app enforces this** — a
+  `historyPath` anywhere else is refused when you save the definition, instead of quietly
+  sharing the history of a session that asked for its own.
+* A path may only use letters, digits and `. _ - ~ / @ +`. **No spaces, no shell
+  metacharacters**: the links are handed to the container as one
+  `target|source|kind;target|source|kind` string, so a `;` or `|` inside a path splits one
+  link into two malformed ones — the bootstrap drops them and the agent's real directory is
+  never linked. Definitions with such a path are refused when you save them.
 
 ### What "installed" means
 
@@ -277,7 +286,9 @@ one before they are authenticated.
 A broken install never breaks the host, the sync or the other agents. The agent is recorded
 as `installed: false` with a one-line error, the panel shows *not installed* plus that error,
 and a terminal for it is refused instead of starting an unauthenticated agent. Fix the
-definition and sync again. Two agents claiming the same `command` are also a soft failure:
+definition and sync again. The error names what actually went wrong — a failed download says
+`download failed for linux-arm64 (curl exit 6): <url>`, and only a definition that carries no
+URL for this architecture at all says `no download URL for this host … in install.urls`. Two agents claiming the same `command` are also a soft failure:
 the first one keeps the shim, the second is recorded with an error saying so.
 
 ### musl (Alpine) sessions

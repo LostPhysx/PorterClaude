@@ -48,6 +48,9 @@ export function testPaths(overrides: Partial<Paths> = {}): Paths {
 
 export const TEST_HOST_ID = 'default';
 
+/** `config.instanceId()` of the stub store — the porterclaude.instance label of the tests. */
+export const TEST_INSTANCE_ID = 'pc-test';
+
 export function sessionInput(overrides: Partial<SessionInput> = {}): SessionInput {
   return SessionInputSchema.parse({
     name: 'web',
@@ -99,6 +102,7 @@ export function stubConfigStore(
   const map = new Map(sessions.map((s) => [s.name, s]));
   const store = {
     general: () => general,
+    instanceId: () => TEST_INSTANCE_ID,
     listSessions: () => [...map.values()],
     getSession: (name: string) => map.get(name) ?? null,
     putSession: async (cfg: SessionConfig) => {

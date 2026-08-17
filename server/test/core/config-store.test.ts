@@ -400,3 +400,48 @@ describe('ConfigStore', () => {
     }).toThrow();
   });
 });
+
+// ---------------------------------------------------------------------------
+// QA R1-INT2-5 / R2-INT2-6: the identity that keeps two installs on ONE engine apart.
+// ---------------------------------------------------------------------------
+describe('ConfigStore.instanceId', () => {
+  it('generates one on first boot and never changes it', async () => {
+    const dir = await freshDir();
+    const first = await buildContext({ DATA_DIR: dir });
+    const id = first.ctx.config.instanceId();
+    expect(id).toMatch(/^pc-[0-9a-f]{12}$/);
+    expect(JSON.parse(await readFile(path.join(dir, 'config.json'), 'utf8')).instanceId).toBe(id);
+
+    const second = await buildContext({ DATA_DIR: dir });
+    expect(second.ctx.config.instanceId()).toBe(id);
+  });
+
+  it('gives two installs different ids', async () => {
+    const a = await buildContext({ DATA_DIR: await freshDir() });
+    const b = await buildContext({ DATA_DIR: await freshDir() });
+    expect(a.ctx.config.instanceId()).not.toBe(b.ctx.config.instanceId());
+  });
+
+  // a v0.1 / v0.2.0 config has no instanceId: it must get one, and its containers (which
+  // carry no instance label) stay visible - that is the whole migration.
+  it('fills the id in for a config written before the label existed', async () => {
+    const dir = await freshDir();
+    await writeFile(path.join(dir, 'config.json'), JSON.stringify(v1Config({ kind: 'none' })), 'utf8');
+    const { ctx } = await buildContext({ DATA_DIR: dir });
+    expect(ctx.config.instanceId()).toMatch(/^pc-[0-9a-f]{12}$/);
+  });
+
+  it('regenerates an invalid id instead of quarantining config.json', async () => {
+    const dir = await freshDir();
+    const { ctx: first } = await buildContext({ DATA_DIR: dir });
+    await first.hosts.create({ name: 'Local docker', connection: { type: 'socket', socketPath: '/x.sock' } });
+    const file = path.join(dir, 'config.json');
+    const raw = JSON.parse(await readFile(file, 'utf8'));
+    await writeFile(file, JSON.stringify({ ...raw, instanceId: 'NOT A VALID ID' }), 'utf8');
+
+    const { ctx } = await buildContext({ DATA_DIR: dir });
+    expect(ctx.config.instanceId()).toMatch(/^pc-[0-9a-f]{12}$/);
+    // ...and nothing else was lost
+    expect(ctx.config.listHosts().map((host) => host.id)).toEqual(['local-docker']);
+  });
+});

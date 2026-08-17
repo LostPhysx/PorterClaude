@@ -236,6 +236,20 @@ describe('HostManager.importPortainerEndpoints', () => {
     expect(skipping.skipped.map((s) => s.reason)).toContain('already imported');
   });
 
+  it('keeps a host name the operator edited when the import runs again', async () => {
+    const ctx = await ctxFor();
+    const portainer = await fakePortainer(ENDPOINTS);
+    await ctx.credentials.create({ name: 'P', url: portainer.url, apiKey: 'ptr_key_abcd' });
+    await ctx.hosts.importPortainerEndpoints('portainer-1');
+    await ctx.hosts.update('prod', { name: 'Prod EU (renamed)' });
+
+    const again = await ctx.hosts.importPortainerEndpoints('portainer-1');
+    expect(again.updated).toContain('prod');
+    expect(ctx.hosts.require('prod').name).toBe('Prod EU (renamed)');
+    // a host that still carries the endpoint name is still re-templated
+    expect(ctx.hosts.require('staging-box').name).toBe('Staging Box');
+  });
+
   it('honours an explicit endpoint selection and 404s an unknown credential', async () => {
     const ctx = await ctxFor();
     const portainer = await fakePortainer(ENDPOINTS);

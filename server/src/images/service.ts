@@ -17,7 +17,7 @@ import type { ServiceDeps } from '../context.js';
 import type { GeneralConfig } from '../config/schema.js';
 import type { BuildLogLine, DockerBackend, ImageSummary } from '../backends/types.js';
 import { AppError } from '../http/errors.js';
-import { IMAGE_LABELS } from '../sessions/model.js';
+import { CONTAINER_LABELS, IMAGE_LABELS } from '../sessions/model.js';
 import type { HostConfig } from '../hosts/model.js';
 import type { AgentDefinition, ToolsAgentManifest } from '../agents/model.js';
 import { TOOLS_AGENTS_ENV, TOOLS_AGENT_MANIFEST, agentAuthVolumeFor } from '../agents/model.js';
@@ -478,7 +478,10 @@ export class ImageService {
     let present = false;
     let claudeVersion: string | null = null;
     let claudeChannel: string | null = null;
-    let lastSyncedAt = this.lastToolsSync.get(hostId) ?? null;
+    // when the tools volume was last populated, worst source last: the tools IMAGE date is
+    // the date of the first BUILD, which is neither a sync nor even close to one after a
+    // restart (a cached image never gets rebuilt) — see `manifestSyncedAt` below
+    let imageDate: string | null = null;
     let imageHash: string | null = null;
     let built = false;
 
@@ -507,7 +510,7 @@ export class ImageService {
         claudeVersion = this.claudeVersionOf(engine, inspect?.id ?? null);
         claudeChannel = inspect?.labels[IMAGE_LABELS.claudeVersion] ?? null;
         imageHash = inspect?.labels[IMAGE_LABELS.contextHash] ?? null;
-        lastSyncedAt = lastSyncedAt ?? inspect?.createdAt ?? inspect?.labels[IMAGE_LABELS.builtAt] ?? null;
+        imageDate = inspect?.createdAt ?? inspect?.labels[IMAGE_LABELS.builtAt] ?? null;
       } catch (err) {
         error = error ?? errMessage(err);
         this.deps.log.debug({ err, imageRef }, 'inspecting tools image failed');
@@ -518,8 +521,17 @@ export class ImageService {
     // on a fresh install "nothing built yet" is already reported by present:false.
     const outdated = Boolean(contextHash) && (built ? imageHash !== contextHash : present);
 
-    const { statuses: agents, error: manifestError } = await this.agentStatusesWithError(hostId);
+    const {
+      statuses: agents,
+      error: manifestError,
+      syncedAt: manifestSyncedAt,
+    } = await this.agentStatusesWithError(hostId);
     error = error ?? manifestError;
+    // AGENTS.json is written BY the sync, so its `syncedAt` is the only date that survives a
+    // restart of this app (`lastToolsSync` is in-memory) and the only one that is a sync at
+    // all. The image date is the last resort — it made the Images panel claim "synced 00:59"
+    // next to agents "installed 01:11" after a restart (QA R2-INT2-5b).
+    const lastSyncedAt = manifestSyncedAt ?? this.lastToolsSync.get(hostId) ?? imageDate;
     // the `claude` entry of the manifest is the authoritative version once a v0.2 sync ran;
     // the image probe above only says what the tools IMAGE ships (kept for compatibility)
     const claudeAgent = agents.find((a) => a.id === 'claude');
@@ -625,7 +637,10 @@ export class ImageService {
       this.append(job, `ensuring volume ${general.toolsVolume}`);
       await backend.createVolume({
         name: general.toolsVolume,
-        labels: { [TOOLS_SYNC_LABEL]: 'true' },
+        labels: {
+          [TOOLS_SYNC_LABEL]: 'true',
+          [CONTAINER_LABELS.instance]: this.deps.config.instanceId(),
+        },
       });
 
       // what the populate container installs into the volume (agents/model.ts contract)
@@ -741,7 +756,11 @@ export class ImageService {
     if (!volumes.includes(target)) {
       await backend.createVolume({
         name: target,
-        labels: { 'porterclaude.managed': 'true', 'porterclaude.agent': 'claude' },
+        labels: {
+          'porterclaude.managed': 'true',
+          [CONTAINER_LABELS.instance]: this.deps.config.instanceId(),
+          'porterclaude.agent': 'claude',
+        },
       });
     }
 
@@ -1117,13 +1136,14 @@ export class ImageService {
    * `agentStatuses` plus WHY the manifest is missing: an unreachable host answers
    * `installed:false` for every agent, and without this error string the panel cannot tell
    * that apart from "enabled but never synced" (api.md: an unreachable host answers
-   * installed:false plus an error instead of a 502).
+   * installed:false plus an error instead of a 502). `syncedAt` is the manifest's own
+   * timestamp — `ToolsStatus.lastSyncedAt` (the only accurate one after a restart).
    */
   async agentStatusesWithError(
     hostId: string,
-  ): Promise<{ statuses: AgentToolStatus[]; error: string | null }> {
+  ): Promise<{ statuses: AgentToolStatus[]; error: string | null; syncedAt: string | null }> {
     const host = this.deps.hosts.get(hostId);
-    if (!host) return { statuses: [], error: null };
+    if (!host) return { statuses: [], error: null, syncedAt: null };
     const enabled = this.enabledAgents(host);
     const general = this.deps.hosts.settingsForHost(host);
 
@@ -1140,7 +1160,7 @@ export class ImageService {
         error: entry?.error ?? error,
       };
     });
-    return { statuses, error };
+    return { statuses, error, syncedAt: manifest?.syncedAt ?? null };
   }
 
   /**
@@ -1261,8 +1281,16 @@ export class ImageService {
     let containerId: string | null = null;
     try {
       const imageRef = await this.probeImageRef(backend, general, probeImage);
-      // nothing on this engine can read the volume: a real "unknown", not a failure
-      if (!imageRef) return { manifest: null, bootstrap: null, error: null };
+      if (!imageRef) {
+        // Nothing on this engine can read the volume — but "no image here" and "this engine
+        // does not answer at all" look the SAME through inspectImage: a portainer endpoint
+        // that no longer exists answers 404 for every path, and a docker 404 is mapped to
+        // null ("no such image"). One ping tells them apart, and without it an unreachable
+        // host answered installed:false + error:null for every agent while the tools panel
+        // (which does call listVolumes) showed the transport error (QA R1-INT2-6).
+        const unreachable = await this.pingError(backend);
+        return { manifest: null, bootstrap: null, error: unreachable };
+      }
       const created = await backend.createContainer({
         name,
         image: imageRef,
@@ -1292,6 +1320,17 @@ export class ImageService {
           this.deps.log.debug({ err, containerId }, 'removing the manifest probe container failed');
         }
       }
+    }
+  }
+
+  /** `null` when the engine answers a ping, its error message when it does not. */
+  private async pingError(backend: DockerBackend): Promise<string | null> {
+    try {
+      await backend.ping();
+      return null;
+    } catch (err) {
+      this.deps.log.debug({ err }, 'the engine did not answer a ping');
+      return errMessage(err);
     }
   }
 

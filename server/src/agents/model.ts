@@ -33,6 +33,48 @@ export const AgentIdSchema = z
   .regex(AGENT_ID_RE, 'agent id must be lowercase letters, digits and dashes (max 32 chars)');
 
 /**
+ * An executable NAME — never a command line. `command` (and the npm/pip `bin` it defaults
+ * to) is what the tools volume must put on PATH (`<toolsMount>/bin/<command>`), what
+ * `install-agents.sh` writes a `run.sh` for, and what a terminal execs.
+ *
+ * A value with shell metacharacters (`evil; rm -rf /`) is not an injection — the terminal
+ * shell-quotes the argv and the installer refuses it — but it fails at SYNC time, in a job
+ * log, hours after the definition was accepted with a 201. It is rejected here instead.
+ */
+export const AGENT_COMMAND_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+
+export const AgentCommandSchema = z
+  .string()
+  .regex(
+    AGENT_COMMAND_RE,
+    'must be a plain executable name: letters, digits, `.`, `_`, `-` (max 64 chars), no spaces or shell metacharacters',
+  );
+
+/**
+ * Container env var name. The keys of `AgentDefinition.env` end up in `docker create` and in
+ * every `docker exec` of a session; a key like `BAD KEY` is accepted by the engine and then
+ * unusable by any shell, so it is rejected where it enters the system.
+ */
+export const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+export const AgentEnvKeySchema = z
+  .string()
+  .regex(ENV_KEY_RE, 'env keys must match [A-Za-z_][A-Za-z0-9_]*');
+
+/**
+ * The characters a shared path may use ON THE WAY IN. Beyond `AgentPathSchema` (which only
+ * rules out traversal) this keeps a path usable by everything that has to carry it:
+ *   * `SESSION_AGENT_LINKS_ENV` encodes links as `target|source|kind;…`, so a `;` or `|` in
+ *     a path silently splits ONE link into two malformed ones — the entrypoint drops them
+ *     ("ignoring the malformed agent link") and the agent's real directory is never linked;
+ *   * the bootstrap and the root repair script (`ensureAgentDirs`) build `sh -c` lines from
+ *     these paths, and whitespace/metacharacters make them unquotable in practice.
+ * STORED definitions stay lax on purpose (config/store.ts must not drop an agent an older
+ * build accepted); only the API refuses them.
+ */
+export const AGENT_PATH_SAFE_RE = /^[A-Za-z0-9._~/@+-]+$/;
+
+/**
  * `~/…` (relative to the container home) or an absolute POSIX path - and nothing else.
  *
  * Every such path becomes a SYMLINK inside the session container (`resolveAgentPath` +
@@ -58,6 +100,12 @@ export const AgentPathSchema = z
     message: 'path must name something below the container home, not the home itself',
   });
 
+/** `AgentPathSchema` plus the safe charset (API input only, see AGENT_PATH_SAFE_RE). */
+export const SafeAgentPathSchema = AgentPathSchema.refine((p) => AGENT_PATH_SAFE_RE.test(p), {
+  message:
+    'path must not contain whitespace or shell metacharacters (allowed: letters, digits, `.`, `_`, `-`, `~`, `/`, `@`, `+`)',
+});
+
 /** Where an agent keeps state that must be shared between every session on a host. */
 export const AgentSharedPathSchema = z.object({
   /** `~/…` (relative to the container home) or an absolute POSIX path */
@@ -74,44 +122,63 @@ export const AgentSharedPathSchema = z.object({
  *
  * Targets are the four the tools volume ships: `linux-x64`, `linux-arm64`,
  * `linux-x64-musl`, `linux-arm64-musl` (musl is best effort).
+ *
+ * The four variants are named so the API-input union below can tighten `bin` without
+ * repeating them (see AgentInstallInputSchema).
  */
+const AgentInstallScriptSchema = z.object({
+  kind: z.literal('script'),
+  /** curl'ed and piped into sh, with HOME/PREFIX pointed at the tools payload */
+  url: z.string().url(),
+  args: z.array(z.string()).max(32).optional(),
+  /** the executable the installer leaves behind, relative to its install prefix */
+  binPath: z.string().max(256).optional(),
+  env: z.record(z.string(), z.string()).optional(),
+});
+
+const AgentInstallNpmSchema = z.object({
+  kind: z.literal('npm'),
+  package: z.string().min(1).max(214),
+  /** npm dist-tag or exact version (default 'latest') */
+  version: z.string().max(64).optional(),
+  /** the bin name npm links (default: the agent's `command`) */
+  bin: z.string().max(64).optional(),
+});
+
+const AgentInstallPipSchema = z.object({
+  kind: z.literal('pip'),
+  package: z.string().min(1).max(214),
+  version: z.string().max(64).optional(),
+  bin: z.string().max(64).optional(),
+  /** install with `uv tool install` when available (default true) */
+  preferUv: z.boolean().optional(),
+});
+
+const AgentInstallBinarySchema = z.object({
+  kind: z.literal('binary'),
+  /** download URL per target; missing targets are simply not installed */
+  urls: z.record(
+    z.enum(['linux-x64', 'linux-arm64', 'linux-x64-musl', 'linux-arm64-musl']),
+    z.string().url(),
+  ),
+  archive: z.enum(['none', 'tar.gz', 'zip']).default('none'),
+  /** path of the executable inside the archive (ignored for archive:'none') */
+  path: z.string().max(256).optional(),
+});
+
 export const AgentInstallSchema = z.discriminatedUnion('kind', [
-  z.object({
-    kind: z.literal('script'),
-    /** curl'ed and piped into sh, with HOME/PREFIX pointed at the tools payload */
-    url: z.string().url(),
-    args: z.array(z.string()).max(32).optional(),
-    /** the executable the installer leaves behind, relative to its install prefix */
-    binPath: z.string().max(256).optional(),
-    env: z.record(z.string(), z.string()).optional(),
-  }),
-  z.object({
-    kind: z.literal('npm'),
-    package: z.string().min(1).max(214),
-    /** npm dist-tag or exact version (default 'latest') */
-    version: z.string().max(64).optional(),
-    /** the bin name npm links (default: the agent's `command`) */
-    bin: z.string().max(64).optional(),
-  }),
-  z.object({
-    kind: z.literal('pip'),
-    package: z.string().min(1).max(214),
-    version: z.string().max(64).optional(),
-    bin: z.string().max(64).optional(),
-    /** install with `uv tool install` when available (default true) */
-    preferUv: z.boolean().optional(),
-  }),
-  z.object({
-    kind: z.literal('binary'),
-    /** download URL per target; missing targets are simply not installed */
-    urls: z.record(
-      z.enum(['linux-x64', 'linux-arm64', 'linux-x64-musl', 'linux-arm64-musl']),
-      z.string().url(),
-    ),
-    archive: z.enum(['none', 'tar.gz', 'zip']).default('none'),
-    /** path of the executable inside the archive (ignored for archive:'none') */
-    path: z.string().max(256).optional(),
-  }),
+  AgentInstallScriptSchema,
+  AgentInstallNpmSchema,
+  AgentInstallPipSchema,
+  AgentInstallBinarySchema,
+]);
+
+/** `AgentInstallSchema` with the `bin` names the installer links validated (API input). */
+export const AgentInstallInputSchema = z.discriminatedUnion('kind', [
+  AgentInstallScriptSchema,
+  AgentInstallNpmSchema.extend({ bin: AgentCommandSchema.optional() }),
+  AgentInstallPipSchema.extend({ bin: AgentCommandSchema.optional() }),
+  AgentInstallBinarySchema,
 ]);
 
 export const AgentDefinitionSchema = z.object({
@@ -163,8 +230,49 @@ export interface HostAgentView extends AgentView {
   authVolume: string;
 }
 
-/** Input for POST/PUT /api/agents (custom agents). `id` is immutable on PUT. */
-export const AgentDefinitionInputSchema = AgentDefinitionSchema;
+/**
+ * The container home the API input rules are evaluated against. Only the RELATION between
+ * `historyPath` and the `sharedPaths` matters here and both are resolved with the same home,
+ * so the concrete value is irrelevant — a host may override `containerHome` at any time.
+ */
+const VALIDATION_HOME = '/home/dev';
+
+/**
+ * Input for POST/PUT /api/agents (custom agents). `id` is immutable on PUT.
+ *
+ * DELIBERATELY STRICTER THAN `AgentDefinitionSchema` (which parses what is already STORED):
+ * a definition that config.json accepted with an older build must keep loading — dropping it
+ * would take the agent away from every host that enables it (config/store.ts
+ * `dropInvalidCustomAgents`) — so the tighter rules live on the way IN, where the caller can
+ * still fix them and gets a 422 naming the field:
+ *   * `command` / npm+pip `bin`  — a plain executable name (AGENT_COMMAND_RE);
+ *   * `sharedPaths[].path` / `historyPath` — no whitespace, no shell metacharacters
+ *     (AGENT_PATH_SAFE_RE);
+ *   * `env` keys — [A-Za-z_][A-Za-z0-9_]* (ENV_KEY_RE);
+ *   * `historyPath` must sit inside one of the shared DIRECTORIES (docs/AGENTS.md): it is
+ *     mounted at `agentHistoryTarget()`, which is null for a path outside them — the private
+ *     history volume of `shareHistory:false` would then silently never be mounted.
+ */
+export const AgentDefinitionInputSchema = AgentDefinitionSchema.extend({
+  command: AgentCommandSchema.max(64),
+  install: AgentInstallInputSchema,
+  sharedPaths: z
+    .array(AgentSharedPathSchema.extend({ path: SafeAgentPathSchema }))
+    .min(1)
+    .max(8),
+  historyPath: SafeAgentPathSchema.nullable().default(null),
+  env: z.record(AgentEnvKeySchema, z.string()).default({}),
+}).superRefine((def, ctx) => {
+  if (def.historyPath && agentHistoryTarget(def, VALIDATION_HOME) === null) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['historyPath'],
+      message:
+        `historyPath '${def.historyPath}' must sit inside one of the sharedPaths ` +
+        `directories (${def.sharedPaths.filter((p) => p.kind === 'dir').map((p) => p.path).join(', ') || 'none declared'})`,
+    });
+  }
+});
 export type AgentDefinitionInput = z.infer<typeof AgentDefinitionInputSchema>;
 
 // ---------------------------------------------------------------------------

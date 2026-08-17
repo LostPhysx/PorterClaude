@@ -8,6 +8,10 @@
 
 # ---------- stage 1: dependencies ----------
 FROM node:22-bookworm-slim AS deps
+# Every stage is labelled so the images a rebuild leaves DANGLING can be collected by label
+# (`docker image prune -f --filter label=porterclaude.image=app`, or deploy/host-prep.sh
+# --prune, which only ever touches dangling images carrying a porterclaude.* label).
+LABEL porterclaude.image="app" porterclaude.stage="deps"
 WORKDIR /app
 COPY package.json package-lock.json* ./
 COPY server/package.json server/
@@ -22,6 +26,7 @@ RUN if [ -f package-lock.json ]; then \
 
 # ---------- stage 2: build ----------
 FROM deps AS build
+LABEL porterclaude.image="app" porterclaude.stage="build"
 WORKDIR /app
 COPY . .
 # server: tsc -> server/dist ; web is plain ES modules and has no build step
@@ -32,6 +37,7 @@ RUN npm prune --omit=dev --no-audit --no-fund
 
 # ---------- stage 3: runtime ----------
 FROM node:22-bookworm-slim AS runtime
+LABEL porterclaude.image="app" porterclaude.stage="runtime"
 WORKDIR /app
 ENV NODE_ENV=production \
     PORT=8080 \

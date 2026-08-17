@@ -162,6 +162,16 @@ socket's group:
 stat -c %g /var/run/docker.sock     # on the docker host -> put it in DOCKER_GID
 ```
 
+`DOCKER_GID` is optional: when it is missing from `deploy/.env`, `deploy.sh` probes the
+engine for it (step 5 above) and only falls back to the compose default `999` when the probe
+fails — a `--dry-run` always renders that fallback, because it makes no network calls.
+
+The two external networks the stack attaches to come from `PROXY_NETWORK_APP` (shared with
+nginx-proxy) and `PROXY_NETWORK_EDGE`, defaulting to `portainer_dmz` / `portainer_gate`.
+A v0.1 env file that still carries the single `PROXY_NETWORKS=<app>,<edge>` keeps working:
+`deploy.sh` splits it into those two names when they are not set explicitly (first entry =
+app, second = edge) and logs the mapping, instead of ignoring the variable silently.
+
 `porterclaude-data` must persist: it holds `secret.key`, which encrypts the stored Portainer
 keys and signs session cookies. The **agent logins** are not in it — they live on each
 managed docker host in the per-agent volumes `porterclaude-auth-<agentId>`

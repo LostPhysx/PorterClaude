@@ -36,7 +36,10 @@ services:
     environment:
       APP_PASSWORD: ${APP_PASSWORD:-change-me}
       # APP_SECRET: ...                       # optional; auto-generated into /data/secret.key
-      # PORTERCLAUDE_BACKEND: socket          # socket | portainer — seeds the FIRST host only
+      PORTERCLAUDE_BACKEND: socket            # socket | portainer — seeds the FIRST host only;
+                                              # matches the socket mount below. Drop it (and the
+                                              # mount) for a portainer-only install, or to add
+                                              # every host by hand in Settings -> Hosts.
       # --- seeding a portainer host ---------------------------------------------------
       # PORTAINER_URL: https://portainer.example.com
       # PORTAINER_API_KEY: ...                # seeds one credential; stored encrypted in /data

@@ -187,6 +187,12 @@ export const CONTAINER_LABELS = {
   session: 'porterclaude.session',
   /** v0.2: the host id the session belongs to (reconcile/adoption reads it back) */
   host: 'porterclaude.host',
+  /**
+   * v0.2: the PorterClaude INSTALL that created this container (config.instanceId).
+   * Session discovery only ever touches containers that carry this install's id or NO id at
+   * all (v0.1 / v0.2.0 containers) — see sessions/service.ts `ownedByThisInstance`.
+   */
+  instance: 'porterclaude.instance',
   /** v0.2: comma separated agent ids mounted into this container */
   agents: 'porterclaude.agents',
   imageType: 'porterclaude.image-type',

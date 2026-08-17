@@ -8,7 +8,8 @@
 #   --clean   remove leftover QA session containers (porterclaude.managed=true, named
 #             pc-qa-* / pc-o1-*) together with their workspace/history volumes
 #   --prune   remove DANGLING images that carry porterclaude.* labels (every recipe rebuild
-#             and every tools sync leaves one behind: ~1-2 GB each)
+#             and every tools sync leaves one behind: ~1-2 GB each; since v0.2 the app-image
+#             stages built by deploy.sh are labelled porterclaude.image=app and collected too)
 #   --vhost   write vhost.d/<portainer-host> and vhost.d/<app-host> for nginx-proxy so that
 #             long /docker/build streams and idle terminal WebSockets stop being cut at 60 s
 #   --reload  HUP the nginx-proxy container so it picks the new vhost files up
@@ -40,7 +41,8 @@ usage: deploy/host-prep.sh [--dry-run] <action>... [--env-file <path>]
 actions (each is opt-in; without one the script does nothing):
   --clean     remove containers labelled porterclaude.managed=true whose name starts with
               pc-qa- or pc-o1-, plus their porterclaude-ws-* / porterclaude-hist-* volumes
-  --prune     remove dangling images that carry a porterclaude.* label
+  --prune     remove dangling images that carry a porterclaude.* label (recipe and tools
+              builds, plus the app-image stages every deploy.sh run leaves behind)
   --vhost     write nginx-proxy vhost.d snippets for the Portainer host (long build streams)
               and for the app host (idle terminal WebSockets)
   --reload    send SIGHUP to the nginx-proxy container so it reloads its configuration

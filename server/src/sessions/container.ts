@@ -28,6 +28,13 @@ export interface BuildSpecInput {
    * `porterclaude.agents` label and the spec hash, so pass it sorted by id.
    */
   agents: AgentDefinition[];
+  /**
+   * `config.instanceId()` — the install this container belongs to. It becomes the
+   * `porterclaude.instance` label and is what keeps a second PorterClaude on the same engine
+   * from listing/adopting this container (sessions/service.ts). Labels are NOT part of the
+   * spec hash, so adding it never makes an existing container report `needsRecreate`.
+   */
+  instanceId: string;
   /** concrete image ref: recipes resolve to <imageNamespace>/<recipe>:latest */
   resolvedImage: string;
   /** custom images get the tools-volume bootstrap entrypoint */
@@ -131,6 +138,7 @@ export function imagePathFromEnv(env: string[] | undefined, general: GeneralConf
  *   labels      porterclaude.managed=true
  *               porterclaude.session=<slug>
  *               porterclaude.host=<hostId>                        (v0.2)
+ *               porterclaude.instance=<config.instanceId>         (v0.2)
  *               porterclaude.agents=<id,id,...>                   (v0.2)
  *               porterclaude.image-type=recipe|custom
  *               porterclaude.recipe=<name>            (recipes only)
@@ -237,6 +245,7 @@ export function buildContainerSpec(input: BuildSpecInput): CreateContainerSpec {
     [CONTAINER_LABELS.managed]: 'true',
     [CONTAINER_LABELS.session]: session.name,
     [CONTAINER_LABELS.host]: session.hostId,
+    [CONTAINER_LABELS.instance]: input.instanceId,
     [CONTAINER_LABELS.agents]: agents.map((a) => a.id).join(','),
     [CONTAINER_LABELS.imageType]: imageType,
     [CONTAINER_LABELS.createdAt]: session.createdAt,

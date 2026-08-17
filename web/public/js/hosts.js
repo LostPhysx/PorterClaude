@@ -478,17 +478,14 @@ function overridesFieldsHtml(host) {
 }
 
 /**
- * What a NEW host starts with: the agents the current default host enables (a second host
- * usually wants the same set), else the first built-in of the registry. Deliberately not a
- * hard-coded agent id - the UI is agent-neutral (frontend.md section 12.6).
+ * What a NEW host starts with: the built-in default set - the FIRST built-in of the registry
+ * (`claude` today), never the agent set of the default host. Enabling an agent costs sync
+ * time and disk on that host, so a second host starts minimal and the operator opts in
+ * (AGENTS.md section 2). Deliberately not a hard-coded agent id - the UI is agent-neutral
+ * (frontend.md section 12.6).
  * @returns {string[]}
  */
 function defaultEnabledAgentIds() {
-  const current = getHost(defaultHostId);
-  const inherited = current && current.agents && Array.isArray(current.agents.enabled)
-    ? current.agents.enabled
-    : [];
-  if (inherited.length) return inherited;
   const firstBuiltin = agentDefs.find((a) => a && a.builtin);
   return firstBuiltin ? [firstBuiltin.id] : [];
 }

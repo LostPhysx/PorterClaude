@@ -81,10 +81,34 @@ parse_args() {
 }
 
 # --- env -----------------------------------------------------------------------------------
+# Legacy alias: v0.1 env files carry ONE combined `PROXY_NETWORKS=app,edge`, while the
+# compose file reads PROXY_NETWORK_APP / PROXY_NETWORK_EDGE. Split the old form so an
+# existing deploy/.env keeps working instead of being silently ignored. The two explicit
+# names always win when they are set themselves.
+apply_proxy_network_aliases() {
+  [ -n "${PROXY_NETWORKS:-}" ] || return 0
+  local nets count app edge
+  nets="$(printf '%s' "$PROXY_NETWORKS" | tr ',' ' ')"
+  count="$(printf '%s' "$nets" | awk '{print NF}')"
+  app="$(printf '%s' "$nets" | awk '{print $1}')"
+  edge="$(printf '%s' "$nets" | awk '{print $2}')"
+  if [ "${count:-0}" -gt 2 ]; then
+    warn "PROXY_NETWORKS lists $count networks; the stack attaches exactly two (app, edge)"
+  fi
+  if [ -z "${PROXY_NETWORK_APP:-}" ] && [ -n "$app" ]; then
+    PROXY_NETWORK_APP="$app"; export PROXY_NETWORK_APP
+  fi
+  if [ -z "${PROXY_NETWORK_EDGE:-}" ] && [ -n "$edge" ]; then
+    PROXY_NETWORK_EDGE="$edge"; export PROXY_NETWORK_EDGE
+  fi
+  log "PROXY_NETWORKS (legacy) -> app='${PROXY_NETWORK_APP:-}' edge='${PROXY_NETWORK_EDGE:-}'"
+}
+
 load_env() {
   pc_load_env_file "$ENV_FILE"
   pc_require_env "$ENV_FILE" PORTAINER_URL PORTAINER_ENDPOINT_ID PORTAINER_API_KEY \
                  APP_HOSTNAME APP_PASSWORD STACK_NAME
+  apply_proxy_network_aliases
 
   PORTAINER_URL="${PORTAINER_URL%/}"
   APP_IMAGE="${APP_IMAGE_OVERRIDE:-${APP_IMAGE:-porterclaude:local}}"

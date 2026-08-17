@@ -5,6 +5,8 @@ import { rm } from 'node:fs/promises';
 import { buildContext } from './helpers.js';
 import { BUILTIN_AGENTS, DEFAULT_ENABLED_AGENT_IDS } from '../../src/agents/builtin.js';
 import {
+  AgentDefinitionInputSchema,
+  AgentDefinitionSchema,
   agentAuthVolumeFor,
   agentDataDir,
   agentHistoryTarget,
@@ -195,5 +197,39 @@ describe('agent layout helpers (the naming contract with B2)', () => {
     expect(agentHistoryTarget(claude, '/home/dev')).toBe(
       '/home/dev/.porterclaude/agents/claude/claude/projects',
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// QA R1-INT2-4 / R2-INT2-7: the API input schema is stricter than the STORED one on
+// purpose — tightening the stored shape would drop definitions an older build accepted
+// (ConfigStore.dropInvalidCustomAgents) and take the agent away from every host that
+// enables it.
+// ---------------------------------------------------------------------------
+describe('AgentDefinition schemas', () => {
+  const lax = {
+    ...custom,
+    command: 'my coder',
+    sharedPaths: [{ path: '~/.my coder', kind: 'dir' as const }],
+    historyPath: '~/.other/hist',
+    env: { 'BAD KEY': '1' },
+  };
+
+  it('keeps loading a stored definition the API would refuse today', () => {
+    expect(AgentDefinitionSchema.safeParse(lax).success).toBe(true);
+    expect(AgentDefinitionInputSchema.safeParse(lax).success).toBe(false);
+  });
+
+  it('accepts every built-in definition as API input', () => {
+    for (const builtin of BUILTIN_AGENTS) {
+      const parsed = AgentDefinitionInputSchema.safeParse(builtin);
+      expect(parsed.success, `${builtin.id}: ${JSON.stringify(parsed.error?.issues ?? [])}`).toBe(true);
+    }
+  });
+
+  it('names the offending field', () => {
+    const parsed = AgentDefinitionInputSchema.safeParse({ ...custom, historyPath: '~/.elsewhere/x' });
+    expect(parsed.success).toBe(false);
+    expect(parsed.error?.issues[0]?.path).toEqual(['historyPath']);
   });
 });

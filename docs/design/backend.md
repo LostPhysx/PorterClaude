@@ -628,6 +628,19 @@ marker. Without this the deployed instance would silently ask for `/login` again
 * `reconcile()`/adoption reads `porterclaude.host` and `porterclaude.agents` back from the
   labels; an adopted container without a host label falls back to the host whose backend
   listed it.
+* **Instance scoping (`porterclaude.instance`).** Two hosts of ONE install may point at the
+  same engine (see §12.1) — and so may two INSTALLS, which is what the
+  `containerPrefix`/`volumePrefix` overrides are advertised for. `config.instanceId`
+  (`pc-<12 hex>`, generated once by `ConfigStore.init` and never rewritten) labels every
+  container and volume this install creates, and `listManagedContainers` drops everything
+  labelled for another install: `list()`, `reconcile()`, `locate()` (terminals, start,
+  remove, recreate) only ever see containers with THIS id or with no id at all — the latter
+  being a v0.1/v0.2.0 container of this install, since nothing else ever wrote the label.
+  Without it each install listed the other's containers as adoptable orphans, with its own
+  `hostName`, its own rewritten `resolvedImage` and a terminal that opened into them.
+  The one deliberate exception is the create-time name check, which looks at every managed
+  container regardless of instance: the name clash is real, and docker's own error is worse.
+  No migration: an install that has no id yet gets one on the next boot.
 * Changing a host's enabled agents makes its sessions report `needsRecreate` (the mounts are
   part of the spec hash). That is intended and documented in the UI.
 
@@ -652,7 +665,14 @@ marker. Without this the deployed instance would silently ask for `/login` again
   SUCCESSFUL read is cached: a manifest that is null because the engine did not answer would
   otherwise keep a recovered host at `installed:false` for the rest of the TTL. The failure
   reason travels on as `ToolsStatus.error` and as every `HostAgentView.error`, so the panel
-  can tell "not installed" from "could not read the tools volume".
+  can tell "not installed" from "could not read the tools volume". A host that answers 404
+  for EVERY path (a portainer endpoint that no longer exists) is indistinguishable from "no
+  such image" through `inspectImage`, so when no image on the engine can read the volume the
+  probe pings once: a failing ping is that transport error, a successful one is a real
+  "unknown".
+* `ToolsStatus.lastSyncedAt` comes from the manifest's own `syncedAt`, then from the sync
+  this process ran, and only then from the tools IMAGE date — the image is built once and
+  cached, so after a restart it claimed a sync hours before the agents it had installed.
 * `syncTools(hostId)` = build `<ns>/tools:latest` when missing/outdated → ensure the volume →
   run the populate container **with `PORTERCLAUDE_AGENTS`** → legacy claude import (once) →
   invalidate the cached manifest. A single agent failing to install is a job warning, not a

@@ -41,13 +41,25 @@ pc_uv_target() {
 # pc_fetch <url> <dest> : curl with retries, a connect timeout and no progress noise.
 # Returns non-zero on failure (and removes a partial file). Never prints credentials.
 pc_fetch() {
-  local url="$1" dest="$2" dir
+  local url="$1" dest="$2" dir status
   dir="$(dirname "$dest")"
   mkdir -p "$dir" 2>/dev/null || :
-  if curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 20 -o "$dest.part" "$url" \
-     && [ -s "$dest.part" ]; then
-    mv -f "$dest.part" "$dest"
-    return 0
+  if curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 20 -o "$dest.part" "$url"; then
+    status=0
+  else
+    status=$?
+  fi
+  # WHY a global: a shell function can only hand back a status, but the callers have to put
+  # the REASON into the agent manifest — that is what the Agents/Images cards show, and
+  # "download failed" without the curl status sent QA looking for a missing url instead
+  # (R2-INT2-5a). Always set, so a caller may read it after any pc_fetch.
+  PC_FETCH_STATUS="curl exit $status"
+  if [ "$status" -eq 0 ]; then
+    if [ -s "$dest.part" ]; then
+      mv -f "$dest.part" "$dest"
+      return 0
+    fi
+    PC_FETCH_STATUS="empty response"
   fi
   rm -f "$dest.part" 2>/dev/null || :
   return 1

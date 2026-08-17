@@ -18,6 +18,14 @@ import { hashPassword } from './crypto.js';
 import type { Env } from '../env.js';
 import type { Paths } from '../paths.js';
 import type { Logger } from '../logger.js';
+import { shortId } from '../util/ids.js';
+
+/**
+ * Instance id of a store whose `init()` never ran. It is a REAL id (containers labelled with
+ * it are owned by this process), just not a persisted one — every code path that creates a
+ * container goes through an initialised store.
+ */
+const UNKNOWN_INSTANCE_ID = 'pc-unknown';
 
 export interface ConfigStoreDeps {
   paths: Paths;
@@ -84,6 +92,11 @@ export class ConfigStore extends EventEmitter {
     // First boot (or a recovered file): make sure the file exists on disk, then seed.
     await this.update((draft) => {
       draft.version = CONFIG_VERSION;
+      // identity of this install; generated ONCE and never rewritten (see schema.ts)
+      if (!draft.instanceId) {
+        draft.instanceId = `pc-${shortId(6)}`;
+        log.info({ instanceId: draft.instanceId }, 'generated the instance id of this install');
+      }
       this.applyEnvSeeds(draft);
     });
 
@@ -363,6 +376,15 @@ export class ConfigStore extends EventEmitter {
 
   general(): GeneralConfig {
     return this.get().general;
+  }
+
+  /**
+   * Identity of this install (`porterclaude.instance` on every container/volume it creates).
+   * Always a value once `init()` ran; the fallback keeps a store that was never initialised
+   * (tests, a caller before init) from labelling containers with `undefined`.
+   */
+  instanceId(): string {
+    return this.get().instanceId ?? UNKNOWN_INSTANCE_ID;
   }
 
   /**

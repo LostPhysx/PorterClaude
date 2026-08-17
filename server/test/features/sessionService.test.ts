@@ -22,6 +22,7 @@ import {
   stubHostManager,
   stubHosts,
   stubConfigStore,
+  TEST_INSTANCE_ID,
 } from './helpers.js';
 
 /** the agents a default test host resolves to (hostConfig enables `claude`) */
@@ -331,6 +332,7 @@ describe('SessionService.list', () => {
       general: generalConfig(),
       resolvedImage: 'porterclaude/node:latest',
       imageType: 'recipe',
+      instanceId: TEST_INSTANCE_ID,
     });
     const { service, sb } = makeService({ sessions: [stored] });
     sb!.containers.push(
@@ -1297,6 +1299,7 @@ describe('SessionService.resolveAgents', () => {
       general: generalConfig(),
       resolvedImage: 'porterclaude/node:latest',
       imageType: 'recipe',
+      instanceId: TEST_INSTANCE_ID,
     });
     // the container was created with claude only; the host now also enables opencode
     const { service, sb } = makeService({
@@ -1499,5 +1502,114 @@ describe('SessionService file-kind agent paths (INT2-3)', () => {
     const seed = script.indexOf("printf '%s\\n' '{}' > '/home/dev/.porterclaude/agents/aider/aider.conf.yml'");
     expect(cp).toBeGreaterThan(-1);
     expect(seed).toBeGreaterThan(cp);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// QA R1-INT2-5 / R2-INT2-6: two PorterClaude INSTALLS on one engine. Every container this
+// install creates carries porterclaude.instance=<config.instanceId>; a container labelled
+// for another install must be invisible here (it was listed as an adoptable orphan, with a
+// terminal that opened into it), while an UNLABELLED container - a v0.1 / v0.2.0 container
+// of THIS install - must stay visible.
+// ---------------------------------------------------------------------------
+describe('cross-instance isolation on a shared engine', () => {
+  const foreign = () =>
+    containerSummary({
+      id: 'c-foreign',
+      name: 'qa-a1',
+      names: ['qa-a1'],
+      labels: {
+        'porterclaude.managed': 'true',
+        'porterclaude.session': 'a1',
+        [CONTAINER_LABELS.instance]: 'pc-someone-else',
+      },
+    });
+
+  const legacy = () =>
+    containerSummary({
+      id: 'c-legacy',
+      name: 'pc-old',
+      names: ['pc-old'],
+      labels: { 'porterclaude.managed': 'true', 'porterclaude.session': 'old' },
+    });
+
+  const mine = () =>
+    containerSummary({
+      id: 'c-mine',
+      name: 'pc-ghost',
+      names: ['pc-ghost'],
+      labels: {
+        'porterclaude.managed': 'true',
+        'porterclaude.session': 'ghost',
+        [CONTAINER_LABELS.instance]: TEST_INSTANCE_ID,
+      },
+    });
+
+  it('labels every container and volume it creates with the instance id', async () => {
+    const { service, sb } = makeService();
+    sb!.images.set('porterclaude/node:latest', imageInspect());
+
+    await service.create(sessionInput({ name: 'web' }));
+
+    const spec = sb!.log.find((c) => c.method === 'createContainer')!.args[0] as {
+      labels?: Record<string, string>;
+    };
+    expect(spec.labels?.[CONTAINER_LABELS.instance]).toBe(TEST_INSTANCE_ID);
+    const volumes = sb!.log
+      .filter((c) => c.method === 'createVolume')
+      .map((c) => c.args[0] as { name: string; labels?: Record<string, string> });
+    expect(volumes.length).toBeGreaterThan(0);
+    for (const volume of volumes) {
+      expect(volume.labels?.[CONTAINER_LABELS.instance], volume.name).toBe(TEST_INSTANCE_ID);
+    }
+  });
+
+  it('lists its own and unlabelled containers, never another install\'s', async () => {
+    const { service, sb } = makeService();
+    sb!.containers.push(foreign(), legacy(), mine());
+
+    const views = await service.list();
+    expect(views.map((v) => v.name).sort()).toEqual(['ghost', 'old']);
+    expect(views.every((v) => v.orphan)).toBe(true);
+  });
+
+  it('never adopts another install\'s container', async () => {
+    const { service, cfg, sb } = makeService();
+    sb!.containers.push(foreign());
+
+    const report = await service.reconcile({ adopt: true });
+    expect(report).toMatchObject({ orphans: [], adopted: [], missing: [] });
+    expect([...cfg.sessions.keys()]).toEqual([]);
+  });
+
+  it('does not resolve a foreign container by name (no terminal into it, no remove)', async () => {
+    const { service, sb } = makeService();
+    sb!.containers.push(foreign());
+
+    await expect(service.requireRunningContainer('a1')).rejects.toMatchObject({ code: 'not_found' });
+    await expect(service.remove('a1')).rejects.toMatchObject({ code: 'not_found' });
+    expect(sb!.calls).not.toContain('removeContainer');
+  });
+
+  it('still refuses to create a session whose NAME a foreign container occupies', async () => {
+    const { service, sb } = makeService();
+    sb!.images.set('porterclaude/node:latest', imageInspect());
+    sb!.containers.push(
+      containerSummary({
+        id: 'c-clash',
+        name: 'pc-web',
+        names: ['pc-web'],
+        labels: {
+          'porterclaude.managed': 'true',
+          'porterclaude.session': 'web',
+          [CONTAINER_LABELS.instance]: 'pc-someone-else',
+        },
+      }),
+    );
+
+    await expect(service.create(sessionInput({ name: 'web' }))).rejects.toMatchObject({
+      code: 'conflict',
+    });
+    expect(sb!.calls).not.toContain('createContainer');
   });
 });

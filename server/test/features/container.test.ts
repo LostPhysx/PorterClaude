@@ -14,7 +14,7 @@ import {
   workspaceMountFor,
 } from '../../src/sessions/container.js';
 import { CONTAINER_LABELS } from '../../src/sessions/model.js';
-import { generalConfig, sessionConfig, TEST_HOST_ID } from './helpers.js';
+import { generalConfig, sessionConfig, TEST_HOST_ID, TEST_INSTANCE_ID } from './helpers.js';
 import { BUILTIN_AGENTS } from '../../src/agents/builtin.js';
 import type { AgentDefinition } from '../../src/agents/model.js';
 
@@ -39,6 +39,7 @@ function recipeSpec(overrides = {}, defs: AgentDefinition[] = agents, imageCmd?:
     agents: defs,
     resolvedImage: 'porterclaude/node:latest',
     imageType: 'recipe',
+    instanceId: TEST_INSTANCE_ID,
     ...(imageCmd === undefined ? {} : { imageCmd }),
   });
 }
@@ -51,6 +52,7 @@ function customSpec(overrides = {}, defs: AgentDefinition[] = agents) {
     agents: defs,
     resolvedImage: 'nginx:1.27',
     imageType: 'custom',
+    instanceId: TEST_INSTANCE_ID,
   });
 }
 
@@ -241,6 +243,7 @@ describe('buildContainerSpec', () => {
       agents,
       resolvedImage: 'porterclaude/node:latest',
       imageType: 'recipe',
+      instanceId: TEST_INSTANCE_ID,
     });
     expect(spec.mounts).toContainEqual({
       type: 'volume',
@@ -343,6 +346,7 @@ describe('specHash', () => {
         agents,
         resolvedImage: 'porterclaude/node:other',
         imageType: 'recipe',
+        instanceId: TEST_INSTANCE_ID,
       }),
       recipeSpec({ shareHistory: false }),
       recipeSpec({ env: { FOO: 'bar' } }),
@@ -383,6 +387,7 @@ describe('container PATH (BE-6)', () => {
       agents,
       resolvedImage: 'alpine:3.20',
       imageType: 'custom',
+      instanceId: TEST_INSTANCE_ID,
       imageEnvPath: '/usr/sbin:/usr/bin:/sbin:/bin',
     });
     expect(spec.env?.PATH).toBe(
@@ -403,6 +408,7 @@ describe('container PATH (BE-6)', () => {
       agents,
       resolvedImage: 'porterclaude/node:latest',
       imageType: 'recipe',
+      instanceId: TEST_INSTANCE_ID,
       imageEnvPath: '/usr/local/bin:/usr/bin',
     });
     expect(spec.env?.PATH).toBe('/opt/porterclaude/bin:/home/dev/.local/bin:/usr/local/bin:/usr/bin');
@@ -427,6 +433,7 @@ describe('container PATH (BE-6)', () => {
         agents,
         resolvedImage: 'alpine:3.20',
         imageType: 'custom',
+        instanceId: TEST_INSTANCE_ID,
         ...(imageEnvPath === undefined ? {} : { imageEnvPath }),
       });
     const created = build('/usr/local/go/bin:/usr/bin');

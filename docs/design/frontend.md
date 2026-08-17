@@ -661,7 +661,12 @@ unchanged.
   Never logged, never in `localStorage`.
 * Import endpoints: checkbox list → `POST …/import` → the summary
   ("n created, n updated, n skipped" + one line per skipped endpoint with its reason) stays in
-  the modal while the host table refreshes behind it.
+  the modal while the host table refreshes behind it. A re-import **keeps a host name the
+  operator edited** (the server only re-templates a host that still carries the endpoint's own
+  name), so "updated" may leave the row's name untouched.
+* The agent checkboxes of a NEW host start at the built-in default set (the first built-in of
+  the registry, `claude`), **not** at the default host's set: every extra agent costs sync
+  time and disk on that host (AGENTS.md section 2).
 
 ### Agents (F1)
 

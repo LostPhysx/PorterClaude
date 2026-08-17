@@ -80,8 +80,23 @@ export const AgentsConfigSchema = z.object({
   custom: z.array(AgentDefinitionSchema).default([]),
 });
 
+/** `pc-<12 hex>` — generated once per install, see AppConfigSchema.instanceId. */
+export const INSTANCE_ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
+
 export const AppConfigSchema = z.object({
   version: z.number().int().default(CONFIG_VERSION),
+  /**
+   * Stable identity of THIS PorterClaude install (v0.2). Generated once on first boot and
+   * never changed; every container and volume this install creates carries it as
+   * `porterclaude.instance=<id>`, and session discovery ignores containers that carry a
+   * DIFFERENT one (backend.md §13). That is what keeps two installs on one shared engine
+   * from listing — and adopting, recreating or destroying — each other's containers.
+   * `null` only until ConfigStore.init() fills it in; no migration needed, a config written
+   * by v0.1/v0.2.0 simply gets one on the next boot.
+   */
+  // `.catch(null)`: a hand-edited id that breaks the pattern must regenerate on the next
+  // boot, never quarantine config.json (hosts, credentials and sessions with it).
+  instanceId: z.string().regex(INSTANCE_ID_RE).nullable().catch(null).default(null),
   auth: AuthConfigSchema.default({}),
   /** every managed docker engine; empty on a fresh install */
   hosts: z.array(HostConfigSchema).default([]),

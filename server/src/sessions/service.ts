@@ -19,6 +19,10 @@
 //      (<containerHome>/.porterclaude/agents/<id>) and re-create the agent symlinks.
 //   5. `reconcile()` reads porterclaude.host / porterclaude.agents back from the labels when
 //      it adopts an orphan, and skips hosts it cannot reach.
+//   5a. INSTANCE SCOPING: every container/volume created here carries
+//      `porterclaude.instance=<config.instanceId>`, and `listManagedContainers` hides the
+//      containers of ANOTHER PorterClaude install on the same engine (`ownedByThisInstance`)
+//      — see that method for the whole rule.
 //   6. The TOOLS VOLUME of the host is a hard precondition (INT2-2): every v0.2 container
 //      runs `<toolsMount>/entrypoint.sh` as its entrypoint, so a host whose tools volume was
 //      never synced can only produce crash-looping containers. `ToolsReadinessProbe` (the
@@ -470,7 +474,8 @@ export class SessionService {
       throw AppError.conflict(`session '${input.name}' already exists`);
     }
     const existing = this.matchContainer(
-      await this.listManagedContainers(scope.backend),
+      // a container of ANOTHER install occupies the name just as much as one of ours
+      await this.listManagedContainers(scope.backend, { anyInstance: true }),
       input.name,
       scope.general,
     );
@@ -787,7 +792,11 @@ export class SessionService {
     for (const agent of agents) {
       await scope.backend.createVolume({
         name: agentAuthVolumeFor(scope.general.volumePrefix, agent.id),
-        labels: { [CONTAINER_LABELS.managed]: 'true', [VOLUME_AGENT_LABEL]: agent.id },
+        labels: {
+          [CONTAINER_LABELS.managed]: 'true',
+          [CONTAINER_LABELS.instance]: this.deps.config.instanceId(),
+          [VOLUME_AGENT_LABEL]: agent.id,
+        },
       });
     }
   }
@@ -947,8 +956,43 @@ export class SessionService {
     return cfg;
   }
 
-  private async listManagedContainers(backend: DockerBackend): Promise<ContainerSummary[]> {
-    return backend.listContainers({ all: true, labelFilters: { [CONTAINER_LABELS.managed]: 'true' } });
+  /**
+   * The `porterclaude.managed=true` containers of an engine THIS INSTALL may touch.
+   *
+   * `opts.anyInstance` is for the one caller that must see everything: the create-time name
+   * check, where a foreign container occupying the name is still a conflict (docker would
+   * refuse the create with a much worse message).
+   */
+  private async listManagedContainers(
+    backend: DockerBackend,
+    opts?: { anyInstance?: boolean },
+  ): Promise<ContainerSummary[]> {
+    const all = await backend.listContainers({
+      all: true,
+      labelFilters: { [CONTAINER_LABELS.managed]: 'true' },
+    });
+    return opts?.anyInstance ? all : this.ownedByThisInstance(all);
+  }
+
+  /**
+   * QA R1-INT2-5 / R2-INT2-6: several PorterClaude INSTALLS may share one engine (that is
+   * what the `containerPrefix`/`volumePrefix` overrides are for). Every container this
+   * install creates carries `porterclaude.instance=<config.instanceId>`, so a container
+   * labelled for ANOTHER install is dropped here: without it each install listed the other's
+   * containers as adoptable orphans — with its own hostName, its own rewritten resolvedImage
+   * and a terminal that opened into the foreign container — and could recreate or destroy
+   * them from its UI.
+   *
+   * A container with NO instance label stays visible: that is a v0.1 / v0.2.0 container of
+   * THIS install (nothing else ever wrote the label), and dropping it would strand every
+   * session created before the upgrade.
+   */
+  private ownedByThisInstance(containers: ContainerSummary[]): ContainerSummary[] {
+    const mine = this.deps.config.instanceId();
+    return containers.filter((c) => {
+      const label = c.labels[CONTAINER_LABELS.instance];
+      return !label || label === mine;
+    });
   }
 
   private matchContainer(
@@ -1032,7 +1076,11 @@ export class SessionService {
       for (const name of wanted) {
         await backend.createVolume({
           name,
-          labels: { [CONTAINER_LABELS.managed]: 'true', [CONTAINER_LABELS.session]: cfg.name },
+          labels: {
+            [CONTAINER_LABELS.managed]: 'true',
+            [CONTAINER_LABELS.instance]: this.deps.config.instanceId(),
+            [CONTAINER_LABELS.session]: cfg.name,
+          },
         });
         if (before && !before.has(name)) fresh.push(name);
       }
@@ -1047,6 +1095,7 @@ export class SessionService {
         agents,
         resolvedImage,
         imageType: cfg.image.type,
+        instanceId: this.deps.config.instanceId(),
         imageEnvPath,
         imageCmd,
       });
@@ -1671,6 +1720,7 @@ export class SessionService {
           agents,
           resolvedImage,
           imageType: cfg.image.type,
+          instanceId: this.deps.config.instanceId(),
           // recover the image PATH the container was created with, otherwise the recomputed
           // hash of a session would never match (container.ts composeToolsPath)
           imageEnvPath: imagePathFromEnv(inspect?.env, general),

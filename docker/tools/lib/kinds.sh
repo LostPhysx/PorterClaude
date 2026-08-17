@@ -357,8 +357,15 @@ GUARD
 # verify it is executable, unpack when install.archive is tar.gz/zip and take install.path
 # from inside. run.sh dispatches on the session's arch + libc.
 pc_install_binary() {
-  local archive inner_path arch suffix url tmp got flavour dest
+  local archive inner_path arch suffix url tmp got flavour dest why
   arch="$ARCH"
+  # WHY `why`: the manifest entry of a failed agent is what the Agents/Images cards show, and
+  # "no download URL for this host … in install.urls" blames the DEFINITION. It was also
+  # printed when every URL was there and the DOWNLOAD failed (or the archive was unusable),
+  # which sent operators looking for a missing url they had actually configured (QA
+  # R2-INT2-5a). The last concrete failure wins; the "no URL" message is only used when the
+  # definition really carries none for this architecture.
+  why=""
   if [ -z "$arch" ]; then
     echo "unsupported machine '$(uname -m)'" >&2
     return 1
@@ -377,7 +384,8 @@ pc_install_binary() {
     dest="$AGENT_DIR/bin/$AGENT_COMMAND-$flavour"
     pc_log "downloading $AGENT_ID ($flavour)"
     if ! pc_fetch "$url" "$tmp/download"; then
-      pc_warn "$AGENT_ID: download failed for $flavour"
+      why="download failed for $flavour (${PC_FETCH_STATUS:-unknown error}): $url"
+      pc_warn "$AGENT_ID: $why"
       rm -rf "$tmp"
       continue
     fi
@@ -388,7 +396,8 @@ pc_install_binary() {
       tar.gz|zip)
         mv -f "$tmp/download" "$tmp/archive.$archive"
         if ! pc_extract "$tmp/archive.$archive" "$tmp/x" 0; then
-          pc_warn "$AGENT_ID: cannot unpack the $flavour archive"
+          why="cannot unpack the $flavour archive (install.archive '$archive')"
+          pc_warn "$AGENT_ID: $why"
           rm -rf "$tmp"
           continue
         fi
@@ -397,7 +406,8 @@ pc_install_binary() {
         else
           inner="$(find "$tmp/x" -type f -name "$AGENT_COMMAND" -perm -u+x 2>/dev/null | head -n1)"
           if [ -z "$inner" ]; then
-            pc_warn "$AGENT_ID: the $flavour archive carries no '$AGENT_COMMAND'"
+            why="the $flavour archive carries no executable '$AGENT_COMMAND' (set install.path)"
+            pc_warn "$AGENT_ID: $why"
             rm -rf "$tmp"
             continue
           fi
@@ -405,7 +415,8 @@ pc_install_binary() {
         fi
         ;;
       *)
-        pc_warn "$AGENT_ID: unknown install.archive '$archive'"
+        why="unknown install.archive '$archive' (expected none, tar.gz or zip)"
+        pc_warn "$AGENT_ID: $why"
         rm -rf "$tmp"
         continue
         ;;
@@ -416,7 +427,13 @@ pc_install_binary() {
   done
 
   if [ -z "$got" ]; then
-    echo "no download URL for this host ($(pc_target 2>/dev/null || printf 'linux-%s' "$arch")) in install.urls" >&2
+    # the definition IS the problem only when it names no url for this architecture; every
+    # other failure keeps its own reason (see `why` above)
+    if [ -n "$why" ]; then
+      echo "$why" >&2
+    else
+      echo "no download URL for this host ($(pc_target 2>/dev/null || printf 'linux-%s' "$arch")) in install.urls" >&2
+    fi
     return 1
   fi
   pc_log "'$AGENT_ID' installed:$got"

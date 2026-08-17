@@ -579,8 +579,9 @@ export class HostManager {
    * One host per Portainer endpoint of a stored credential:
    *   * skip endpoints that are not docker (`type` 1 or 2) with a reason,
    *   * host id = `uniqueHostId(slugifyHostId(endpoint.name), existing ids)`,
-   *   * an existing host with the same `credentialId` + `endpointId` is updated (name) when
-   *     `update !== false`, never duplicated,
+   *   * an existing host with the same `credentialId` + `endpointId` is updated when
+   *     `update !== false`, never duplicated - but a name the operator edited is KEPT: the
+   *     name is only re-templated while the host still carries the endpoint's own name,
    *   * the first import on an empty install also sets the default host.
    */
   async importPortainerEndpoints(
@@ -619,7 +620,14 @@ export class HostManager {
           skipped.push({ endpointId: endpoint.id, name: endpoint.name, reason: 'already imported' });
           continue;
         }
-        await this.deps.config.putHost({ ...existing, name, updatedAt: now });
+        // Never clobber an operator-chosen name: re-templating is only for hosts that still
+        // carry the endpoint's own name (R1-INT2-7a).
+        const untouched = existing.name === (endpoint.name || `endpoint-${endpoint.id}`);
+        await this.deps.config.putHost({
+          ...existing,
+          name: untouched ? name : existing.name,
+          updatedAt: now,
+        });
         updated.push(existing.id);
         continue;
       }

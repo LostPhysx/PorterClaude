@@ -45,6 +45,7 @@ services:
     ports: ["8080:8080"]
     environment:
       APP_PASSWORD: change-me
+      PORTERCLAUDE_BACKEND: socket                   # seeds the first host = this docker socket
     volumes:
       - porterclaude-data:/data                      # must persist (secrets + config)
       - /var/run/docker.sock:/var/run/docker.sock    # only for a local-socket host
@@ -54,8 +55,11 @@ volumes:
 ```
 
 1. Open `http://localhost:8080` and log in with `APP_PASSWORD`.
-2. **Settings → Hosts**: accept the auto-detected Docker socket, or add a Portainer
-   credential (URL + API key) and import its endpoints.
+2. **Settings → Hosts**: `PORTERCLAUDE_BACKEND: socket` has already created the host
+   *Local docker* for the mounted socket — check that it is reachable. Drop that variable and
+   the app starts with no host at all; you then add one here: the local Docker socket, or a
+   Portainer credential (URL + API key) whose endpoints you import. The seed only applies
+   while `/data` holds no host — after that the app is the source of truth.
 3. **Settings → Agents**: pick the agents this host should have, then **Sync tools** — that
    is what installs them (minutes on the first run, outbound HTTPS from the Docker host).
 4. Create a session, open a terminal, run your agent and log in once — every other session on

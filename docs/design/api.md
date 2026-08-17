@@ -173,6 +173,11 @@ Debug aid: `{ "routes": [ { "route": "/vendor/bootstrap", "dir": "…", "mounted
 `managed=1` filters on the label `porterclaude.managed=true`. All four return
 `409 backend_not_configured` when no backend is set up.
 
+These four are the **raw engine view** and are deliberately NOT scoped to this install:
+on a shared engine they also show the containers/volumes of another PorterClaude (look at
+`porterclaude.instance` to tell them apart). `GET /api/sessions` is the scoped one — nothing
+outside this install ever appears there.
+
 ---
 
 ## Sessions
@@ -328,8 +333,12 @@ streamed — `since`/`nextIndex` give an append-only cursor.
 `contextHash` is the hash of the current `docker/tools` context; `outdated` = the image's
 stored `porterclaude.context-hash` differs from it (or the volume is populated from an image
 that no longer exists) — the same rule as `RecipeStatus.outdated`. `claudeVersion` /
-`claudeChannel` / `lastSyncedAt` follow the `RecipeStatus` rules above (`lastSyncedAt`
-falls back to the image's Created timestamp until this process has run a sync).
+`claudeChannel` follow the `RecipeStatus` rules above. `lastSyncedAt` is the `syncedAt` of
+`<toolsMount>/AGENTS.json` (v0.2) — the only timestamp that survives a restart of the app and
+the only one that is a SYNC; it falls back to the sync this process ran, and to the tools
+image's Created timestamp only while the volume carries no manifest at all. (Before v0.2 the
+image date won after a restart, which made the panel report a sync hours before the agents it
+had installed.)
 
 `POST /api/images/tools/sync` body `{ "force"?: boolean }` → `202 { "job": JobSummary }`.
 The sync **rebuilds `<ns>/tools:latest` whenever it is missing or outdated** and only then
@@ -783,6 +792,19 @@ Ids are part of the API (volume names, `shell=agent:<id>`) and never change.
   contain a `..` segment (`422 validation_error`): the bootstrap turns them into symlinks
   inside the session container, so a traversal would point the link — and everything the
   agent writes through it — outside that agent's auth volume.
+* The rest of the input hygiene, all `422 validation_error` with the field in
+  `error.details[].path` (v0.2):
+
+  | field | rule | why |
+  |---|---|---|
+  | `command`, npm/pip `install.bin` | `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$` | it is an executable NAME, not a command line: the tools volume links `<toolsMount>/bin/<command>` and a terminal execs it. `"evil; rm -rf /"` used to be accepted here and refused hours later in a sync job log |
+  | `sharedPaths[].path`, `historyPath` | no whitespace, no shell metacharacters (allowed: letters, digits `. _ - ~ / @ +`) | the links travel to the container as `target\|source\|kind;…` (`PORTERCLAUDE_AGENT_LINKS`), so a `;` or `\|` splits one link into two malformed ones and the entrypoint silently drops them |
+  | `env` keys | `^[A-Za-z_][A-Za-z0-9_]*$` | anything else is unusable by any shell in the container |
+  | `historyPath` | must sit inside one of the `sharedPaths` entries with `kind:"dir"` | it is mounted at the matching path INSIDE the auth volume; outside them there is nothing to mount, so `shareHistory:false` would silently share the history anyway |
+
+  These rules apply to the API only. A definition **already stored** in `config.json` keeps
+  loading even when it breaks them — tightening the stored shape would drop the agent from
+  every host that enables it — so an old definition is corrected on the next `PUT`.
 * `DELETE` is `409` while a host enables the agent or a session pins it; `force=1` also
   strips the id from those hosts/sessions (their containers keep the mount until recreated).
 
@@ -796,7 +818,9 @@ PUT /api/hosts/:hostId/agents  { "enabled": ["claude","opencode"] } -> same shap
 `HostAgentView` = `AgentView` + `{ enabled, installed, version, installedAt, error,
 authVolume }`. `installed`/`version` come from `<toolsMount>/AGENTS.json` inside that host's
 tools volume (written by the last tools sync); an unreachable host answers `installed:false`
-plus an `error` string instead of a 502.
+plus an `error` string instead of a 502 — the same transport error `GET
+/api/hosts/:hostId/images/tools` reports, so the two panels never disagree about why a host
+is empty.
 
 Enabling an agent does **not** install it: run `POST /api/hosts/:hostId/images/tools/sync`
 afterwards (the UI offers it right there), and recreate the sessions that should mount it.
@@ -927,6 +951,7 @@ as 4401), it shows the reason and offers "open a bash terminal" / "check the hos
 labels   porterclaude.managed=true
          porterclaude.session=<slug>
          porterclaude.host=<hostId>            (v0.2)
+         porterclaude.instance=<instanceId>    (v0.2 — the INSTALL that created it)
          porterclaude.agents=<id,id,…>          (v0.2)
          porterclaude.image-type=recipe|custom
          porterclaude.recipe=<name>            (recipes only)
@@ -941,6 +966,15 @@ env      PORTERCLAUDE_SESSION, PORTERCLAUDE_HOST, PORTERCLAUDE_TOOLS, PORTERCLAU
 entrypoint ["<toolsMount>/entrypoint.sh"]      (recipes keep their image CMD)
 ```
 
+**`porterclaude.instance`** is the identity of this PorterClaude install: a `pc-<12 hex>` id
+generated once on first boot and stored in `config.json` (`instanceId`). Every container AND
+volume an install creates carries it, and `GET /api/sessions`, `POST /api/sessions/reconcile`
+and every lookup by name only ever see containers that carry **this** install's id **or no id
+at all** (a v0.1 / v0.2.0 container — nothing else ever wrote the label). Two installs sharing
+one engine therefore no longer list each other's containers as adoptable orphans, and neither
+can open a terminal into, recreate or destroy the other's sessions. Creating a session whose
+container NAME is already taken is still a `409 conflict`, whoever owns that container.
+
 The agent's own paths are **symlinks** into its auth volume, created by the bootstrap:
 `~/.claude -> <agentDir>/claude`, `~/.claude.json -> <agentDir>/claude.json`. The slug of a
 shared path is the whole path with `~/` and leading dots stripped and `/` replaced by `-`
@@ -950,6 +984,7 @@ shared path is the whole path with `~/` and leading dots stripped and `/` replac
 
 ```json
 { "version": 2,
+  "instanceId": "pc-9f86d081a1b2",
   "auth": { "...": "unchanged" },
   "hosts": [ HostConfig ],
   "defaultHostId": "default",
@@ -964,6 +999,10 @@ Migration v1 → v2 runs on first boot, is lossless, and writes `config.json.v1.
 first v2 write: the single backend becomes the host `default` (+ a `portainer-1` credential
 when it was a Portainer backend, re-using the already-encrypted key), every session gets
 `hostId: "default"` and `agents: null`, and `general` is carried over unchanged.
+
+`instanceId` needs no migration: a config without one (v0.1, v0.2.0) gets a fresh id on the
+next boot, and the containers it created carry no `porterclaude.instance` label — which is
+exactly the "unlabelled = mine" case above, so they stay visible and manageable.
 
 Env seeds keep their v0.1 names (`PORTERCLAUDE_BACKEND`, `PORTAINER_URL`,
 `PORTAINER_API_KEY`, `PORTAINER_ENDPOINT_ID`, `DOCKER_SOCKET`) but now create the first host

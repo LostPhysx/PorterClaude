@@ -1027,3 +1027,82 @@ describe('the one-time legacy claude import', () => {
     expect(service.getJobLines(job.id).lines.join(' ')).toContain('WARNING: importing the v0.1 claude login failed');
   });
 });
+
+// ---------------------------------------------------------------------------
+// QA R1-INT2-6 / R2-INT2-5: the tools diagnostics must name the REAL reason.
+// ---------------------------------------------------------------------------
+describe('tools diagnostics', () => {
+  const manifest = {
+    syncedAt: '2026-08-16T09:00:00.000Z',
+    agents: [{ id: 'claude', command: 'claude', installed: true, version: '2.1.233', error: null }],
+  };
+
+  /** an engine that ANSWERS but has nothing on it (fresh install, nothing ever synced) */
+  function emptyEngine() {
+    return stubBackend({ containerLogs: async () => '' });
+  }
+
+  /**
+   * A portainer host whose endpoint is gone answers 404 for EVERY path, and a docker 404 on
+   * an image is mapped to null ("no such image") - so the agents view saw "nothing here to
+   * read the volume with" where the tools view saw the transport error.
+   */
+  function goneEndpoint() {
+    const err = new Error('GET /_ping: Unable to find an environment with the specified identifier');
+    return stubBackend({
+      ping: async () => {
+        throw err;
+      },
+      inspectImage: async () => null,
+    });
+  }
+
+  it('carries the transport error into the agents view, like the tools view (R1-INT2-6)', async () => {
+    const { service } = makeService(goneEndpoint(), {
+      host: hostConfig({ agents: { enabled: ['claude', 'opencode'] } }),
+    });
+
+    const agents = await service.agentStatuses(TEST_HOST_ID);
+    expect(agents).toHaveLength(2);
+    for (const agent of agents) {
+      expect(agent.installed).toBe(false);
+      expect(agent.error).toContain('Unable to find an environment');
+    }
+    // ...and it is the SAME reason the tools panel shows
+    expect((await service.toolsStatus(TEST_HOST_ID)).error).toContain('Unable to find an environment');
+  });
+
+  it('still reports "nothing to read the volume with" as unknown, not as an error', async () => {
+    const { service } = makeService(emptyEngine(), { host: hostConfig({ agents: { enabled: ['claude'] } }) });
+    expect(await service.agentStatuses(TEST_HOST_ID)).toEqual([
+      { id: 'claude', installed: false, version: null, installedAt: null, error: null },
+    ]);
+  });
+
+  it('takes lastSyncedAt from AGENTS.json, not from the tools image date (R2-INT2-5)', async () => {
+    const sb = stubBackend({ containerLogs: async () => JSON.stringify(manifest) });
+    // an image built long before the last sync: after a restart it was the only date left
+    sb.images.set(
+      'porterclaude/tools:latest',
+      imageInspect({ tags: ['porterclaude/tools:latest'], createdAt: '2026-08-15T00:59:00.000Z' }),
+    );
+    sb.volumes.push({ name: 'porterclaude-tools', driver: 'local', labels: {} });
+    const { service } = makeService(sb, { host: hostConfig({ agents: { enabled: ['claude'] } }) });
+
+    const status = await service.toolsStatus(TEST_HOST_ID);
+    expect(status.lastSyncedAt).toBe(manifest.syncedAt);
+    expect(status.agents[0]?.installedAt).toBe(manifest.syncedAt);
+  });
+
+  it('falls back to the image date only while there is no manifest', async () => {
+    const sb = stubBackend({ containerLogs: async () => 'cat: /out/AGENTS.json: No such file' });
+    sb.images.set(
+      'porterclaude/tools:latest',
+      imageInspect({ tags: ['porterclaude/tools:latest'], createdAt: '2026-08-15T00:59:00.000Z' }),
+    );
+    sb.volumes.push({ name: 'porterclaude-tools', driver: 'local', labels: {} });
+    const { service } = makeService(sb, { host: hostConfig({ agents: { enabled: ['claude'] } }) });
+
+    expect((await service.toolsStatus(TEST_HOST_ID)).lastSyncedAt).toBe('2026-08-15T00:59:00.000Z');
+  });
+});

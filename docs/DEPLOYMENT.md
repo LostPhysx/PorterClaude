@@ -48,8 +48,12 @@ Two caveats worth knowing before you add the second host:
   `status: unreachable`, its sessions show as absent, and every other host keeps working.
 * Two hosts may point at the *same* engine (e.g. the local socket and a Portainer endpoint of
   the same machine). That is allowed, and they then share volumes and images by construction.
-  If you want two genuinely independent installs on one engine, give one host
-  `volumePrefix` / `containerPrefix` overrides (Settings → Hosts → *(host)* → Overrides).
+  Two *separate PorterClaude installs* on one engine do not see each other's sessions: every
+  container carries a `porterclaude.instance=<id>` label (the id is generated once per install
+  and stored in `config.json`), and session listing/reconcile only adopts containers with this
+  install's id or with no id (pre-0.2.1 containers). Volumes are still shared by name, so give
+  one install a different `volumePrefix` / `containerPrefix` (Settings → Hosts → *(host)* →
+  Overrides) if you want fully independent state.
 * Deleting a host **never touches the engine** — containers, volumes and images stay; only
   PorterClaude forgets them. It refuses while sessions still reference the host unless you
   force it.
@@ -133,6 +137,7 @@ services:
       - "8080:8080"
     environment:
       APP_PASSWORD: change-me
+      PORTERCLAUDE_BACKEND: socket                   # seeds the first host = the mounted socket
       TRUST_PROXY: "1"
     volumes:
       - porterclaude-data:/data                      # MUST persist
@@ -142,6 +147,11 @@ services:
 volumes:
   porterclaude-data:
 ```
+
+`PORTERCLAUDE_BACKEND: socket` is what makes the app come up with the host *Local docker*
+already created — without it (and without `PORTAINER_*`) the first start has **no host at
+all** and the Hosts panel asks you to add one by hand. Drop it for a Portainer-only install,
+or when you want to add every host in Settings yourself.
 
 The image ships its own `HEALTHCHECK` (node's built-in `fetch` against `/api/health`).
 **Do not override it with a `wget`/`curl` command** — the runtime image contains neither, so
@@ -160,6 +170,7 @@ services:
     init: true
     environment:
       APP_PASSWORD: change-me
+      PORTERCLAUDE_BACKEND: socket
       VIRTUAL_HOST: claude.example.com
       LETSENCRYPT_HOST: claude.example.com
       VIRTUAL_PORT: 8080
@@ -369,12 +380,21 @@ before that behaviour existed, or ones a stopped container was holding:
 ```bash
 docker image prune -f --filter label=porterclaude.recipe        # recipe images
 docker image prune -f --filter label=porterclaude.context-hash  # recipes + the tools image
+docker image prune -f --filter label=porterclaude.image=app     # app-image builds (deploy.sh)
 ```
 
 (Images built by v0.1 also carry `porterclaude.claude-version`; v0.2 no longer sets that
 label anywhere.) Without shell access to the host, `bash deploy/host-prep.sh --prune` does
 the same through the Portainer API and only ever touches dangling images carrying a
 `porterclaude.*` label. Run it with `--dry-run` first: it prints every image and its size.
+
+**`deploy/deploy.sh` leaves leftovers too.** Every remote build of the app image replaces the
+previous `deps`/`build` stage images and the previously tagged app image, so each deploy
+leaves roughly 0.4 GB + 0.3 GB dangling on the build host — a few deploys are a couple of GB.
+Since v0.2 all three stages of `docker/Dockerfile` carry `porterclaude.image=app`, so the
+commands above (and `host-prep.sh --prune`) collect them. Images built by an **older**
+`docker/Dockerfile` have no label at all: those need a plain `docker image prune -f` on the
+host once, or removal by id in Portainer.
 
 ## Volumes created on a managed host
 
@@ -389,6 +409,12 @@ One set per host — the names are identical on every engine, the contents are n
 | `porterclaude-claude`, `porterclaude-claude-home` | – (v0.1 only) | the v0.1 shared Claude login; **read once** by the v0.2 import, then unused | removable after the upgrade |
 
 The prefix is `general.volumePrefix` (default `porterclaude-`) and can be overridden per host.
+
+**When they appear.** A *tools sync* only builds `porterclaude-tools`. The per-agent auth
+volumes are created with the **first session that mounts them**, so after enabling `opencode`
+and syncing you will see `porterclaude-auth-claude` but no `porterclaude-auth-opencode` until
+a session is created (or recreated) with that agent — an empty volume list right after a sync
+is expected, not a failed sync.
 
 The volume to protect is **`porterclaude-auth-<agentId>`**: it is the only copy of an agent's
 authentication on that host. Losing it means logging in again, on every host it happened to.

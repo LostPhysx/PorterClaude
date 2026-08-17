@@ -11,6 +11,10 @@
 #     ssh <docker-host> stat -c %g /var/run/docker.sock     # -> put that gid in DOCKER_GID
 # A Portainer-only install (PORTERCLAUDE_BACKEND=portainer) needs no socket and no group_add.
 #
+# The two external networks come from PROXY_NETWORK_APP / PROXY_NETWORK_EDGE in deploy/.env
+# (defaults portainer_dmz / portainer_gate). deploy.sh also accepts the legacy single
+# PROXY_NETWORKS=<app>,<edge> and splits it into those two names.
+#
 # PORTERCLAUDE_BACKEND below only SEEDS THE FIRST HOST, and only while /data holds none.
 # Everything after that — more docker hosts (Settings -> Hosts, incl. Portainer credentials
 # and endpoint import), the coding agents installed on each host, images and sessions — is
