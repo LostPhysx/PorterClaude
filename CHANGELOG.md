@@ -3,6 +3,21 @@
 All notable changes to PorterClaude. Versions are git tags (`vX.Y.Z`); each tag is also
 published as `ghcr.io/lostphysx/porterclaude:<version>`.
 
+## v0.2.2 — 2026-08-17
+
+- **Sessions prepare their host instead of refusing.** Creating (or editing, or starting) a
+  session whose recipe image was never built, or whose host has an unsynced tools volume, no
+  longer fails with a 409 that throws the form away. The definition is stored immediately, the
+  image build and/or tools sync run on the host, and the container is created and started when
+  they finish. The API answers `202` with `session.preparing` (`phase`, `detail`, the image
+  `jobs` to follow); the Sessions table shows a *preparing* badge with the current step.
+- A failed preparation keeps the session and puts the reason in its warnings — **Start**
+  retries the whole thing. Concurrent calls join the running preparation rather than starting
+  a second build.
+- An edit/recreate that needs a build no longer tears the old container down first: it keeps
+  running until the host is ready.
+- Recipe picker says *builds on first use* instead of *not built*.
+
 ## v0.2.1 — 2026-08-17
 
 - Custom-agent definitions are validated at the API (command, paths, env keys; `historyPath`

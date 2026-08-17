@@ -12,7 +12,7 @@ per host.
   (five built in, plus your own), images and account; everything is configured in the app,
   nothing hard-coded
 
-Status: **v0.2.1** — multiple hosts and pluggable coding agents. Release notes:
+Status: **v0.2.2** — multiple hosts and pluggable coding agents. Release notes:
 [CHANGELOG.md](CHANGELOG.md). Agent guide: [docs/AGENTS.md](docs/AGENTS.md). See also
 [PLAN.md](PLAN.md), [docs/](docs/) and [docs/design/](docs/design/).
 
@@ -43,8 +43,10 @@ volumes:
    the app starts with no host at all; you then add one here: the local Docker socket, or a
    Portainer credential (URL + API key) whose endpoints you import. The seed only applies
    while `/data` holds no host — after that the app is the source of truth.
-3. **Settings → Agents**: pick the agents this host should have, then **Sync tools** — that
-   is what installs them (minutes on the first run, outbound HTTPS from the Docker host).
+3. **Settings → Agents**: pick the agents this host should have. **Sync tools** installs them
+   (minutes on the first run, outbound HTTPS from the Docker host) — or just create a session
+   and let it run: an unsynced host and an unbuilt recipe image are prepared automatically,
+   with the progress on the session row.
 4. Create a session, open a terminal, run your agent and log in once — every other session on
    that host is now authenticated too.
 

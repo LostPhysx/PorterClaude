@@ -147,8 +147,24 @@ export type SessionConfig = z.infer<typeof SessionConfigSchema>;
 export type SessionWorkspace = z.infer<typeof WorkspaceSchema>;
 export type SessionImageRef = z.infer<typeof ImageRefSchema>;
 
+/**
+ * v0.2.2: a session whose host was not ready yet (recipe image not built, tools volume
+ * never synced) is no longer refused — the server does the work and reports it here while
+ * the request is long over. `null` on every session that is simply ready.
+ */
+export interface SessionPreparation {
+  phase: 'building-image' | 'syncing-tools' | 'creating' | 'starting';
+  /** human-readable version of `phase`, including what is being built/synced */
+  detail: string;
+  /** the image jobs this preparation is waiting on (GET /api/hosts/:id/images/jobs/:jobId) */
+  jobs: { id: string; kind: string; target: string }[];
+  startedAt: string;
+}
+
 /** Runtime status merged over the stored config; this is what GET /api/sessions returns. */
 export interface SessionView extends SessionConfig {
+  /** non-null while the server is preparing the host for this session (v0.2.2) */
+  preparing: SessionPreparation | null;
   /** name of `hostId`, or the id itself when the host is gone (dangling session) */
   hostName: string;
   /** the host this session points at no longer exists */

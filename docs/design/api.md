@@ -252,12 +252,31 @@ Notes
 * `DELETE` removes the container and the stored definition; `removeVolumes=1` also deletes
   `porterclaude-ws-<name>` and `porterclaude-hist-<name>` (never the shared volumes).
 * `409 conflict` when creating a name that already exists (config or container).
-* `409 conflict` with `details.reason: "tools_not_synced"` when the target host's tools
-  volume carries no `<toolsMount>/entrypoint.sh`: every container runs that bootstrap as its
-  entrypoint, so the session could only crash-loop. The message names the fix (run the tools
-  sync for that host). The check never blocks on a maybe — an unreachable host or a volume
-  that cannot be read lets the create through as before. `POST …/start` and `…/restart` of an
-  EXISTING container do not refuse; they report the same sentence in `warnings`.
+* **Preparation (v0.2.2).** A host that is not ready for the session is no longer refused;
+  the server does the missing work. `POST /api/sessions`, `PUT /api/sessions/:name` and
+  `POST /api/sessions/:name/start` answer **`202 Accepted`** (instead of 201/200) when they
+  started one, with `session.preparing` set:
+
+  ```json
+  { "preparing": { "phase": "building-image", "detail": "building the 'node' image",
+                   "jobs": [{ "id": "a1b2c3d4", "kind": "build", "target": "node" }],
+                   "startedAt": "2026-08-17T17:00:00.000Z" } }
+  ```
+
+  `phase` is one of `building-image` | `syncing-tools` | `creating` | `starting`; the jobs are
+  ordinary image jobs, so `GET /api/hosts/:hostId/images/jobs/:id?since=` streams their log.
+  The definition is **persisted before** the preparation starts — nothing the user typed is
+  lost — and the container is created and started when it finishes. `preparing` is `null` on
+  every other session, and the whole path is skipped (fully synchronous 201/200) when the
+  host is already ready. A preparation that fails leaves the stored session in place with the
+  reason in `warnings`; `POST …/start` retries the whole thing. Two calls for the same session
+  join the first preparation instead of starting a second build.
+* `409 conflict` with `details.reason: "tools_not_synced"` is what remains of the v0.2.1
+  behaviour: it is only reachable when the server cannot prepare (a deployment whose image
+  service is absent) or when a sync ran and the volume still carries no
+  `<toolsMount>/entrypoint.sh` — every container runs that bootstrap as its entrypoint, so
+  the session could only crash-loop. The check never blocks on a maybe: an unreachable host or
+  a volume that cannot be read lets the create through as before.
 * Route order: `/reconcile` is registered before `/:name`.
 * `POST /reconcile` **adopts**: every container labelled `porterclaude.managed=true` that
   has no stored definition is written back into `config.json` (reconstructed from its

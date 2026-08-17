@@ -21,6 +21,7 @@ const view = (name: string): SessionView => ({
   hostId: 'default',
   hostName: 'Local docker',
   hostMissing: false,
+  preparing: null,
   agents: null,
   resolvedAgents: ['claude'],
   image: { type: 'recipe', recipe: 'node' },

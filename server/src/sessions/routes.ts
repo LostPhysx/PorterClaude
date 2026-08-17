@@ -64,7 +64,10 @@ export function createSessionsRouter(ctx: AppContext): Router {
     asyncHandler(async (req, res) => {
       const input = parseBody(SessionInputSchema, req);
       const session = await ctx.sessions.create(input);
-      res.status(201).json({ session });
+      // 202 = the definition is stored and the host is being prepared for it (a recipe
+      // image is building, the tools volume is syncing); the container appears when that
+      // finishes. `session.preparing` says what is running. 201 = it is already there.
+      res.status(session.preparing ? 202 : 201).json({ session });
     }),
   );
 
@@ -93,7 +96,8 @@ export function createSessionsRouter(ctx: AppContext): Router {
     asyncHandler(async (req, res) => {
       const { name } = parseParams(NameParams, req);
       const input = parseBody(SessionInputSchema, req);
-      res.json({ session: await ctx.sessions.update(name, input) });
+      const session = await ctx.sessions.update(name, input);
+      res.status(session.preparing ? 202 : 200).json({ session });
     }),
   );
 
@@ -111,7 +115,8 @@ export function createSessionsRouter(ctx: AppContext): Router {
     '/:name/start',
     asyncHandler(async (req, res) => {
       const { name } = parseParams(NameParams, req);
-      res.json({ session: await ctx.sessions.start(name) });
+      const session = await ctx.sessions.start(name);
+      res.status(session.preparing ? 202 : 200).json({ session });
     }),
   );
 

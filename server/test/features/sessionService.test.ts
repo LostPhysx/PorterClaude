@@ -1,7 +1,7 @@
 // OWNER: B2. SessionService against stubbed DockerBackends (no docker host). v0.2: the
 // service is host- and agent-aware, so the expectations below describe the per-agent auth
 // volumes, the porterclaude.host/agents labels and the multi-host list.
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { AppError, DockerApiError } from '../../src/http/errors.js';
 import { CONTAINER_LABELS, SessionConfigSchema, SessionInputSchema } from '../../src/sessions/model.js';
 import type { ContainerInspect } from '../../src/backends/types.js';
@@ -1351,7 +1351,7 @@ describe('SessionService.resolveAgents', () => {
 // INT2-2: a host whose tools volume was never synced can only produce
 // crash-looping containers (tini: exec <toolsMount>/entrypoint.sh failed)
 // ---------------------------------------------------------------------------
-describe('SessionService tools-volume gate (INT2-2)', () => {
+describe('SessionService tools-volume gate (INT2-2) - fallback without a preparer', () => {
   function toolsService(
     answer: 'ready' | 'unsynced' | 'unknown',
     opts: { sessions?: ReturnType<typeof sessionConfig>[] } = {},
@@ -1373,6 +1373,9 @@ describe('SessionService tools-volume gate (INT2-2)', () => {
   }
 
   it('refuses to create a session on a host whose tools volume was never synced', async () => {
+    // v0.2.2: this is the FALLBACK path - a probe that can only answer readiness (no
+    // ensureToolsSynced) cannot fix anything, so refusing is still the honest answer. The
+    // real ImageService implements the preparer half; see the block below.
     const { service, sb, cfg, probes } = toolsService('unsynced');
 
     await expect(service.create(sessionInput({ name: 'web' }))).rejects.toMatchObject({
@@ -1418,6 +1421,159 @@ describe('SessionService tools-volume gate (INT2-2)', () => {
     const { service, sb } = toolsService('ready', { sessions: [sessionConfig({ name: 'web' })] });
     sb.containers.push(containerSummary({ state: 'exited' }));
     expect((await service.start('web')).warnings).toEqual([]);
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// v0.2.2: "just do it" - a host that is not ready is PREPARED, not refused. The user
+// typed a form; losing it to send them to another screen is the bug being fixed here.
+// ---------------------------------------------------------------------------
+describe('SessionService preparation (v0.2.2)', () => {
+  type Job = { id: string; kind: string; target: string; status: string; error: string | null };
+
+  /**
+   * The jobs are GATED: `awaitJob` blocks until the test calls `release()`. Without that the
+   * whole preparation runs to completion inside the first `await` of create(), and the
+   * intermediate phases (which are exactly what the UI renders) could never be observed.
+   */
+  function preparerService(
+    opts: {
+      tools?: 'ready' | 'unsynced' | 'unknown';
+      imageBuilt?: boolean;
+      buildFails?: boolean;
+      sessions?: ReturnType<typeof sessionConfig>[];
+    } = {},
+  ) {
+    const cfg = stubConfigStore(opts.sessions ?? []);
+    const sb = stubBackend();
+    let toolsAnswer = opts.tools ?? 'unsynced';
+    if (opts.imageBuilt !== false) sb.images.set('porterclaude/node:latest', imageInspect());
+
+    let release = (): void => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    const started: string[] = [];
+    const jobs = new Map<string, Job>();
+    let seq = 0;
+    const record = (kind: string, target: string, ok: boolean): Job => {
+      seq += 1;
+      const job: Job = { id: `job${seq}`, kind, target, status: ok ? 'success' : 'error', error: ok ? null : 'boom' };
+      jobs.set(job.id, job);
+      return job;
+    };
+
+    const service = new SessionService(
+      serviceDeps({ config: cfg.store, hosts: stubHostManager(sb.backend) }),
+      {
+        toolsReadiness: async () => toolsAnswer,
+        ensureRecipeImage: async (_hostId: string, recipe: string) => {
+          started.push(`build:${recipe}`);
+          if (sb.images.has('porterclaude/node:latest')) return null;
+          if (!opts.buildFails) sb.images.set('porterclaude/node:latest', imageInspect());
+          return record('build', recipe, !opts.buildFails);
+        },
+        ensureToolsSynced: async (_hostId: string, probeImage?: string) => {
+          started.push(`sync:${probeImage ?? '-'}`);
+          if (toolsAnswer !== 'unsynced') return null;
+          toolsAnswer = 'ready';
+          return record('tools-sync', 'porterclaude-tools', true);
+        },
+        awaitJob: async (id: string) => {
+          await gate;
+          return jobs.get(id) ?? null;
+        },
+      },
+    );
+    return { service, sb, cfg, started, release: () => release() };
+  }
+
+  it('stores the definition and syncs the tools volume instead of refusing the create', async () => {
+    const { service, sb, cfg, started, release } = preparerService({ tools: 'unsynced' });
+
+    const view = await service.create(sessionInput({ name: 'web' }));
+
+    // the answer comes back immediately, and NOTHING the user typed is lost
+    expect(view.preparing).toMatchObject({ phase: 'syncing-tools' });
+    expect(view.preparing?.detail).toMatch(/tools volume/);
+    expect(view.preparing?.jobs).toEqual([
+      { id: 'job1', kind: 'tools-sync', target: 'porterclaude-tools' },
+    ]);
+    expect(cfg.sessions.has('web')).toBe(true);
+    expect(sb.calls).not.toContain('createContainer');
+
+    release();
+    await vi.waitFor(() => expect(sb.calls).toContain('createContainer'));
+    await vi.waitFor(async () => expect((await service.get('web')).preparing).toBeNull());
+    expect(started).toEqual(['sync:porterclaude/node:latest']);
+    expect((await service.get('web')).warnings).toEqual([]);
+  });
+
+  it('builds a recipe image that does not exist yet, then syncs, then creates', async () => {
+    const { service, sb, started, release } = preparerService({ imageBuilt: false, tools: 'unsynced' });
+
+    const view = await service.create(sessionInput({ name: 'web' }));
+    expect(view.preparing).toMatchObject({ phase: 'building-image' });
+    expect(view.preparing?.detail).toMatch(/building the 'node' image/);
+
+    release();
+    await vi.waitFor(() => expect(sb.calls).toContain('createContainer'));
+    expect(started).toEqual(['build:node', 'sync:porterclaude/node:latest']);
+  });
+
+  it('keeps the session (with a warning) when the preparation fails, so Start can retry', async () => {
+    const { service, sb, cfg, release } = preparerService({ imageBuilt: false, buildFails: true });
+
+    await service.create(sessionInput({ name: 'web' }));
+    release();
+    await vi.waitFor(async () => expect((await service.get('web')).warnings.length).toBe(1));
+
+    const view = await service.get('web');
+    expect(view.preparing).toBeNull();
+    expect(view.status).toBe('absent');
+    expect(view.warnings[0]).toMatch(/building the 'node' image failed: boom/);
+    // the definition is still there - that is the whole point
+    expect(cfg.sessions.has('web')).toBe(true);
+    expect(sb.calls).not.toContain('createContainer');
+  });
+
+  it('does not prepare at all when the host is already ready (still fully synchronous)', async () => {
+    const { service, sb, started } = preparerService({ tools: 'ready' });
+    const view = await service.create(sessionInput({ name: 'web' }));
+    expect(view.preparing).toBeNull();
+    expect(started).toEqual([]);
+    expect(sb.calls).toContain('createContainer');
+  });
+
+  it('a second call while a preparation runs does not start a second build', async () => {
+    const { service, started, release } = preparerService({ imageBuilt: false });
+
+    await service.create(sessionInput({ name: 'web' }));
+    // both of these land while the first preparation is still waiting on the gate
+    await service.start('web');
+    await service.start('web');
+    expect(started.filter((s) => s.startsWith('build:'))).toEqual(['build:node']);
+
+    release();
+  });
+
+  it('start prepares an unsynced host instead of only warning about it', async () => {
+    const { service, sb, release } = preparerService({
+      tools: 'unsynced',
+      sessions: [sessionConfig({ name: 'web' })],
+    });
+    sb.containers.push(containerSummary({ state: 'exited' }));
+
+    const view = await service.start('web');
+    expect(view.preparing).toMatchObject({ phase: 'syncing-tools' });
+    expect(sb.calls).not.toContain('startContainer');
+
+    release();
+    await vi.waitFor(() => expect(sb.calls).toContain('startContainer'));
+    await vi.waitFor(async () => expect((await service.get('web')).preparing).toBeNull());
+    expect((await service.get('web')).warnings).toEqual([]);
   });
 });
 

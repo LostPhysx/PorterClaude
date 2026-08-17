@@ -53,7 +53,7 @@ import {
   agentHistoryTarget,
   agentLinks,
 } from '../agents/model.js';
-import type { SessionConfig, SessionInput, SessionView } from './model.js';
+import type { SessionConfig, SessionInput, SessionPreparation, SessionView } from './model.js';
 import {
   CONTAINER_LABELS,
   SessionNameSchema,
@@ -122,6 +122,23 @@ export interface ToolsReadinessProbe {
     hostId: string,
     opts?: { probeImage?: string },
   ): Promise<'ready' | 'unsynced' | 'unknown'>;
+  /**
+   * v0.2.2 — the "just do it" half (ImageService implements all three). Optional so a test
+   * stub can still be a bare readiness probe; without them a host that is not ready is
+   * refused exactly like in v0.2.1 instead of being prepared.
+   */
+  ensureRecipeImage?(hostId: string, recipe: string): Promise<PreparationJob | null>;
+  ensureToolsSynced?(hostId: string, probeImage?: string): Promise<PreparationJob | null>;
+  awaitJob?(id: string): Promise<PreparationJob | null>;
+}
+
+/** The bit of ImageService's JobSummary a preparation cares about. */
+export interface PreparationJob {
+  id: string;
+  kind: string;
+  target: string;
+  status: string;
+  error: string | null;
 }
 
 /** A host plus everything a session operation on it needs. */
@@ -175,6 +192,18 @@ function resolvedImageRefFor(cfg: SessionConfig, general: GeneralConfig): string
     : cfg.image.ref;
 }
 
+/** One piece of host work a session needs before it can run (v0.2.2, see prepare()). */
+type PreparationStep =
+  | { kind: 'build-image'; recipe: string; ref: string }
+  | { kind: 'sync-tools' };
+
+function describeStep(step: PreparationStep | undefined): string {
+  if (!step) return 'preparing the host';
+  return step.kind === 'build-image'
+    ? `building the '${step.recipe}' image`
+    : 'syncing the tools volume';
+}
+
 /** true for a container user that is root (or unset, which means root). */
 function isRootUser(user: string): boolean {
   const u = user.trim();
@@ -188,6 +217,9 @@ export class SessionService {
   /** sessions whose definition was reconstructed from a container in THIS process; their
    *  config describes the running container even when the spec hash cannot match. */
   private readonly adopted = new Set<string>();
+
+  /** name -> the preparation running for it right now (v0.2.2, see prepare()) */
+  private readonly preparations = new Map<string, SessionPreparation>();
 
   constructor(
     private readonly deps: ServiceDeps,
@@ -463,6 +495,12 @@ export class SessionService {
    * session plus the containers of the TARGET host), ensure the volumes exist, resolve the
    * image, create the container, start it when autoStart, and persist the config only after
    * a successful create (rolling the container back when persisting fails).
+   *
+   * v0.2.2: when the host is not ready for this session — the recipe image was never built,
+   * or the tools volume was never synced — the create does NOT fail any more. The definition
+   * is persisted immediately (so nothing the user typed is lost), the missing work is started
+   * on the host, and the returned view carries `preparing`; the container is created and
+   * started by that background run. Everything else is unchanged and still synchronous.
    */
   async create(input: SessionInput): Promise<SessionView> {
     const hostId = this.deps.hosts.requireHostId(input.hostId);
@@ -494,10 +532,35 @@ export class SessionService {
       updatedAt: now,
     };
 
+    // Not ready? Keep the definition and do the work instead of refusing it.
+    const steps = await this.preparationSteps(scope, cfg);
+    if (steps.length) {
+      await this.deps.config.putSession(cfg);
+      this.prepare(scope, cfg, steps, 'create');
+      return this.get(cfg.name);
+    }
+
+    await this.materialize(scope, cfg, { start: cfg.autoStart });
+    return this.get(cfg.name);
+  }
+
+  /**
+   * createContainerFor + start + persist, with the rollback that belongs to it: whatever
+   * this call created on the engine is removed again when a later step fails, so a failed
+   * create never leaves a half-container or an empty workspace volume behind.
+   *
+   * `putSession` is an upsert: in the prepared path (see prepare()) the definition is
+   * already stored and this only writes the spec hash back.
+   */
+  private async materialize(
+    scope: HostScope,
+    cfg: SessionConfig,
+    opts: { start: boolean },
+  ): Promise<void> {
     const created = await this.createContainerFor(scope, cfg);
     cfg.specHash = created.specHash;
 
-    if (cfg.autoStart) {
+    if (opts.start) {
       try {
         await scope.backend.startContainer(created.id);
       } catch (err) {
@@ -517,7 +580,6 @@ export class SessionService {
     }
 
     if (created.warnings.length) this.addWarnings(cfg.name, created.warnings);
-    return this.get(cfg.name);
   }
 
   /** Edit = recreate: stop -> remove container (keep volumes) -> create -> start if it was
@@ -552,18 +614,27 @@ export class SessionService {
     return this.replaceContainer({ ...stored, updatedAt: new Date().toISOString() });
   }
 
-  async start(name: string): Promise<SessionView> {
+  /** `opts.prepared` is internal: the preparation that just finished calls back in here and
+   *  must not re-enter it (see runPreparation). */
+  async start(name: string, opts?: { prepared?: boolean }): Promise<SessionView> {
     const { scope, container } = await this.locate(name);
     // An orphan (container labelled porterclaude.session=<name> with no stored config,
     // e.g. after losing /data) is adopted here instead of 404ing.
     const cfg = await this.loadConfig(name, scope, container);
 
+    // Same rule as create(): a host that is not ready is made ready rather than refused —
+    // this is also the retry path after a preparation failed, and the button the UI offers
+    // for a session whose image was pruned or whose host was re-synced.
+    if (!opts?.prepared) {
+      const steps = await this.preparationSteps(scope, cfg, container !== null);
+      if (steps.length) {
+        this.prepare(scope, cfg, steps, container ? 'start' : 'create');
+        return this.get(name);
+      }
+    }
+
     if (!container) {
-      const created = await this.createContainerFor(scope, cfg);
-      cfg.specHash = created.specHash;
-      await this.deps.config.putSession(cfg);
-      await scope.backend.startContainer(created.id);
-      await this.afterStart(scope, cfg, created.id);
+      await this.materialize(scope, cfg, { start: true });
       return this.get(name);
     }
 
@@ -1231,6 +1302,128 @@ export class SessionService {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // preparation (v0.2.2)
+  //
+  // v0.2.1 answered "the recipe image is not built" and "the tools volume was never synced"
+  // with a 409 that told the user to go to another screen, click a button, come back and
+  // retype the whole form. Both are things the server can simply DO, and both are already
+  // implemented as image jobs — so it does them, in the background, and reports progress on
+  // the session instead of refusing it.
+  // -------------------------------------------------------------------------
+
+  /**
+   * What has to happen on the host before this definition can run. `[]` = nothing, which is
+   * the normal case and keeps create/start/update fully synchronous.
+   *
+   * `hasContainer` skips the image check: a container that already exists starts from the
+   * image it was created with, even if that image has since been pruned or retagged.
+   */
+  private async preparationSteps(
+    scope: HostScope,
+    cfg: SessionConfig,
+    hasContainer = false,
+  ): Promise<PreparationStep[]> {
+    // Without the "just do it" half of ImageService there is nothing to prepare WITH, and
+    // requireSyncedTools/resolveImage refuse exactly like they did in v0.2.1.
+    if (!this.tools?.ensureToolsSynced || !this.tools.awaitJob) return [];
+
+    const steps: PreparationStep[] = [];
+    if (!hasContainer && cfg.image.type === 'recipe' && this.tools.ensureRecipeImage) {
+      const ref = recipeImageRef(scope.general.imageNamespace, cfg.image.recipe);
+      const built = await scope.backend.inspectImage(ref).catch(() => null);
+      if (!built) steps.push({ kind: 'build-image', recipe: cfg.image.recipe, ref });
+    }
+    // The tools probe needs an image that exists ON THAT ENGINE to read the volume with. If
+    // the session image is about to be built, there may be none yet and the probe answers
+    // 'unknown' — so the sync step is added unconditionally when a build runs, and
+    // ensureToolsSynced re-probes (and does nothing) once the image is there.
+    if (steps.length) {
+      steps.push({ kind: 'sync-tools' });
+    } else if ((await this.toolsState(scope, resolvedImageRefFor(cfg, scope.general))) === 'unsynced') {
+      steps.push({ kind: 'sync-tools' });
+    }
+    return steps;
+  }
+
+  /**
+   * Start the background preparation for `cfg` and return immediately. The caller has
+   * already persisted the definition (create/replace) or is starting a stored one, so a
+   * failure here is never data loss: the session stays in the list, the reason lands in its
+   * warnings, and Start retries the whole thing.
+   */
+  private prepare(
+    scope: HostScope,
+    cfg: SessionConfig,
+    steps: PreparationStep[],
+    mode: 'create' | 'replace' | 'start',
+  ): void {
+    // A second click while the first preparation runs must not start a second build.
+    if (this.preparations.has(cfg.name)) return;
+    const state: SessionPreparation = {
+      phase: steps[0]?.kind === 'build-image' ? 'building-image' : 'syncing-tools',
+      detail: describeStep(steps[0]),
+      jobs: [],
+      startedAt: new Date().toISOString(),
+    };
+    this.preparations.set(cfg.name, state);
+    void this.runPreparation(scope, cfg, steps, mode, state);
+  }
+
+  private async runPreparation(
+    scope: HostScope,
+    cfg: SessionConfig,
+    steps: PreparationStep[],
+    mode: 'create' | 'replace' | 'start',
+    state: SessionPreparation,
+  ): Promise<void> {
+    const log = this.deps.log;
+    try {
+      for (const step of steps) {
+        state.phase = step.kind === 'build-image' ? 'building-image' : 'syncing-tools';
+        state.detail = describeStep(step);
+        log.info({ session: cfg.name, host: scope.host.id, step: step.kind }, 'preparing the host for a session');
+        const started =
+          step.kind === 'build-image'
+            ? await this.tools?.ensureRecipeImage?.(scope.host.id, step.recipe)
+            : await this.tools?.ensureToolsSynced?.(
+                scope.host.id,
+                resolvedImageRefFor(cfg, scope.general),
+              );
+        // null = already done by the time we got here (another session prepared the same
+        // host, or the probe that said 'unsynced' was stale). Nothing to wait for.
+        if (!started) continue;
+        state.jobs = [...state.jobs, { id: started.id, kind: started.kind, target: started.target }];
+        const finished = (await this.tools?.awaitJob?.(started.id)) ?? started;
+        if (finished.status !== 'success') {
+          throw new Error(
+            `${describeStep(step)} failed${finished.error ? `: ${finished.error}` : ` (${finished.status})`}`,
+          );
+        }
+      }
+
+      state.phase = mode === 'start' ? 'starting' : 'creating';
+      state.detail = mode === 'start' ? 'starting the container' : 'creating the container';
+      if (mode === 'replace') {
+        await this.doReplace(scope, cfg);
+      } else if (mode === 'start') {
+        // re-locates the container: minutes have passed since the caller looked
+        await this.start(cfg.name, { prepared: true });
+      } else {
+        await this.materialize(scope, cfg, { start: cfg.autoStart });
+      }
+      log.info({ session: cfg.name, host: scope.host.id }, 'session preparation finished');
+    } catch (err) {
+      const message = errMessage(err);
+      // The definition survives — this is a warning on the session, not a lost create. The
+      // UI shows it on the row and offers Start, which re-runs the whole preparation.
+      this.addWarnings(cfg.name, [`preparing this session failed: ${message}`]);
+      log.warn({ err, session: cfg.name, host: scope.host.id }, 'session preparation failed');
+    } finally {
+      this.preparations.delete(cfg.name);
+    }
+  }
+
   /**
    * The tools volume of a host is not optional: `buildContainerSpec` gives EVERY v0.2
    * container `<toolsMount>/entrypoint.sh` as its entrypoint, so a volume that was never
@@ -1569,6 +1762,25 @@ export class SessionService {
   /** stop -> remove -> create -> start (used by update/recreate). */
   private async replaceContainer(cfg: SessionConfig): Promise<SessionView> {
     const scope = this.scope(cfg.hostId);
+
+    // Before anything is torn down: a build/sync takes minutes, and destroying a working
+    // container first would leave the session down for all of it. The stored definition is
+    // updated right away so the edit is never lost, and the replace runs after the host is
+    // ready (see prepare()).
+    const steps = await this.preparationSteps(scope, cfg);
+    if (steps.length) {
+      await this.deps.config.putSession(cfg);
+      this.prepare(scope, cfg, steps, 'replace');
+      return this.get(cfg.name);
+    }
+
+    await this.doReplace(scope, cfg);
+    return this.get(cfg.name);
+  }
+
+  /** replaceContainer without the preparation check — the half that actually swaps the
+   *  container, called again by runPreparation once the host is ready. */
+  private async doReplace(scope: HostScope, cfg: SessionConfig): Promise<void> {
     const { backend, general } = scope;
     const previous = this.matchContainer(await this.listManagedContainers(backend), cfg.name, general);
     const wasRunning = previous?.state === 'running';
@@ -1597,7 +1809,6 @@ export class SessionService {
       await this.afterStart(scope, cfg, created.id);
     }
     if (created.warnings.length) this.addWarnings(cfg.name, created.warnings);
-    return this.get(cfg.name);
   }
 
   /** Resolve the image ref and read the PATH it declares (needed for the container PATH,
@@ -1756,10 +1967,15 @@ export class SessionService {
       container && containerImageId && currentImageId && containerImageId !== currentImageId,
     );
 
+    const preparing = this.preparations.get(cfg.name) ?? null;
+
     return {
       ...cfg,
       hostName: opts.hostName,
       hostMissing: opts.hostMissing ?? false,
+      // a live object while the preparation runs: copied so a later phase change cannot
+      // mutate a response that was already serialised
+      preparing: preparing ? { ...preparing, jobs: [...preparing.jobs] } : null,
       resolvedAgents,
       status,
       containerId: container?.id ?? null,

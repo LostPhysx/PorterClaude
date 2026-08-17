@@ -266,6 +266,12 @@ interface JobRecord {
   /** how many lines were evicted from the front (keeps `since` an append-only cursor) */
   dropped: number;
   abort: AbortController;
+  /**
+   * Settles when the runner is done, whatever the outcome (it never rejects — the status
+   * carries the result). `awaitJob` is what lets a caller that is ALREADY running in the
+   * background — the session preparation — wait for a build/sync instead of polling.
+   */
+  done: Promise<void>;
 }
 
 function errMessage(err: unknown): string {
@@ -1466,11 +1472,13 @@ export class ImageService {
       lines: [],
       dropped: 0,
       abort: new AbortController(),
+      // replaced by the real promise below; a JobRecord is never observable before that
+      done: Promise.resolve(),
     };
     this.jobs.set(job.id, job);
     this.evict();
 
-    void (async () => {
+    job.done = (async () => {
       try {
         await run(job);
         if (job.status === 'running') {
@@ -1493,6 +1501,64 @@ export class ImageService {
     })();
 
     return this.summary(job);
+  }
+
+  // -------------------------------------------------------------------------
+  // "just do it" helpers (v0.2.2)
+  //
+  // buildRecipe()/syncTools() are the USER-facing entry points: they refuse (409) when the
+  // same job is already running, because a second click on "Build" is a mistake. The three
+  // methods below are the MACHINE-facing twins used by SessionService.prepare(): a session
+  // that needs an image which is already being built must JOIN that build, not fail. They
+  // are also the only place that decides "already fine, do nothing" -> `null`.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Wait for a job to settle and return its final state. Resolves (never rejects) for a
+   * failed job — the caller reads `status`/`error`. `null` when the id is unknown, which
+   * only happens if the job was evicted from the ring buffer while we waited.
+   */
+  async awaitJob(id: string): Promise<JobSummary | null> {
+    const job = this.jobs.get(id);
+    if (!job) return null;
+    await job.done;
+    return this.summary(job);
+  }
+
+  /**
+   * Make sure the recipe image exists on the host. Returns the job that is building it, or
+   * `null` when it is already there (nothing to wait for).
+   */
+  async ensureRecipeImage(hostId: string, name: string): Promise<JobSummary | null> {
+    const recipe = getRecipe(name);
+    if (!recipe) throw AppError.notFound(`unknown recipe '${name}'`);
+    const running = this.runningJobFor(hostId, 'build', recipe.name);
+    if (running) return this.summary(running);
+
+    const general = this.deps.hosts.settingsFor(hostId);
+    const backend = this.deps.hosts.backendFor(hostId);
+    const tag = recipeImageRef(general.imageNamespace, recipe.name);
+    const existing = await backend.inspectImage(tag).catch(() => null);
+    if (existing) return null;
+    return this.buildRecipe(hostId, recipe.name);
+  }
+
+  /**
+   * Make sure the tools volume of the host can carry a session. Returns the sync job, or
+   * `null` when the volume is already usable — or when readiness cannot be established
+   * ('unknown'), which must never trigger a multi-minute sync on a guess.
+   */
+  async ensureToolsSynced(hostId: string, probeImage?: string): Promise<JobSummary | null> {
+    const running = this.runningJobFor(
+      hostId,
+      'tools-sync',
+      this.deps.hosts.settingsFor(hostId).toolsVolume,
+    );
+    if (running) return this.summary(running);
+    if ((await this.toolsReadiness(hostId, probeImage ? { probeImage } : undefined)) !== 'unsynced') {
+      return null;
+    }
+    return this.syncTools(hostId);
   }
 
   private evict(): void {

@@ -235,7 +235,10 @@ function rowActions(session) {
   const running = session.status === 'running';
   const absent = session.status === 'absent';
   const orphan = !!session.orphan;
-  const busy = busyRows.has(name);
+  // v0.2.2: while the server prepares the host for this session (building its image,
+  // syncing the tools volume) every lifecycle button is pointless — the container is
+  // created the moment that finishes.
+  const busy = busyRows.has(name) || !!session.preparing;
   // a session whose host was force-deleted is READ ONLY: only Destroy stays enabled
   // (api.md "Sessions": hostMissing)
   const locked = busy || !!session.hostMissing;
@@ -253,6 +256,25 @@ function rowActions(session) {
   parts.push(actionButton(name, 'destroy', 'bi-trash', 'Destroy', { disabled: busy, variant: 'outline-danger' }));
   const spinner = busy ? '<span class="spinner-border spinner-border-sm text-secondary ms-2" role="status" aria-hidden="true"></span>' : '';
   return `<div class="btn-group btn-group-sm pc-row-actions" role="group">${parts.join('')}</div>${spinner}`;
+}
+
+/**
+ * Status cell. A session the server is still preparing (v0.2.2 `preparing`) shows what it is
+ * waiting for instead of a bare "absent" — that state is transient and self-healing, so it
+ * must not read like a broken session.
+ */
+function statusCell(session) {
+  const prep = session.preparing;
+  if (!prep) {
+    return `<span class="badge ${statusBadgeClass(session.status)}">${escapeHtml(session.status)}</span>`;
+  }
+  const detail = prep.detail || 'preparing the host';
+  return (
+    `<span class="badge text-bg-info" title="${escapeHtml(detail)}">` +
+    '<span class="spinner-border spinner-border-sm me-1" style="width:.7em;height:.7em" role="status" aria-hidden="true"></span>' +
+    'preparing</span>' +
+    `<div class="small text-secondary text-truncate" style="max-width:14rem">${escapeHtml(detail)}</div>`
+  );
 }
 
 function pills(session) {
@@ -418,7 +440,7 @@ function render() {
         resolvedImageCell(s) +
         '</td>' +
         `<td class="small">${escapeHtml(workspaceLabel(s))}</td>` +
-        `<td><span class="badge ${statusBadgeClass(s.status)}">${escapeHtml(s.status)}</span></td>` +
+        `<td>${statusCell(s)}</td>` +
         `<td>${portsLabel(s)}</td>` +
         `<td class="small">${escapeHtml(fmtDuration(s.uptimeSec))}</td>` +
         `<td class="text-end text-nowrap">${rowActions(s)}</td>` +
@@ -679,7 +701,8 @@ function sessionFormHtml(session) {
   const recipeOptions = (recipes.length ? recipes : FALLBACK_RECIPES.map((n) => ({ name: n, title: n })))
     .map((r) => {
       const selected = image.type === 'recipe' && image.recipe === r.name ? ' selected' : '';
-      const built = r.built === false ? ' (not built)' : '';
+      // v0.2.2: not-built is no longer a blocker — creating the session builds it.
+      const built = r.built === false ? ' (builds on first use)' : '';
       return `<option value="${escapeHtml(r.name)}"${selected}>${escapeHtml(r.title || r.name)}${built}</option>`;
     })
     .join('');
@@ -1049,7 +1072,7 @@ function repaintLookups(session) {
       .map(
         (r) =>
           `<option value="${escapeHtml(r.name)}"${r.name === current ? ' selected' : ''}>` +
-          `${escapeHtml(r.title || r.name)}${r.built === false ? ' (not built)' : ''}</option>`,
+          `${escapeHtml(r.title || r.name)}${r.built === false ? ' (builds on first use)' : ''}</option>`,
       )
       .join('');
   }
@@ -1144,11 +1167,21 @@ async function saveSession(event) {
   }
   if (button) button.disabled = true;
   try {
-    if (editing) await api.sessions.update(editing.name, input);
-    else await api.sessions.create(input);
+    const saved = editing
+      ? await api.sessions.update(editing.name, input)
+      : await api.sessions.create(input);
     const modalEl = byId('session-modal');
     if (modalEl && typeof bootstrap !== 'undefined') bootstrap.Modal.getOrCreateInstance(modalEl).hide();
-    toast(`Session ${input.name} ${editing ? 'updated' : 'created'}`, { variant: 'success' });
+    // v0.2.2: the server no longer refuses a session whose host is not ready yet — it
+    // stores the definition and does the missing work (image build, tools sync). Say so
+    // rather than claiming the session is up.
+    const prep = saved && saved.session && saved.session.preparing;
+    toast(
+      prep
+        ? `Session ${input.name} saved — ${prep.detail}. It starts by itself when that is done.`
+        : `Session ${input.name} ${editing ? 'updated' : 'created'}`,
+      { variant: prep ? 'info' : 'success', delay: prep ? 8000 : undefined },
+    );
     editing = null;
     await reload();
   } catch (err) {
