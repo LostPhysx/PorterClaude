@@ -9,46 +9,46 @@ import type { ExecStream } from '../backends/types.js';
 import { AppError, toAppError } from '../http/errors.js';
 import { SLUG_RE } from '../util/slug.js';
 import {
-  parseTerminalShell,
-  TerminalRefusal,
-  TERMINAL_CLOSE,
-  TERMINAL_HEARTBEAT_MS,
-  TERMINAL_HEARTBEAT_TIMEOUT_MS,
-  TERMINAL_MAX_BUFFER_BYTES,
+  parseSessionShell,
+  SessionRefusal,
+  SESSION_CLOSE,
+  SESSION_HEARTBEAT_MS,
+  SESSION_HEARTBEAT_TIMEOUT_MS,
+  SESSION_MAX_BUFFER_BYTES,
 } from './protocol.js';
-import type { ClientMessage, ServerMessage, TerminalCloseCode, TerminalErrorCode } from './protocol.js';
+import type { ClientMessage, ServerMessage, SessionCloseCode, SessionErrorCode } from './protocol.js';
 
-export const TERMINAL_PATH = '/api/terminals';
+export const SESSION_WS_PATH = '/api/sessions';
 
-export interface TerminalWsHandle {
+export interface SessionWsHandle {
   wss: WebSocketServer;
-  /** close every live terminal and the server */
+  /** close every live session and the server */
   close(): Promise<void>;
 }
 
-/** The pane name the UI generates: <session>-<shell>-<n>. */
-const TERMINAL_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,39}$/;
+/** The pane name the UI generates: <container>-<shell>-<n>. */
+const SESSION_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,39}$/;
 
 /**
  * v0.2: `shell` is a STRING on the wire (`bash` | `sh` | `agent:<id>`, plus the deprecated
- * `claude` alias) and is decoded with `parseTerminalShell`, which also yields the agent id.
+ * `claude` alias) and is decoded with `parseSessionShell`, which also yields the agent id.
  * An unparsable value is a 4400.
  */
 const QuerySchema = z.object({
-  session: z.string().regex(SLUG_RE, 'invalid session name'),
+  container: z.string().regex(SLUG_RE, 'invalid container name'),
   shell: z
     .string()
     .max(48)
     .default('bash')
     .transform((raw, ctx2) => {
-      const parsed = parseTerminalShell(raw);
+      const parsed = parseSessionShell(raw);
       if (!parsed) {
         ctx2.addIssue({ code: z.ZodIssueCode.custom, message: 'invalid shell' });
         return z.NEVER;
       }
       return parsed;
     }),
-  name: z.string().regex(TERMINAL_NAME_RE, 'invalid terminal name'),
+  session: z.string().regex(SESSION_NAME_RE, 'invalid session name'),
   cols: z.coerce.number().int().min(1).max(1000).optional().default(80),
   rows: z.coerce.number().int().min(1).max(1000).optional().default(24),
 });
@@ -67,7 +67,7 @@ const ClientMessageSchema = z.discriminatedUnion('type', [
 /**
  * FROZEN SIGNATURE — index.ts (B1) calls exactly this.
  */
-export function attachTerminalWs(server: Server, ctx: AppContext): TerminalWsHandle {
+export function attachSessionWs(server: Server, ctx: AppContext): SessionWsHandle {
   const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
 
   const onUpgrade = (req: IncomingMessage, socket: Duplex, head: Buffer): void => {
@@ -78,13 +78,13 @@ export function attachTerminalWs(server: Server, ctx: AppContext): TerminalWsHan
       return;
     }
     // Not ours: leave the socket alone so other upgrade handlers can serve it.
-    if (pathname !== TERMINAL_PATH) return;
+    if (pathname !== SESSION_WS_PATH) return;
 
     let authenticated = false;
     try {
       authenticated = authenticateUpgradeRequest(req, ctx);
     } catch (err) {
-      ctx.log.error({ err }, 'terminal upgrade authentication failed');
+      ctx.log.error({ err }, 'session upgrade authentication failed');
       authenticated = false;
     }
     if (!authenticated) {
@@ -107,7 +107,7 @@ export function attachTerminalWs(server: Server, ctx: AppContext): TerminalWsHan
         void handleConnection(ws, req, ctx);
       });
     } catch (err) {
-      ctx.log.error({ err }, 'terminal upgrade failed');
+      ctx.log.error({ err }, 'session upgrade failed');
       socket.destroy();
     }
   };
@@ -120,7 +120,7 @@ export function attachTerminalWs(server: Server, ctx: AppContext): TerminalWsHan
       server.off('upgrade', onUpgrade);
       for (const client of wss.clients) {
         try {
-          client.close(TERMINAL_CLOSE.normal, 'server shutting down');
+          client.close(SESSION_CLOSE.normal, 'server shutting down');
         } catch {
           /* ignore */
         }
@@ -139,7 +139,7 @@ function send(ws: WebSocket, msg: ServerMessage): void {
   }
 }
 
-function fail(ws: WebSocket, code: TerminalErrorCode, message: string, closeCode: TerminalCloseCode): void {
+function fail(ws: WebSocket, code: SessionErrorCode, message: string, closeCode: SessionCloseCode): void {
   send(ws, { type: 'error', code, message });
   try {
     ws.close(closeCode, message.slice(0, 100));
@@ -174,35 +174,35 @@ function delay(ms: number): Promise<void> {
 }
 
 /**
- * Error -> (terminal error code, websocket close code).
+ * Error -> (session error code, websocket close code).
  *
- * A `TerminalRefusal` (v0.2) carries both itself: it is how `agent_not_available` (4410) and
+ * A `SessionRefusal` (v0.2) carries both itself: it is how `agent_not_available` (4410) and
  * `host_unavailable` (4411) reach the client. Everything else is mapped from the AppError
  * code, with `not_implemented` (a host whose connection type this version cannot talk to)
  * folded into `host_unavailable` as well.
  */
-export function mapError(err: unknown): { code: TerminalErrorCode; close: TerminalCloseCode; message: string } {
-  if (err instanceof TerminalRefusal) {
-    return { code: err.terminalCode, close: err.closeCode, message: err.message };
+export function mapError(err: unknown): { code: SessionErrorCode; close: SessionCloseCode; message: string } {
+  if (err instanceof SessionRefusal) {
+    return { code: err.sessionCode, close: err.closeCode, message: err.message };
   }
   const appErr: AppError = toAppError(err);
   switch (appErr.code) {
     case 'not_implemented':
-      return { code: 'host_unavailable', close: TERMINAL_CLOSE.hostUnavailable, message: appErr.message };
+      return { code: 'host_unavailable', close: SESSION_CLOSE.hostUnavailable, message: appErr.message };
     case 'not_found':
-      return { code: 'session_not_found', close: TERMINAL_CLOSE.sessionNotFound, message: appErr.message };
+      return { code: 'container_not_found', close: SESSION_CLOSE.containerNotFound, message: appErr.message };
     case 'conflict':
-      return { code: 'session_not_running', close: TERMINAL_CLOSE.sessionNotRunning, message: appErr.message };
+      return { code: 'container_not_running', close: SESSION_CLOSE.containerNotRunning, message: appErr.message };
     case 'backend_error':
     case 'backend_not_configured':
-      return { code: 'backend_error', close: TERMINAL_CLOSE.backendError, message: appErr.message };
+      return { code: 'backend_error', close: SESSION_CLOSE.backendError, message: appErr.message };
     case 'validation_error':
     case 'bad_request':
-      return { code: 'bad_request', close: TERMINAL_CLOSE.badRequest, message: appErr.message };
+      return { code: 'bad_request', close: SESSION_CLOSE.badRequest, message: appErr.message };
     case 'unauthorized':
-      return { code: 'unauthorized', close: TERMINAL_CLOSE.unauthorized, message: appErr.message };
+      return { code: 'unauthorized', close: SESSION_CLOSE.unauthorized, message: appErr.message };
     default:
-      return { code: 'internal', close: TERMINAL_CLOSE.internal, message: 'internal error' };
+      return { code: 'internal', close: SESSION_CLOSE.internal, message: 'internal error' };
   }
 }
 
@@ -216,19 +216,19 @@ function toBuffer(data: unknown): Buffer {
 async function handleConnection(ws: WebSocket, req: IncomingMessage, ctx: AppContext): Promise<void> {
   const log = ctx.log;
   let stream: ExecStream | null = null;
-  let terminalId: string | null = null;
+  let sessionId: string | null = null;
   let closed = false;
   let lastPong = Date.now();
   /** the user closed the pane (kill message / close code 4001) -> end the tmux session */
   let killRequested = false;
-  /** set once the query parsed; kill needs the session + pane name */
-  let target: { session: string; name: string } | null = null;
+  /** set once the query parsed; kill needs the container + pane name */
+  let target: { container: string; session: string } | null = null;
 
   const cleanup = (): void => {
     if (closed) return;
     closed = true;
     clearInterval(heartbeat);
-    if (terminalId) ctx.terminals.unregister(terminalId);
+    if (sessionId) ctx.sessions.unregister(sessionId);
     if (stream) {
       try {
         stream.close();
@@ -239,32 +239,32 @@ async function handleConnection(ws: WebSocket, req: IncomingMessage, ctx: AppCon
     // Only an EXPLICIT close ends the shell: a reload or a dropped connection must leave
     // the tmux session alone, that is what makes re-attaching work (INT-06).
     if (killRequested && target) {
-      void ctx.terminals.killTmuxSession(target.session, target.name);
+      void ctx.sessions.killTmuxSession(target.container, target.session);
     }
   };
 
   const heartbeat = setInterval(() => {
     try {
-      if (Date.now() - lastPong > TERMINAL_HEARTBEAT_TIMEOUT_MS) {
-        log.warn('terminal heartbeat timeout; terminating socket');
+      if (Date.now() - lastPong > SESSION_HEARTBEAT_TIMEOUT_MS) {
+        log.warn('session heartbeat timeout; terminating socket');
         ws.terminate();
         cleanup();
         return;
       }
       ws.ping();
     } catch (err) {
-      log.debug({ err }, 'terminal heartbeat failed');
+      log.debug({ err }, 'session heartbeat failed');
     }
-  }, TERMINAL_HEARTBEAT_MS);
+  }, SESSION_HEARTBEAT_MS);
 
   ws.on('pong', () => {
     lastPong = Date.now();
   });
   ws.on('error', (err) => {
-    log.debug({ err }, 'terminal websocket error');
+    log.debug({ err }, 'session websocket error');
   });
   ws.on('close', (code: number) => {
-    if (code === TERMINAL_CLOSE.paneClosed) killRequested = true;
+    if (code === SESSION_CLOSE.paneClosed) killRequested = true;
     cleanup();
   });
 
@@ -274,14 +274,14 @@ async function handleConnection(ws: WebSocket, req: IncomingMessage, ctx: AppCon
     const url = new URL(req.url ?? '/', 'http://localhost');
     const parsed = QuerySchema.safeParse(Object.fromEntries(url.searchParams.entries()));
     if (!parsed.success) {
-      fail(ws, 'bad_request', 'invalid terminal query', TERMINAL_CLOSE.badRequest);
+      fail(ws, 'bad_request', 'invalid session query', SESSION_CLOSE.badRequest);
       cleanup();
       return;
     }
     query = parsed.data;
-    target = { session: query.session, name: query.name };
+    target = { container: query.container, session: query.session };
   } catch {
-    fail(ws, 'bad_request', 'invalid terminal query', TERMINAL_CLOSE.badRequest);
+    fail(ws, 'bad_request', 'invalid session query', SESSION_CLOSE.badRequest);
     cleanup();
     return;
   }
@@ -289,17 +289,17 @@ async function handleConnection(ws: WebSocket, req: IncomingMessage, ctx: AppCon
   // --- open the exec -------------------------------------------------------
   let opened;
   try {
-    opened = await ctx.terminals.open({
-      session: query.session,
+    opened = await ctx.sessions.open({
+      container: query.container,
       shell: query.shell.shell,
       agentId: query.shell.agentId,
-      name: query.name,
+      session: query.session,
       cols: query.cols,
       rows: query.rows,
     });
   } catch (err) {
     const mapped = mapError(err);
-    log.warn({ err, session: query.session }, 'opening terminal failed');
+    log.warn({ err, container: query.container }, 'opening a session failed');
     fail(ws, mapped.code, mapped.message, mapped.close);
     cleanup();
     return;
@@ -308,30 +308,30 @@ async function handleConnection(ws: WebSocket, req: IncomingMessage, ctx: AppCon
   if (ws.readyState !== WebSocket.OPEN) {
     // the client disappeared while we were opening the exec
     opened.stream.close();
-    ctx.terminals.unregister(opened.terminalId);
+    ctx.sessions.unregister(opened.sessionId);
     cleanup();
     return;
   }
 
   stream = opened.stream;
-  terminalId = opened.terminalId;
+  sessionId = opened.sessionId;
   const execId = opened.stream.execId;
 
   send(ws, {
     type: 'ready',
-    terminalId: opened.terminalId,
-    session: query.session,
+    sessionId: opened.sessionId,
+    container: query.container,
     hostId: opened.hostId,
     shell: query.shell.shell,
     agentId: opened.agentId,
-    name: query.name,
+    session: query.session,
     tmux: opened.tmux,
     reattached: opened.reattached,
     cols: query.cols,
     rows: query.rows,
   });
   if (opened.reattached) {
-    send(ws, { type: 'info', message: `reattached to tmux session pc_${query.name}` });
+    send(ws, { type: 'info', message: `reattached to tmux session pc_${query.session}` });
   } else if (!opened.tmux) {
     send(ws, {
       type: 'info',
@@ -343,15 +343,15 @@ async function handleConnection(ws: WebSocket, req: IncomingMessage, ctx: AppCon
   stream.onData((chunk) => {
     try {
       if (ws.readyState !== WebSocket.OPEN) return;
-      if (ws.bufferedAmount > TERMINAL_MAX_BUFFER_BYTES) {
-        log.warn({ terminalId }, 'terminal backpressure limit exceeded; dropping socket');
-        fail(ws, 'internal', 'client too slow', TERMINAL_CLOSE.internal);
+      if (ws.bufferedAmount > SESSION_MAX_BUFFER_BYTES) {
+        log.warn({ sessionId }, 'session backpressure limit exceeded; dropping socket');
+        fail(ws, 'internal', 'client too slow', SESSION_CLOSE.internal);
         cleanup();
         return;
       }
       ws.send(chunk, { binary: true });
     } catch (err) {
-      log.debug({ err }, 'forwarding terminal output failed');
+      log.debug({ err }, 'forwarding session output failed');
     }
   });
 
@@ -359,24 +359,24 @@ async function handleConnection(ws: WebSocket, req: IncomingMessage, ctx: AppCon
   // the exec websocket's 1006 when the container dies), never a process status - so ask the
   // engine for the real exit status, and when the container is no longer running close with
   // 4409 instead of pretending the shell exited normally: the pane then shows the
-  // "session is not running" note with its Start action rather than "[process exited]".
+  // "container is not running" note with its Start action rather than "[process exited]".
   //
-  // INT-05: one state check races the stop. POST /sessions/:name/stop kills the exec within
+  // INT-05: one state check races the stop. POST /containers/:name/stop kills the exec within
   // ~60 ms while the engine needs ~170 ms (portainer a bit more) to report the container as
   // exited, so the inspect right after the exec died still answered "running" and the pane
   // got `exit 137` + 1000. When the exit status looks like a container stop (128+SIGKILL /
   // 128+SIGTERM) or cannot be read at all, keep re-checking for a short while before
   // believing "running". A normal shell exit (0 or any other status while the container is
   // still up) is unaffected: it is answered on the first check, as before.
-  const sessionStopReason = async (): Promise<AppError | null> => {
+  const containerStopReason = async (): Promise<AppError | null> => {
     try {
-      await ctx.sessions.requireRunningContainer(query.session);
+      await ctx.containers.requireRunningContainer(query.container);
       return null;
     } catch (err) {
       const appErr = toAppError(err);
       // only a definite "gone"/"stopped" answer overrides the normal exit path
       if (appErr.code === 'not_found' || appErr.code === 'conflict') return appErr;
-      log.debug({ err }, 'could not confirm the session state after the exec ended');
+      log.debug({ err }, 'could not confirm the container state after the exec ended');
       return null;
     }
   };
@@ -386,49 +386,49 @@ async function handleConnection(ws: WebSocket, req: IncomingMessage, ctx: AppCon
     // the real process status first: it decides how hard we look at the container state
     let code: number | null = null;
     try {
-      // the exec lives on the SESSION'S host (v0.2), which the ready frame already named
+      // the exec lives on the CONTAINER'S host (v0.2), which the ready frame already named
       code = (await ctx.hosts.backendFor(opened.hostId).execInspect(execId)).exitCode;
     } catch (err) {
-      log.debug({ err, terminalId }, 'inspecting the finished exec failed');
+      log.debug({ err, sessionId }, 'inspecting the finished exec failed');
     }
     if (closed || ws.readyState !== WebSocket.OPEN) return;
 
-    let stopped = await sessionStopReason();
+    let stopped = await containerStopReason();
     if (!stopped && looksLikeContainerStop(code)) {
       const deadline = Date.now() + STOP_RECHECK.timeoutMs;
       while (!stopped && Date.now() < deadline) {
         await delay(STOP_RECHECK.intervalMs);
         if (closed || ws.readyState !== WebSocket.OPEN) return;
-        stopped = await sessionStopReason();
+        stopped = await containerStopReason();
       }
     }
     if (closed || ws.readyState !== WebSocket.OPEN) return;
     if (stopped) {
       const mapped = mapError(stopped);
       log.info(
-        { terminalId, session: query.session, exitCode: code, close: mapped.close },
-        'the exec died with its container: closing the terminal as "session not running"',
+        { sessionId, container: query.container, exitCode: code, close: mapped.close },
+        'the exec died with its container: closing the session as "container not running"',
       );
       fail(ws, mapped.code, mapped.message, mapped.close);
       cleanup();
       return;
     }
     send(ws, { type: 'exit', code });
-    ws.close(TERMINAL_CLOSE.normal, 'shell exited');
+    ws.close(SESSION_CLOSE.normal, 'shell exited');
     cleanup();
   };
 
   stream.onClose(() => {
     onStreamClosed().catch((err: unknown) => {
-      log.debug({ err }, 'closing terminal socket failed');
+      log.debug({ err }, 'closing the session socket failed');
       cleanup();
     });
   });
 
   stream.onError((err) => {
-    log.warn({ err, terminalId }, 'terminal exec stream error');
+    log.warn({ err, sessionId }, 'session exec stream error');
     try {
-      fail(ws, 'backend_error', err.message, TERMINAL_CLOSE.backendError);
+      fail(ws, 'backend_error', err.message, SESSION_CLOSE.backendError);
     } finally {
       cleanup();
     }
@@ -458,7 +458,7 @@ async function handleConnection(ws: WebSocket, req: IncomingMessage, ctx: AppCon
       switch (msg.type) {
         case 'resize':
           void stream.resize({ cols: msg.cols, rows: msg.rows }).catch((err: unknown) => {
-            log.debug({ err }, 'terminal resize failed');
+            log.debug({ err }, 'session resize failed');
           });
           break;
         case 'ping':
@@ -471,7 +471,7 @@ async function handleConnection(ws: WebSocket, req: IncomingMessage, ctx: AppCon
           // the pane is gone for good: cleanup() kills pc_<name> after the socket closed
           killRequested = true;
           try {
-            ws.close(TERMINAL_CLOSE.normal, 'pane closed');
+            ws.close(SESSION_CLOSE.normal, 'pane closed');
           } catch {
             /* ignore */
           }
@@ -479,9 +479,9 @@ async function handleConnection(ws: WebSocket, req: IncomingMessage, ctx: AppCon
           break;
       }
     } catch (err) {
-      log.error({ err }, 'terminal message handler failed');
+      log.error({ err }, 'session message handler failed');
       try {
-        fail(ws, 'internal', 'internal error', TERMINAL_CLOSE.internal);
+        fail(ws, 'internal', 'internal error', SESSION_CLOSE.internal);
       } finally {
         cleanup();
       }

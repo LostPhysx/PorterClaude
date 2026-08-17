@@ -1,12 +1,12 @@
-// OWNER: B2. Mounted at /api/sessions behind requireAuth (see routes/index.ts).
+// OWNER: B2. Mounted at /api/containers behind requireAuth (see routes/index.ts).
 import { Router } from 'express';
 import { z } from 'zod';
 import type { AppContext } from '../context.js';
 import { asyncHandler } from '../http/async.js';
 import { parseBody, parseParams, parseQuery } from '../http/validate.js';
-import { SessionInputSchema, SessionNameSchema } from './model.js';
+import { ContainerInputSchema, ContainerNameSchema } from './model.js';
 
-const NameParams = z.object({ name: SessionNameSchema });
+const NameParams = z.object({ name: ContainerNameSchema });
 
 const boolish = z
   .union([z.boolean(), z.string()])
@@ -19,7 +19,7 @@ const boolish = z
 
 const RemoveQuery = z.object({ removeVolumes: boolish });
 
-/** v0.2: optional host filter for the list; session NAMES stay globally unique. */
+/** v0.2: optional host filter for the list; container NAMES stay globally unique. */
 const ListQuery = z.object({ hostId: z.string().min(1).max(32).optional() });
 
 const LogsQuery = z.object({
@@ -28,46 +28,46 @@ const LogsQuery = z.object({
 });
 
 /**
- * v0.2: sessions stay FLAT (no /api/hosts/:hostId prefix) because a session name is unique
- * across hosts - that is also what lets the terminal websocket route session -> host with
+ * v0.2: containers stay FLAT (no /api/hosts/:hostId prefix) because a container name is unique
+ * across hosts - that is also what lets the session websocket route container -> host with
  * nothing but the name. The host is part of the body (create only, immutable afterwards)
- * and of every SessionView.
+ * and of every ContainerView.
  *
- * GET    /api/sessions?hostId=<id>     -> { sessions: SessionView[] }
- * POST   /api/sessions                 SessionInput -> 201 { session: SessionView }
- *                                       409 conflict when the name is taken
- * GET    /api/sessions/:name           -> { session: SessionView }
- * PUT    /api/sessions/:name           SessionInput -> { session: SessionView }  (recreates)
- * DELETE /api/sessions/:name?removeVolumes=1 -> 204
- * POST   /api/sessions/:name/start     -> { session: SessionView }
- * POST   /api/sessions/:name/stop      -> { session: SessionView }
- * POST   /api/sessions/:name/restart   -> { session: SessionView }
- * POST   /api/sessions/:name/recreate  -> { session: SessionView }
- * GET    /api/sessions/:name/logs?tail=200&timestamps=0 -> { logs: string }
- * POST   /api/sessions/reconcile?hostId=<id> -> { report: ReconcileReport }
- *                                       (every host, or just one)
+ * GET    /api/containers?hostId=<id>     -> { containers: ContainerView[] }
+ * POST   /api/containers                 ContainerInput -> 201 { container: ContainerView }
+ *                                         409 conflict when the name is taken
+ * GET    /api/containers/:name           -> { container: ContainerView }
+ * PUT    /api/containers/:name           ContainerInput -> { container: ContainerView }  (recreates)
+ * DELETE /api/containers/:name?removeVolumes=1 -> 204
+ * POST   /api/containers/:name/start     -> { container: ContainerView }
+ * POST   /api/containers/:name/stop      -> { container: ContainerView }
+ * POST   /api/containers/:name/restart   -> { container: ContainerView }
+ * POST   /api/containers/:name/recreate  -> { container: ContainerView }
+ * GET    /api/containers/:name/logs?tail=200&timestamps=0 -> { logs: string }
+ * POST   /api/containers/reconcile?hostId=<id> -> { report: ReconcileReport }
+ *                                         (every host, or just one)
  */
-export function createSessionsRouter(ctx: AppContext): Router {
+export function createContainersRouter(ctx: AppContext): Router {
   const router = Router();
 
   router.get(
     '/',
     asyncHandler(async (req, res) => {
       const { hostId } = parseQuery(ListQuery, req);
-      const sessions = await ctx.sessions.list(hostId ? { hostId } : undefined);
-      res.json({ sessions });
+      const containers = await ctx.containers.list(hostId ? { hostId } : undefined);
+      res.json({ containers });
     }),
   );
 
   router.post(
     '/',
     asyncHandler(async (req, res) => {
-      const input = parseBody(SessionInputSchema, req);
-      const session = await ctx.sessions.create(input);
+      const input = parseBody(ContainerInputSchema, req);
+      const container = await ctx.containers.create(input);
       // 202 = the definition is stored and the host is being prepared for it (a recipe
       // image is building, the tools volume is syncing); the container appears when that
-      // finishes. `session.preparing` says what is running. 201 = it is already there.
-      res.status(session.preparing ? 202 : 201).json({ session });
+      // finishes. `container.preparing` says what is running. 201 = it is already there.
+      res.status(container.preparing ? 202 : 201).json({ container });
     }),
   );
 
@@ -78,7 +78,7 @@ export function createSessionsRouter(ctx: AppContext): Router {
       // explicit user action: adopt orphans (the startup reconcile does not, so an
       // orphan stays visible instead of being silently rewritten)
       const { hostId } = parseQuery(ListQuery, req);
-      const report = await ctx.sessions.reconcile({ adopt: true, ...(hostId ? { hostId } : {}) });
+      const report = await ctx.containers.reconcile({ adopt: true, ...(hostId ? { hostId } : {}) });
       res.json({ report });
     }),
   );
@@ -87,7 +87,7 @@ export function createSessionsRouter(ctx: AppContext): Router {
     '/:name',
     asyncHandler(async (req, res) => {
       const { name } = parseParams(NameParams, req);
-      res.json({ session: await ctx.sessions.get(name) });
+      res.json({ container: await ctx.containers.get(name) });
     }),
   );
 
@@ -95,9 +95,9 @@ export function createSessionsRouter(ctx: AppContext): Router {
     '/:name',
     asyncHandler(async (req, res) => {
       const { name } = parseParams(NameParams, req);
-      const input = parseBody(SessionInputSchema, req);
-      const session = await ctx.sessions.update(name, input);
-      res.status(session.preparing ? 202 : 200).json({ session });
+      const input = parseBody(ContainerInputSchema, req);
+      const container = await ctx.containers.update(name, input);
+      res.status(container.preparing ? 202 : 200).json({ container });
     }),
   );
 
@@ -106,7 +106,7 @@ export function createSessionsRouter(ctx: AppContext): Router {
     asyncHandler(async (req, res) => {
       const { name } = parseParams(NameParams, req);
       const { removeVolumes } = parseQuery(RemoveQuery, req);
-      await ctx.sessions.remove(name, { removeVolumes });
+      await ctx.containers.remove(name, { removeVolumes });
       res.status(204).end();
     }),
   );
@@ -115,8 +115,8 @@ export function createSessionsRouter(ctx: AppContext): Router {
     '/:name/start',
     asyncHandler(async (req, res) => {
       const { name } = parseParams(NameParams, req);
-      const session = await ctx.sessions.start(name);
-      res.status(session.preparing ? 202 : 200).json({ session });
+      const container = await ctx.containers.start(name);
+      res.status(container.preparing ? 202 : 200).json({ container });
     }),
   );
 
@@ -124,7 +124,7 @@ export function createSessionsRouter(ctx: AppContext): Router {
     '/:name/stop',
     asyncHandler(async (req, res) => {
       const { name } = parseParams(NameParams, req);
-      res.json({ session: await ctx.sessions.stop(name) });
+      res.json({ container: await ctx.containers.stop(name) });
     }),
   );
 
@@ -132,7 +132,7 @@ export function createSessionsRouter(ctx: AppContext): Router {
     '/:name/restart',
     asyncHandler(async (req, res) => {
       const { name } = parseParams(NameParams, req);
-      res.json({ session: await ctx.sessions.restart(name) });
+      res.json({ container: await ctx.containers.restart(name) });
     }),
   );
 
@@ -140,7 +140,7 @@ export function createSessionsRouter(ctx: AppContext): Router {
     '/:name/recreate',
     asyncHandler(async (req, res) => {
       const { name } = parseParams(NameParams, req);
-      res.json({ session: await ctx.sessions.recreate(name) });
+      res.json({ container: await ctx.containers.recreate(name) });
     }),
   );
 
@@ -149,7 +149,7 @@ export function createSessionsRouter(ctx: AppContext): Router {
     asyncHandler(async (req, res) => {
       const { name } = parseParams(NameParams, req);
       const { tail, timestamps } = parseQuery(LogsQuery, req);
-      const logs = await ctx.sessions.logs(name, { tail, timestamps });
+      const logs = await ctx.containers.logs(name, { tail, timestamps });
       res.json({ logs });
     }),
   );

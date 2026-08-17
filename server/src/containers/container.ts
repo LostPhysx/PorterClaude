@@ -1,16 +1,16 @@
-// OWNER: B2. Pure translation SessionConfig -> CreateContainerSpec. No I/O, no docker
+// OWNER: B2. Pure translation ContainerConfig -> CreateContainerSpec. No I/O, no docker
 // calls: this file must stay unit-testable without a docker host.
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import type { CreateContainerSpec, MountSpec, PortMapSpec } from '../backends/types.js';
 import type { GeneralConfig } from '../config/schema.js';
 import { AppError } from '../http/errors.js';
-import type { SessionConfig } from './model.js';
+import type { ContainerConfig } from './model.js';
 import { CONTAINER_LABELS, historyVolumeFor, workspaceVolumeFor } from './model.js';
 import type { AgentDefinition } from '../agents/model.js';
 import {
-  SESSION_AGENTS_ENV,
-  SESSION_AGENT_LINKS_ENV,
+  CONTAINER_AGENTS_ENV,
+  CONTAINER_AGENT_LINKS_ENV,
   agentAuthVolumeFor,
   agentDataDir,
   agentHistoryTarget,
@@ -19,19 +19,19 @@ import {
 } from '../agents/model.js';
 
 export interface BuildSpecInput {
-  session: SessionConfig;
-  /** the EFFECTIVE settings of the session's host (`hosts.settingsFor(session.hostId)`) */
+  container: ContainerConfig;
+  /** the EFFECTIVE settings of the container's host (`hosts.settingsFor(container.hostId)`) */
   general: GeneralConfig;
   /**
    * The agents mounted into this container, already resolved
-   * (`agents.resolveForSession(host, session)`). Order matters: it goes into the
+   * (`agents.resolveForContainer(host, container)`). Order matters: it goes into the
    * `porterclaude.agents` label and the spec hash, so pass it sorted by id.
    */
   agents: AgentDefinition[];
   /**
    * `config.instanceId()` — the install this container belongs to. It becomes the
    * `porterclaude.instance` label and is what keeps a second PorterClaude on the same engine
-   * from listing/adopting this container (sessions/service.ts). Labels are NOT part of the
+   * from listing/adopting this container (containers/service.ts). Labels are NOT part of the
    * spec hash, so adding it never makes an existing container report `needsRecreate`.
    */
   instanceId: string;
@@ -49,7 +49,7 @@ export interface BuildSpecInput {
   /**
    * The Cmd the resolved image declares (`ImageInspect.cmd`). It MUST be passed through
    * explicitly: the engine only inherits the image Cmd when the create request leaves the
-   * Entrypoint unset (moby `merge()`), and v0.2 sets an Entrypoint on every session — so
+   * Entrypoint unset (moby `merge()`), and v0.2 sets an Entrypoint on every container — so
    * without this a recipe container comes up with Cmd=null and the php recipe never starts
    * supervisord (measured by O1, docs/design/requests/v2-O1.md 1).
    * When recomputing the spec of an EXISTING container pass its own `ContainerInspect.cmd`
@@ -59,7 +59,7 @@ export interface BuildSpecInput {
 }
 
 /** pidsLimit applied to every managed container. */
-export const SESSION_PIDS_LIMIT = 4096;
+export const CONTAINER_PIDS_LIMIT = 4096;
 
 /** `general.containerHome` without a trailing slash (`/home/dev` by default). */
 export function containerHomeFor(general: GeneralConfig): string {
@@ -103,8 +103,8 @@ export function toolsPathPrefix(general: GeneralConfig): string[] {
 
 /**
  * `<toolsMount>/bin:<home>/.local/bin:<image PATH>` - the container-level PATH of a custom
- * image session. Every `docker exec` inherits the container env, so this is what makes
- * `claude` resolvable in a terminal even when the session user cannot write any rc file
+ * image container. Every `docker exec` inherits the container env, so this is what makes
+ * `claude` resolvable in a session even when the container user cannot write any rc file
  * (docker creates the mountpoint parent `<containerHome>` as root:root, so a non-root
  * image cannot persist PATH in `$HOME/.profile`; see backend.md section 7).
  */
@@ -119,7 +119,7 @@ export function composeToolsPath(general: GeneralConfig, imagePath?: string | nu
 
 /**
  * Inverse of composeToolsPath: recover the image's own PATH from the env of a container we
- * created. Needed so that recomputing the spec hash of a running session (SessionView
+ * created. Needed so that recomputing the spec hash of a running container (ContainerView
  * .needsRecreate) yields the value the container was created with instead of flapping
  * whenever the image PATH is unknown.
  */
@@ -134,9 +134,9 @@ export function imagePathFromEnv(env: string[] | undefined, general: GeneralConf
 
 /**
  * Contract (docs/design/backend.md v0.2 §7 "Container layout"):
- *   name        <containerPrefix><session>            e.g. pc-web
+ *   name        <containerPrefix><container>            e.g. pc-web
  *   labels      porterclaude.managed=true
- *               porterclaude.session=<slug>
+ *               porterclaude.container=<slug>
  *               porterclaude.host=<hostId>                        (v0.2)
  *               porterclaude.instance=<config.instanceId>         (v0.2)
  *               porterclaude.agents=<id,id,...>                   (v0.2)
@@ -149,15 +149,15 @@ export function imagePathFromEnv(env: string[] | undefined, general: GeneralConf
  *               <volumePrefix>hist-<slug>[-<agentId>]
  *                                           -> agentHistoryTarget(agent)  (shareHistory=false)
  *               workspace                   -> <workspaceMount>       (bind or volume)
- *               <toolsVolume> (ro)          -> <toolsMount>           (EVERY session in v0.2)
+ *               <toolsVolume> (ro)          -> <toolsMount>           (EVERY container in v0.2)
  *               ...extraMounts
  *   env         PORTERCLAUDE_SESSION=<slug>, PORTERCLAUDE_HOST=<hostId>, TERM=xterm-256color,
  *               PORTERCLAUDE_TOOLS=<toolsMount>, PORTERCLAUDE_HOME=<containerHome>,
  *               HOME=<containerHome>,
  *               PATH=<toolsMount>/bin:<containerHome>/.local/bin:<image PATH>,
  *               PORTERCLAUDE_AGENT_IDS=<id,id>, PORTERCLAUDE_AGENT_LINKS=<target|source|kind;...>,
- *               <agent.env>..., ...session.env
- *   entrypoint  ["<toolsMount>/entrypoint.sh"]        for EVERY session (v0.2)
+ *               <agent.env>..., ...container.env
+ *   entrypoint  ["<toolsMount>/entrypoint.sh"]        for EVERY container (v0.2)
  *   cmd         ["sleep","infinity"] for custom images; recipes get the image's OWN CMD
  *               passed back explicitly, so the php recipe still starts supervisord behind
  *               the bootstrap (and ["sleep","infinity"] when the image declares none)
@@ -179,17 +179,17 @@ export function imagePathFromEnv(env: string[] | undefined, general: GeneralConf
  * before the bootstrap runs.
  *
  * The ownership/symlink repairs that make this layout work inside a running container live
- * in sessions/service.ts (`ensureAgentDirs`, run as uid 0 after every start).
+ * in containers/service.ts (`ensureAgentDirs`, run as uid 0 after every start).
  */
 export function buildContainerSpec(input: BuildSpecInput): CreateContainerSpec {
-  const { session, general, resolvedImage, imageType, agents } = input;
+  const { container, general, resolvedImage, imageType, agents } = input;
   const home = containerHomeFor(general);
   const toolsMount = toolsMountFor(general);
 
   const mounts: MountSpec[] = [];
 
   // One auth volume per agent, mounted at the agent dir. Its private-history overlay (when
-  // the session does not share history) is nested INSIDE that mount on purpose.
+  // the container does not share history) is nested INSIDE that mount on purpose.
   for (const agent of agents) {
     mounts.push({
       type: 'volume',
@@ -197,12 +197,12 @@ export function buildContainerSpec(input: BuildSpecInput): CreateContainerSpec {
       target: agentDataDir(home, agent.id),
       readOnly: false,
     });
-    if (!session.shareHistory) {
+    if (!container.shareHistory) {
       const historyTarget = agentHistoryTarget(agent, home);
       if (historyTarget) {
         mounts.push({
           type: 'volume',
-          source: historyVolumeFor(general.volumePrefix, session.name, agent.id),
+          source: historyVolumeFor(general.volumePrefix, container.name, agent.id),
           target: historyTarget,
           readOnly: false,
         });
@@ -210,77 +210,77 @@ export function buildContainerSpec(input: BuildSpecInput): CreateContainerSpec {
     }
   }
 
-  mounts.push(workspaceMountFor(session, general));
+  mounts.push(workspaceMountFor(container, general));
 
-  // v0.2: the tools volume is mounted into EVERY session (it carries the agents now).
+  // v0.2: the tools volume is mounted into EVERY container (it carries the agents now).
   mounts.push({ type: 'volume', source: general.toolsVolume, target: toolsMount, readOnly: true });
 
-  for (const m of session.extraMounts) {
+  for (const m of container.extraMounts) {
     mounts.push({ type: m.type, source: m.source, target: m.target, readOnly: m.readOnly });
   }
 
   const links = agents.flatMap((agent) => agentLinks(agent, home));
 
   const env: Record<string, string> = {
-    PORTERCLAUDE_SESSION: session.name,
-    PORTERCLAUDE_HOST: session.hostId,
+    PORTERCLAUDE_SESSION: container.name,
+    PORTERCLAUDE_HOST: container.hostId,
     TERM: 'xterm-256color',
     PORTERCLAUDE_TOOLS: toolsMount,
     PORTERCLAUDE_HOME: home,
     // Pin PATH: `docker exec` inherits the CONTAINER env, not whatever the entrypoint
     // exported, and a non-root image cannot persist PATH in an rc file (docker creates
-    // <containerHome> as root:root). Without this a terminal cannot find the agents.
+    // <containerHome> as root:root). Without this a session cannot find the agents.
     PATH: composeToolsPath(general, input.imageEnvPath),
     // Pin HOME: docker would otherwise use the image's HOME (/root for root images) and the
     // agents would write their credentials outside the shared auth volumes.
     HOME: home,
-    [SESSION_AGENTS_ENV]: agents.map((a) => a.id).join(','),
-    [SESSION_AGENT_LINKS_ENV]: encodeAgentLinks(links),
+    [CONTAINER_AGENTS_ENV]: agents.map((a) => a.id).join(','),
+    [CONTAINER_AGENT_LINKS_ENV]: encodeAgentLinks(links),
   };
   // agent-declared env first, the user's own env always wins
   for (const agent of agents) for (const [k, v] of Object.entries(agent.env)) env[k] = v;
-  for (const [k, v] of Object.entries(session.env)) env[k] = v;
+  for (const [k, v] of Object.entries(container.env)) env[k] = v;
 
   const labels: Record<string, string> = {
     [CONTAINER_LABELS.managed]: 'true',
-    [CONTAINER_LABELS.session]: session.name,
-    [CONTAINER_LABELS.host]: session.hostId,
+    [CONTAINER_LABELS.container]: container.name,
+    [CONTAINER_LABELS.host]: container.hostId,
     [CONTAINER_LABELS.instance]: input.instanceId,
     [CONTAINER_LABELS.agents]: agents.map((a) => a.id).join(','),
     [CONTAINER_LABELS.imageType]: imageType,
-    [CONTAINER_LABELS.createdAt]: session.createdAt,
+    [CONTAINER_LABELS.createdAt]: container.createdAt,
   };
-  if (session.image.type === 'recipe') labels[CONTAINER_LABELS.recipe] = session.image.recipe;
+  if (container.image.type === 'recipe') labels[CONTAINER_LABELS.recipe] = container.image.recipe;
 
-  const ports: PortMapSpec[] = session.ports.map((p) => ({
+  const ports: PortMapSpec[] = container.ports.map((p) => ({
     containerPort: p.containerPort,
     ...(p.hostPort === undefined ? {} : { hostPort: p.hostPort }),
     protocol: p.protocol,
     ...(p.hostIp === undefined ? {} : { hostIp: p.hostIp }),
   }));
 
-  const network = session.network ?? general.sessionNetwork;
+  const network = container.network ?? general.sessionNetwork;
 
   const spec: CreateContainerSpec = {
-    name: containerName(general, session),
+    name: containerName(general, container),
     image: resolvedImage,
     env,
     labels,
     workingDir: general.workspaceMount,
-    hostname: session.name,
+    hostname: container.name,
     tty: false,
     openStdin: false,
     init: true,
     mounts,
     ports,
-    restartPolicy: session.autoStart ? 'unless-stopped' : 'no',
+    restartPolicy: container.autoStart ? 'unless-stopped' : 'no',
     resources: {
-      ...(session.limits.cpus === undefined ? {} : { cpus: session.limits.cpus }),
-      ...(session.limits.memoryMb === undefined ? {} : { memoryMb: session.limits.memoryMb }),
-      pidsLimit: SESSION_PIDS_LIMIT,
+      ...(container.limits.cpus === undefined ? {} : { cpus: container.limits.cpus }),
+      ...(container.limits.memoryMb === undefined ? {} : { memoryMb: container.limits.memoryMb }),
+      pidsLimit: CONTAINER_PIDS_LIMIT,
     },
     entrypoint: [`${toolsMount}/entrypoint.sh`],
-    ...(session.user ? { user: session.user } : {}),
+    ...(container.user ? { user: container.user } : {}),
     ...(network ? { networks: [network] } : {}),
   };
 
@@ -296,8 +296,8 @@ export function buildContainerSpec(input: BuildSpecInput): CreateContainerSpec {
   return spec;
 }
 
-function containerName(general: GeneralConfig, session: SessionConfig): string {
-  return `${general.containerPrefix}${session.name}`;
+function containerName(general: GeneralConfig, container: ContainerConfig): string {
+  return `${general.containerPrefix}${container.name}`;
 }
 
 /** `/a/b/` -> `/a/b`, `//` -> `/`. */
@@ -335,10 +335,10 @@ export function resolveWorkspaceHostPath(hostPath: string, workspacesRoot: strin
   return resolved;
 }
 
-/** The workspace mount for a session (creating the volume is the service's job). */
-export function workspaceMountFor(session: SessionConfig, general: GeneralConfig): MountSpec {
+/** The workspace mount for a container (creating the volume is the service's job). */
+export function workspaceMountFor(container: ContainerConfig, general: GeneralConfig): MountSpec {
   const target = general.workspaceMount;
-  const ws = session.workspace;
+  const ws = container.workspace;
   if (ws.type === 'bind') {
     return {
       type: 'bind',
@@ -347,14 +347,14 @@ export function workspaceMountFor(session: SessionConfig, general: GeneralConfig
       readOnly: false,
     };
   }
-  const volume = ws.volume ?? workspaceVolumeFor(general.volumePrefix, session.name);
+  const volume = ws.volume ?? workspaceVolumeFor(general.volumePrefix, container.name);
   return { type: 'volume', source: volume, target, readOnly: false };
 }
 
 /**
  * Stable sha256 over the fields that require a container recreate (image, mounts, env,
  * ports, limits, user, network, shareHistory). Stored in the porterclaude.spec-hash label;
- * SessionView.needsRecreate compares the stored config's hash with the container's label.
+ * ContainerView.needsRecreate compares the stored config's hash with the container's label.
  *
  * Labels are deliberately NOT part of the hash: they carry the hash itself plus the
  * creation timestamp, neither of which should trigger a recreate.

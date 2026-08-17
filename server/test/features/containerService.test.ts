@@ -3,10 +3,10 @@
 // volumes, the porterclaude.host/agents labels and the multi-host list.
 import { describe, expect, it, vi } from 'vitest';
 import { AppError, DockerApiError } from '../../src/http/errors.js';
-import { CONTAINER_LABELS, SessionConfigSchema, SessionInputSchema } from '../../src/sessions/model.js';
+import { CONTAINER_LABELS, SessionConfigSchema, SessionInputSchema } from '../../src/containers/model.js';
 import type { ContainerInspect } from '../../src/backends/types.js';
-import { buildContainerSpec } from '../../src/sessions/container.js';
-import { SessionService } from '../../src/sessions/service.js';
+import { buildContainerSpec } from '../../src/containers/container.js';
+import { SessionService } from '../../src/containers/service.js';
 import { BUILTIN_AGENTS } from '../../src/agents/builtin.js';
 import {
   containerSummary,

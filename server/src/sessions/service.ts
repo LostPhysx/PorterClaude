@@ -1,6 +1,6 @@
-// OWNER: B2. Turns "session + shell" into a live ExecStream. No websocket knowledge here.
+// OWNER: B2. Turns "container + shell" into a live ExecStream. No websocket knowledge here.
 //
-// v0.2: everything is resolved through the SESSION'S host (`requireRunningContainer` returns
+// v0.2: everything is resolved through the CONTAINER'S host (`requireRunningContainer` returns
 // the hostId), and `shell:'agent'` runs an agent the CONTAINER really mounts - the agent set
 // of the running container (`porterclaude.agents` / PORTERCLAUDE_AGENT_IDS), NOT the
 // configured `agents ?? host.agents.enabled`, which drifts as soon as an agent is enabled on
@@ -10,32 +10,33 @@
 import type { ServiceDeps } from '../context.js';
 import type { DockerBackend, ExecStream } from '../backends/types.js';
 import type { GeneralConfig } from '../config/schema.js';
-import type { SessionService } from '../sessions/service.js';
-import { composeToolsPath } from '../sessions/container.js';
+import type { ContainerService } from '../containers/service.js';
+import { composeToolsPath } from '../containers/container.js';
 import type { AgentDefinition } from '../agents/model.js';
 import { agentCommandLine } from '../agents/model.js';
 import { toAppError } from '../http/errors.js';
 import { shortId } from '../util/ids.js';
 import { shQuote, tmuxSessionName } from '../util/slug.js';
-import type { TerminalShell } from './protocol.js';
-import { TerminalRefusal } from './protocol.js';
+import type { SessionShell } from './protocol.js';
+import { SessionRefusal } from './protocol.js';
 
-export interface OpenTerminalInput {
-  session: string;
-  shell: TerminalShell;
-  /** required exactly when `shell === 'agent'` (terminals/protocol.ts parseTerminalShell) */
+export interface OpenSessionInput {
+  /** the container this session opens a shell in */
+  container: string;
+  shell: SessionShell;
+  /** required exactly when `shell === 'agent'` (sessions/protocol.ts parseSessionShell) */
   agentId?: string | null;
   /** stable pane name -> tmux session pc_<name> */
-  name: string;
+  session: string;
   cols: number;
   rows: number;
 }
 
-export interface OpenTerminalResult {
-  terminalId: string;
+export interface OpenSessionResult {
+  sessionId: string;
   stream: ExecStream;
   containerId: string;
-  /** the host the session runs on (goes into the `ready` frame) */
+  /** the host the container runs on (goes into the `ready` frame) */
   hostId: string;
   /** the agent this pane started, null for a plain shell */
   agentId: string | null;
@@ -45,7 +46,7 @@ export interface OpenTerminalResult {
 
 /**
  * The half of ImageService this service needs: what the host's TOOLS VOLUME says about an
- * agent. Kept as a narrow interface so terminals do not depend on the whole image service
+ * agent. Kept as a narrow interface so sessions do not depend on the whole image service
  * (and so a test can hand in a stub). See ImageService.agentInstallState.
  */
 export interface AgentInstallProbe {
@@ -65,31 +66,31 @@ interface PathEntry {
   at: number;
 }
 
-export class TerminalService {
+export class SessionService {
   private readonly probes = new Map<string, ProbeEntry>();
   private readonly paths = new Map<string, PathEntry>();
   private readonly streams = new Map<string, ExecStream>();
 
   constructor(
     private readonly deps: ServiceDeps,
-    private readonly sessions: SessionService,
+    private readonly containers: ContainerService,
     /** optional: without it the tools-volume gate below is simply not applied */
     private readonly images?: AgentInstallProbe,
   ) {}
 
   /**
-   * 1. sessions.requireRunningContainer(session)
+   * 1. containers.requireRunningContainer(container)
    * 2. hasTmux(containerId) (cached ~60s per container id)
-   * 3. build the command (see buildTerminalCommand)
+   * 3. build the command (see buildSessionCommand)
    * 4. backend.execCreate(tty + stdin, TERM/COLORTERM/LANG, workingDir /workspace)
    * 5. backend.execStart(execId, { tty: true, stdin: true })
    * 6. best-effort backend.execResize(execId, {cols, rows}) right after start
    */
-  async open(input: OpenTerminalInput): Promise<OpenTerminalResult> {
-    // a stored session whose host is gone/unsupported is a 4411, not a 404 of the session
-    this.assertHostUsable(input.session);
-    const { containerId, config, hostId, containerAgents } = await this.sessions.requireRunningContainer(
-      input.session,
+  async open(input: OpenSessionInput): Promise<OpenSessionResult> {
+    // a stored container whose host is gone/unsupported is a 4411, not a 404 of the container
+    this.assertHostUsable(input.container);
+    const { containerId, config, hostId, containerAgents } = await this.containers.requireRunningContainer(
+      input.container,
     );
     const general = this.deps.hosts.settingsFor(hostId);
     const backend = this.backendFor(hostId);
@@ -100,31 +101,31 @@ export class TerminalService {
     let agentId: string | null = null;
     if (input.shell === 'agent') {
       const def = this.requireMountedAgent(input, config, containerAgents);
-      await this.requireSyncedAgent(hostId, def.id, input.session);
+      await this.requireSyncedAgent(hostId, def.id, input.container);
       agentId = def.id;
       agentCommand = agentCommandLine(def);
     }
 
     const tmux = await this.hasTmux(backend, containerId);
-    const reattached = tmux ? await this.tmuxSessionExists(backend, containerId, input.name) : false;
+    const reattached = tmux ? await this.tmuxSessionExists(backend, containerId, input.session) : false;
     // bash matters with AND without tmux: the tools entrypoint installs tmux into images
     // that have no bash at all (alpine), where `tmux new-session ... bash -l` dies instantly.
     const hasBash = await this.hasBash(backend, containerId);
 
     // v0.2 delivers the agents through the tools volume for RECIPES TOO, so the tools PATH is
-    // composed for every session. The exec inherits the CONTAINER env (buildContainerSpec
+    // composed for every container. The exec inherits the CONTAINER env (buildContainerSpec
     // pins PATH there), but a container created before that - or one whose /etc/profile
     // resets PATH, which Debian's does - would still not find the agents, and a non-root
     // image cannot persist PATH in an rc file it may not write. So the exec gets the tools
     // PATH explicitly AND the command re-exports it after the login shell sourced its
     // profiles. The re-export carries the WHOLE composed PATH, tools prefix *and* the image's
     // own entries (/usr/local/go/bin & co): /etc/profile replaces PATH wholesale, so re-adding
-    // only the tools dirs would leave a golang or rust session without its toolchain (OPS-7).
+    // only the tools dirs would leave a golang or rust container without its toolchain (OPS-7).
     const toolsPath = await this.toolsPath(backend, containerId, general);
 
-    const cmd = buildTerminalCommand({
+    const cmd = buildSessionCommand({
       shell: input.shell,
-      name: input.name,
+      name: input.session,
       tmux,
       hasBash,
       ...(agentCommand ? { agentCommand } : {}),
@@ -156,35 +157,35 @@ export class TerminalService {
       this.deps.log.debug({ err, execId }, 'initial exec resize failed (ignored)');
     }
 
-    const terminalId = shortId(8);
-    this.register(terminalId, stream);
+    const sessionId = shortId(8);
+    this.register(sessionId, stream);
     this.deps.log.info(
       {
-        terminalId,
-        session: input.session,
+        sessionId,
+        container: input.container,
         hostId,
         shell: input.shell,
         agentId,
-        name: input.name,
+        session: input.session,
         tmux,
         reattached,
       },
-      'terminal opened',
+      'session opened',
     );
-    return { terminalId, stream, containerId, hostId, agentId, tmux, reattached };
+    return { sessionId, stream, containerId, hostId, agentId, tmux, reattached };
   }
 
   /**
-   * A session pinned to a host that no longer exists (deleted with force=1) or to a
-   * connection type this version cannot talk to (tcp/ssh) can never get a terminal - both
-   * are `host_unavailable` (close 4411), a terminal condition the client must not retry.
+   * A container pinned to a host that no longer exists (deleted with force=1) or to a
+   * connection type this version cannot talk to (tcp/ssh) can never get a session - both
+   * are `host_unavailable` (close 4411), a condition the client must not retry.
    */
-  private assertHostUsable(session: string): void {
-    const stored = this.deps.config.getSession(session);
-    if (!stored) return; // orphan container: the session service finds its host by scanning
+  private assertHostUsable(container: string): void {
+    const stored = this.deps.config.getContainer(container);
+    if (!stored) return; // orphan container: the container service finds its host by scanning
     if (!this.deps.hosts.get(stored.hostId)) {
-      throw TerminalRefusal.hostUnavailable(
-        `the host '${stored.hostId}' of session '${session}' no longer exists`,
+      throw SessionRefusal.hostUnavailable(
+        `the host '${stored.hostId}' of container '${container}' no longer exists`,
       );
     }
     this.backendFor(stored.hostId);
@@ -206,7 +207,7 @@ export class TerminalService {
    * being launched with a guessed argv.
    */
   private requireMountedAgent(
-    input: OpenTerminalInput,
+    input: OpenSessionInput,
     config: { name: string; hostId: string; agents: string[] | null },
     containerAgents: string[] | null,
   ): AgentDefinition {
@@ -216,18 +217,18 @@ export class TerminalService {
     const configured = this.resolveAgents(config);
     const mounted = containerAgents ?? configured.map((a) => a.id);
     const hint =
-      'enable it on the host, sync the tools volume and recreate the session';
+      'enable it on the host, sync the tools volume and recreate the container';
     if (!mounted.includes(wanted)) {
       const available = mounted.join(', ') || 'none';
-      throw TerminalRefusal.agentNotAvailable(
-        `agent '${wanted}' is not available in session '${input.session}' (mounted: ${available}); ` +
+      throw SessionRefusal.agentNotAvailable(
+        `agent '${wanted}' is not available in container '${input.container}' (mounted: ${available}); ` +
           hint,
       );
     }
     const def = configured.find((a) => a.id === wanted) ?? this.deps.agents.get(wanted);
     if (!def) {
-      throw TerminalRefusal.agentNotAvailable(
-        `agent '${wanted}' is mounted into session '${input.session}' but no longer defined; ` +
+      throw SessionRefusal.agentNotAvailable(
+        `agent '${wanted}' is mounted into container '${input.container}' but no longer defined; ` +
           're-create it under Agents or pick another pane',
       );
     }
@@ -236,7 +237,7 @@ export class TerminalService {
 
   /**
    * Second half of the `agent:<id>` gate: the container may MOUNT the agent (it was enabled
-   * when the session was created) while the host's tools volume never received it, because
+   * when the container was created) while the host's tools volume never received it, because
    * enabling an agent does not install it - that needs a tools sync. There is no shim on the
    * PATH in that case, so answering `ready` hands the user a pane that dies with
    * `bash: <cmd>: command not found`. `agent_not_available` (4410) with the fix in the message
@@ -246,7 +247,7 @@ export class TerminalService {
    * image not built, or a pre-v0.2 volume that carries no AGENTS.json) must never block a
    * pane that would work.
    */
-  private async requireSyncedAgent(hostId: string, agentId: string, session: string): Promise<void> {
+  private async requireSyncedAgent(hostId: string, agentId: string, container: string): Promise<void> {
     if (!this.images) return;
     let state: 'installed' | 'missing' | 'unknown';
     try {
@@ -256,34 +257,34 @@ export class TerminalService {
       return; // never refuse because the probe itself broke
     }
     if (state !== 'missing') return;
-    throw TerminalRefusal.agentNotAvailable(
-      `agent '${agentId}' is enabled for session '${session}' but not installed in the tools ` +
+    throw SessionRefusal.agentNotAvailable(
+      `agent '${agentId}' is enabled for container '${container}' but not installed in the tools ` +
         `volume of host '${hostId}'; run the tools sync (Settings -> Images -> Sync tools volume) ` +
         'and open the pane again',
     );
   }
 
-  /** the agents a session is CONFIGURED for; a dangling host is a 4411, never a crash. */
+  /** the agents a container is CONFIGURED for; a dangling host is a 4411, never a crash. */
   private resolveAgents(config: { name: string; hostId: string; agents: string[] | null }): AgentDefinition[] {
     try {
-      return this.sessions.resolveAgents(config);
+      return this.containers.resolveAgents(config);
     } catch (err) {
-      throw TerminalRefusal.hostUnavailable(
-        `the host '${config.hostId}' of session '${config.name}' is unavailable: ${
+      throw SessionRefusal.hostUnavailable(
+        `the host '${config.hostId}' of container '${config.name}' is unavailable: ${
           err instanceof Error ? err.message : String(err)
         }`,
       );
     }
   }
 
-  /** the session host's transport; an unknown/unsupported host becomes a 4411. */
+  /** the container host's transport; an unknown/unsupported host becomes a 4411. */
   private backendFor(hostId: string): DockerBackend {
     try {
       return this.deps.hosts.backendFor(hostId);
     } catch (err) {
       const appErr = toAppError(err);
       if (appErr.code === 'not_implemented' || appErr.code === 'not_found') {
-        throw TerminalRefusal.hostUnavailable(appErr.message);
+        throw SessionRefusal.hostUnavailable(appErr.message);
       }
       throw err;
     }
@@ -295,9 +296,9 @@ export class TerminalService {
   }
 
   /**
-   * `<toolsMount>/bin:<home>/.local/bin:<container PATH>` of a session container, cached
-   * like the capability probes. Reading the live container PATH keeps whatever the image put
-   * there instead of replacing it with a guess.
+   * `<toolsMount>/bin:<home>/.local/bin:<container PATH>` of a container, cached like the
+   * capability probes. Reading the live container PATH keeps whatever the image put there
+   * instead of replacing it with a guess.
    */
   async toolsPath(backend: DockerBackend, containerId: string, general: GeneralConfig): Promise<string> {
     const cached = this.paths.get(containerId);
@@ -325,9 +326,9 @@ export class TerminalService {
   async tmuxSessionExists(
     backend: DockerBackend,
     containerId: string,
-    terminalName: string,
+    sessionName: string,
   ): Promise<boolean> {
-    const target = shQuote(tmuxSessionName(terminalName));
+    const target = shQuote(tmuxSessionName(sessionName));
     try {
       const res = await backend.runExec(
         containerId,
@@ -347,37 +348,37 @@ export class TerminalService {
    * Without this a closed pane leaves a detached tmux session (and whatever ran in it)
    * alive in the container until it is restarted, and nothing in the UI can reach it any
    * more. Called ONLY on an explicit close (a `kill` message or close code 4001), never on
-   * a reload or a dropped connection — those must keep the session so the next connect
+   * a reload or a dropped connection — those must keep the tmux session so the next connect
    * re-attaches.
    *
    * Best effort by construction: it is called while the socket is going away, so a stopped
    * container, a missing tmux or a dead backend is logged and swallowed. Never throws.
    */
-  async killTmuxSession(session: string, terminalName: string): Promise<boolean> {
-    const target = shQuote(tmuxSessionName(terminalName));
+  async killTmuxSession(container: string, sessionName: string): Promise<boolean> {
+    const target = shQuote(tmuxSessionName(sessionName));
     try {
-      const { containerId, hostId } = await this.sessions.requireRunningContainer(session);
+      const { containerId, hostId } = await this.containers.requireRunningContainer(container);
       const backend = this.deps.hosts.backendFor(hostId);
       const res = await backend.runExec(
         containerId,
         ['sh', '-lc', `tmux kill-session -t ${target} >/dev/null 2>&1 || true`],
         { timeoutMs: 10_000 },
       );
-      this.deps.log.info({ session, name: terminalName, exitCode: res.exitCode }, 'tmux session killed');
+      this.deps.log.info({ container, session: sessionName, exitCode: res.exitCode }, 'tmux session killed');
       return res.exitCode === 0;
     } catch (err) {
-      this.deps.log.debug({ err, session, name: terminalName }, 'killing the tmux session failed (ignored)');
+      this.deps.log.debug({ err, container, session: sessionName }, 'killing the tmux session failed (ignored)');
       return false;
     }
   }
 
   /** Track open streams so shutdown can close them. */
-  register(terminalId: string, stream: ExecStream): void {
-    this.streams.set(terminalId, stream);
+  register(sessionId: string, stream: ExecStream): void {
+    this.streams.set(sessionId, stream);
   }
 
-  unregister(terminalId: string): void {
-    this.streams.delete(terminalId);
+  unregister(sessionId: string): void {
+    this.streams.delete(sessionId);
   }
 
   count(): number {
@@ -389,7 +390,7 @@ export class TerminalService {
       try {
         stream.close();
       } catch (err) {
-        this.deps.log.debug({ err, terminalId: id }, 'closing terminal stream failed');
+        this.deps.log.debug({ err, sessionId: id }, 'closing session stream failed');
       }
     }
     this.streams.clear();
@@ -441,14 +442,15 @@ export class TerminalService {
  * user-supplied pane name can never break out of the `sh -lc` string.
  *
  * `pathPrefix` (`<toolsMount>/bin`, `<containerHome>/.local/bin` and the image's own PATH
- * entries; v0.2 composes it for every session) is re-exported INSIDE the `sh -lc` command,
+ * entries; v0.2 composes it for every container) is re-exported INSIDE the `sh -lc` command,
  * i.e. after the login
  * shell sourced /etc/profile - which on Debian & co unconditionally overwrites PATH and would
  * otherwise hide both the claude binaries of the tools volume and the image's toolchain
  * (/usr/local/go/bin & co) from an image that cannot persist an rc file.
  */
-export function buildTerminalCommand(opts: {
-  shell: TerminalShell;
+export function buildSessionCommand(opts: {
+  shell: SessionShell;
+  /** the pane name, i.e. the session name: it becomes the tmux session pc_<name> */
   name: string;
   tmux: boolean;
   hasBash: boolean;

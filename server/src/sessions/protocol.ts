@@ -1,11 +1,11 @@
-// FROZEN (planner-authored). THE terminal websocket wire protocol. The web topic mirrors
+// FROZEN (planner-authored). THE session websocket wire protocol. The web topic mirrors
 // these shapes; changing anything here breaks the frontend. See docs/design/api.md.
 //
-//   URL:  /api/terminals?session=<slug>&shell=bash|sh|agent:<agentId>&name=<terminal>&cols=<n>&rows=<n>
+//   URL:  /api/sessions?container=<slug>&shell=bash|sh|agent:<agentId>&session=<name>&cols=<n>&rows=<n>
 //         (v0.1 `shell=claude` is still accepted and means `agent:claude`)
-//   The host is NOT part of the query: session names are unique across hosts and the server
-//   routes session -> host -> backend.
-//   Auth: the pc_session cookie (browsers send it automatically on same-origin WS).
+//   The host is NOT part of the query: container names are unique across hosts and the server
+//   routes container -> host -> backend.
+//   Auth: the pc_auth cookie (browsers send it automatically on same-origin WS).
 //
 //   Client -> server
 //     binary frame : raw stdin bytes (what the user typed) -- NOT wrapped in JSON
@@ -21,20 +21,21 @@ import type { ErrorCode } from '../http/errors.js';
 
 /**
  * What a pane runs. v0.2 replaced the hard-wired `claude` row with `agent`, which carries
- * the agent id separately (`TerminalQuery.agentId`) — the wire value is `agent:<agentId>`.
+ * the agent id separately (`SessionQuery.agentId`) — the wire value is `agent:<agentId>`.
  */
-export type TerminalShell = 'bash' | 'sh' | 'agent';
+export type SessionShell = 'bash' | 'sh' | 'agent';
 
 /** the raw `shell` query value, e.g. 'bash' | 'sh' | 'agent:claude' | 'claude' (legacy) */
-export type TerminalShellParam = string;
+export type SessionShellParam = string;
 
-export interface TerminalQuery {
-  session: string;
-  shell: TerminalShell;
+export interface SessionQuery {
+  /** the container this session opens a shell in */
+  container: string;
+  shell: SessionShell;
   /** set exactly when `shell === 'agent'` */
   agentId: string | null;
   /** stable per-pane name; drives the tmux session name, so reconnecting reattaches */
-  name: string;
+  session: string;
   cols?: number;
   rows?: number;
 }
@@ -50,17 +51,17 @@ const AGENT_SHELL_RE = /^agent:([a-z0-9][a-z0-9-]{0,31})$/;
  *   'agent:claude'  -> { shell: 'agent', agentId: 'claude' }
  *   'claude'        -> { shell: 'agent', agentId: 'claude' }   (v0.1 alias, deprecated)
  */
-export function parseTerminalShell(
-  raw: TerminalShellParam,
-): { shell: TerminalShell; agentId: string | null } | null {
+export function parseSessionShell(
+  raw: SessionShellParam,
+): { shell: SessionShell; agentId: string | null } | null {
   if (raw === 'bash' || raw === 'sh') return { shell: raw, agentId: null };
   if (raw === 'claude') return { shell: 'agent', agentId: 'claude' };
   const match = AGENT_SHELL_RE.exec(raw);
   return match ? { shell: 'agent', agentId: match[1] as string } : null;
 }
 
-/** Inverse of parseTerminalShell — what the UI puts into the query. */
-export function formatTerminalShell(shell: TerminalShell, agentId?: string | null): TerminalShellParam {
+/** Inverse of parseSessionShell — what the UI puts into the query. */
+export function formatSessionShell(shell: SessionShell, agentId?: string | null): SessionShellParam {
   return shell === 'agent' ? `agent:${agentId ?? ''}` : shell;
 }
 
@@ -80,14 +81,16 @@ export type ClientMessage =
 export type ServerMessage =
   | {
       type: 'ready';
-      terminalId: string;
-      session: string;
-      /** the host the session runs on (v0.2) */
+      sessionId: string;
+      /** the container this session runs in */
+      container: string;
+      /** the host the container runs on (v0.2) */
       hostId: string;
-      shell: TerminalShell;
+      shell: SessionShell;
       /** the agent this pane started, null for a plain shell (v0.2) */
       agentId: string | null;
-      name: string;
+      /** the pane name (= this session's name) */
+      session: string;
       /** false => no tmux in the image: output is not reconnect-safe (UI shows a warning) */
       tmux: boolean;
       /** true => an existing tmux session was reattached */
@@ -96,79 +99,79 @@ export type ServerMessage =
       rows: number;
     }
   | { type: 'info'; message: string }
-  | { type: 'error'; code: TerminalErrorCode; message: string }
+  | { type: 'error'; code: SessionErrorCode; message: string }
   | { type: 'exit'; code: number | null }
   | { type: 'pong' };
 
-export type TerminalErrorCode =
+export type SessionErrorCode =
   | 'unauthorized'
   | 'bad_request'
-  | 'session_not_found'
-  | 'session_not_running'
-  /** the requested agent is unknown, or not mounted into this session (v0.2) */
+  | 'container_not_found'
+  | 'container_not_running'
+  /** the requested agent is unknown, or not mounted into this container (v0.2) */
   | 'agent_not_available'
-  /** the session's host is gone or its connection type is not supported (v0.2) */
+  /** the container's host is gone or its connection type is not supported (v0.2) */
   | 'host_unavailable'
   | 'backend_error'
   | 'exec_failed'
   | 'internal';
 
 /** WebSocket close codes used by the server (4xxx = application range). */
-export const TERMINAL_CLOSE = {
+export const SESSION_CLOSE = {
   normal: 1000,
   /** client -> server: the user closed the pane; equivalent to a `kill` message (the
    *  browser cannot always send one before it closes the socket) */
   paneClosed: 4001,
   unauthorized: 4401,
   badRequest: 4400,
-  sessionNotFound: 4404,
-  sessionNotRunning: 4409,
-  /** v0.2: the requested agent is not available in this session (do not auto-reconnect) */
+  containerNotFound: 4404,
+  containerNotRunning: 4409,
+  /** v0.2: the requested agent is not available in this container (do not auto-reconnect) */
   agentNotAvailable: 4410,
-  /** v0.2: the session's host is unusable (missing host, unsupported connection) */
+  /** v0.2: the container's host is unusable (missing host, unsupported connection) */
   hostUnavailable: 4411,
   backendError: 4502,
   internal: 4500,
 } as const;
 
-export type TerminalCloseCode = (typeof TERMINAL_CLOSE)[keyof typeof TERMINAL_CLOSE];
+export type SessionCloseCode = (typeof SESSION_CLOSE)[keyof typeof SESSION_CLOSE];
 
 /** Server heartbeat: ws.ping() every 30s, terminate after 2 missed pongs. */
-export const TERMINAL_HEARTBEAT_MS = 30_000;
-export const TERMINAL_HEARTBEAT_TIMEOUT_MS = 70_000;
+export const SESSION_HEARTBEAT_MS = 30_000;
+export const SESSION_HEARTBEAT_TIMEOUT_MS = 70_000;
 
 /** Max buffered stdin bytes before the server drops the connection (backpressure guard). */
-export const TERMINAL_MAX_BUFFER_BYTES = 4 * 1024 * 1024;
+export const SESSION_MAX_BUFFER_BYTES = 4 * 1024 * 1024;
 
 /**
  * A refusal that carries its own wire code + close code (v0.2). `mapError` in ws.ts uses it
  * verbatim, which is how `agent_not_available` (4410) and `host_unavailable` (4411) reach the
  * client: both are conditions no AppError code can express (an unknown agent is not a 404 of
- * the session, and a dead host is not a broken backend — the client must not reconnect).
+ * the container, and a dead host is not a broken backend — the client must not reconnect).
  */
-export class TerminalRefusal extends AppError {
-  readonly terminalCode: TerminalErrorCode;
-  readonly closeCode: TerminalCloseCode;
+export class SessionRefusal extends AppError {
+  readonly sessionCode: SessionErrorCode;
+  readonly closeCode: SessionCloseCode;
 
   constructor(
-    terminalCode: TerminalErrorCode,
-    closeCode: TerminalCloseCode,
+    sessionCode: SessionErrorCode,
+    closeCode: SessionCloseCode,
     message: string,
     appCode: ErrorCode = 'conflict',
   ) {
     super(appCode, message);
-    this.name = 'TerminalRefusal';
-    this.terminalCode = terminalCode;
+    this.name = 'SessionRefusal';
+    this.sessionCode = sessionCode;
     this.closeCode = closeCode;
   }
 
-  /** the requested agent is unknown or not mounted into this session */
-  static agentNotAvailable(message: string): TerminalRefusal {
-    return new TerminalRefusal('agent_not_available', TERMINAL_CLOSE.agentNotAvailable, message, 'conflict');
+  /** the requested agent is unknown or not mounted into this container */
+  static agentNotAvailable(message: string): SessionRefusal {
+    return new SessionRefusal('agent_not_available', SESSION_CLOSE.agentNotAvailable, message, 'conflict');
   }
 
-  /** the session's host is gone, or its connection type is not supported by this version */
-  static hostUnavailable(message: string): TerminalRefusal {
-    return new TerminalRefusal('host_unavailable', TERMINAL_CLOSE.hostUnavailable, message, 'conflict');
+  /** the container's host is gone, or its connection type is not supported by this version */
+  static hostUnavailable(message: string): SessionRefusal {
+    return new SessionRefusal('host_unavailable', SESSION_CLOSE.hostUnavailable, message, 'conflict');
   }
 }

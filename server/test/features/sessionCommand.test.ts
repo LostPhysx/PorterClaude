@@ -2,9 +2,9 @@
 // agent resolution of TerminalService.open (an agent that is not mounted is refused).
 import { describe, expect, it } from 'vitest';
 import type { ContainerInspect } from '../../src/backends/types.js';
-import { SessionService } from '../../src/sessions/service.js';
-import { TerminalService, buildTerminalCommand } from '../../src/terminals/service.js';
-import { TERMINAL_CLOSE } from '../../src/terminals/protocol.js';
+import { SessionService } from '../../src/containers/service.js';
+import { TerminalService, buildTerminalCommand } from '../../src/sessions/service.js';
+import { TERMINAL_CLOSE } from '../../src/sessions/protocol.js';
 import { tmuxSessionName } from '../../src/util/slug.js';
 import {
   containerSummary,

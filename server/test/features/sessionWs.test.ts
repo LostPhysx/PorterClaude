@@ -7,8 +7,8 @@ import type { AddressInfo } from 'node:net';
 import { WebSocket } from 'ws';
 import type { AppContext } from '../../src/context.js';
 import { AppError } from '../../src/http/errors.js';
-import { TERMINAL_CLOSE, TerminalRefusal } from '../../src/terminals/protocol.js';
-import { attachTerminalWs, STOP_RECHECK } from '../../src/terminals/ws.js';
+import { TERMINAL_CLOSE, TerminalRefusal } from '../../src/sessions/protocol.js';
+import { attachTerminalWs, STOP_RECHECK } from '../../src/sessions/ws.js';
 import { silentLog, stubExecStream } from './helpers.js';
 
 const authState = vi.hoisted(() => ({ ok: true }));

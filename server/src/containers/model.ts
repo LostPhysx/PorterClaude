@@ -1,13 +1,13 @@
-// FROZEN (planner-authored, fully implemented). The session model is a cross-topic
-// contract: config store (B1), sessions service/routes (B2) and the web UI all use it.
+// FROZEN (planner-authored, fully implemented). The container model is a cross-topic
+// contract: config store (B1), containers service/routes (B2) and the web UI all use it.
 // Only add fields; never rename or retype an existing one.
 import { z } from 'zod';
 import { SLUG_RE } from '../util/slug.js';
-import { AgentIdSchema, SESSION_AGENTS_ENV } from '../agents/model.js';
+import { AgentIdSchema, CONTAINER_AGENTS_ENV } from '../agents/model.js';
 import { HostIdSchema, LEGACY_HOST_ID } from '../hosts/model.js';
 import type { ContainerState, PortBinding } from '../backends/types.js';
 
-export const SessionNameSchema = z
+export const ContainerNameSchema = z
   .string()
   .regex(SLUG_RE, 'name must be lowercase letters, digits and dashes (max 31 chars)');
 
@@ -40,7 +40,7 @@ export const ImageRefSchema = z.discriminatedUnion('type', [
  * contract would not hold. Backslashes and NUL are rejected because they cannot appear in
  * a POSIX host path the engine can bind-mount. container.ts additionally resolves the path
  * and asserts it stays under workspacesRoot (defence in depth for stored configs, which
- * are validated laxly on purpose - see SessionConfigSchema).
+ * are validated laxly on purpose - see ContainerConfigSchema).
  */
 export const WorkspaceHostPathSchema = z
   .string()
@@ -52,7 +52,7 @@ export const WorkspaceHostPathSchema = z
     "hostPath must not contain '.' or '..' segments",
   );
 
-/** named volume; `volume` defaults to porterclaude-ws-<session> */
+/** named volume; `volume` defaults to porterclaude-ws-<container> */
 const VolumeWorkspaceSchema = z.object({ type: z.literal('volume'), volume: z.string().min(1).optional() });
 /** named volume seeded by cloning a git repo on first start */
 const GitWorkspaceSchema = z.object({
@@ -70,7 +70,7 @@ export const WorkspaceSchema = z.discriminatedUnion('type', [
   GitWorkspaceSchema,
 ]);
 
-/** Stored form: see SessionConfigSchema - a config.json written before the hostPath rule
+/** Stored form: see ContainerConfigSchema - a config.json written before the hostPath rule
  *  existed must not quarantine the whole file. buildContainerSpec still refuses to mount
  *  a path that escapes workspacesRoot. */
 export const WorkspaceStoredSchema = z.discriminatedUnion('type', [
@@ -94,16 +94,16 @@ export const EnvKeySchema = z
   .regex(/^[A-Za-z_][A-Za-z0-9_]*$/, 'environment variable names must match [A-Za-z_][A-Za-z0-9_]*');
 
 /**
- * What the client sends to create/update a session.
+ * What the client sends to create/update a container.
  *
  * v0.2: `hostId` picks the docker engine (omitted => the default host) and is IMMUTABLE
- * after create — moving a session to another host means recreating it there. `agents`
+ * after create — moving a container to another host means recreating it there. `agents`
  * picks the coding agents mounted into the container (null => every agent enabled on the
  * host, resolved at create/recreate time).
  */
-export const SessionInputSchema = z.object({
-  name: SessionNameSchema,
-  /** the host this session runs on; omitted => `config.defaultHostId` */
+export const ContainerInputSchema = z.object({
+  name: ContainerNameSchema,
+  /** the host this container runs on; omitted => `config.defaultHostId` */
   hostId: HostIdSchema.optional(),
   /** null = inherit the host's enabled agents (the usual case) */
   agents: z.array(AgentIdSchema).max(64).nullable().default(null),
@@ -114,7 +114,7 @@ export const SessionInputSchema = z.object({
   ports: z.array(PortMapSchema).default([]),
   extraMounts: z.array(MountSchema).default([]),
   limits: LimitsSchema.default({}),
-  /** false => this session gets a private ~/.claude/projects volume */
+  /** false => this container gets a private ~/.claude/projects volume */
   shareHistory: z.boolean().default(true),
   /** restart policy unless-stopped when true */
   autoStart: z.boolean().default(true),
@@ -124,17 +124,17 @@ export const SessionInputSchema = z.object({
 });
 
 /** Persisted form: input + bookkeeping. */
-export const SessionConfigSchema = SessionInputSchema.extend({
+export const ContainerConfigSchema = ContainerInputSchema.extend({
   /** stored form: always set. A v1 config.json is migrated to the 'default' host, and the
    *  default keeps a hand-written/older file loadable instead of quarantining it. */
   hostId: z.string().min(1).default(LEGACY_HOST_ID),
-  /** deliberately laxer than the input: a session adopted from a container may carry an
-   *  env var the engine accepted before this rule existed, and rejecting it here would
-   *  fail AppConfigSchema and quarantine the whole config.json. */
+  /** deliberately laxer than the input: a container adopted from a running container may
+   *  carry an env var the engine accepted before this rule existed, and rejecting it here
+   *  would fail AppConfigSchema and quarantine the whole config.json. */
   env: z.record(z.string(), z.string()).default({}),
   /** laxer than the input for the same reason as `env`: an existing config.json (or an
    *  adopted container) may carry a hostPath that today's rule rejects, and failing here
-   *  would quarantine every stored session. */
+   *  would quarantine every stored container. */
   workspace: WorkspaceStoredSchema.default({ type: 'volume' }),
   createdAt: z.string(),
   updatedAt: z.string(),
@@ -142,17 +142,17 @@ export const SessionConfigSchema = SessionInputSchema.extend({
   specHash: z.string().optional(),
 });
 
-export type SessionInput = z.infer<typeof SessionInputSchema>;
-export type SessionConfig = z.infer<typeof SessionConfigSchema>;
-export type SessionWorkspace = z.infer<typeof WorkspaceSchema>;
-export type SessionImageRef = z.infer<typeof ImageRefSchema>;
+export type ContainerInput = z.infer<typeof ContainerInputSchema>;
+export type ContainerConfig = z.infer<typeof ContainerConfigSchema>;
+export type ContainerWorkspace = z.infer<typeof WorkspaceSchema>;
+export type ContainerImageRef = z.infer<typeof ImageRefSchema>;
 
 /**
- * v0.2.2: a session whose host was not ready yet (recipe image not built, tools volume
+ * v0.2.2: a container whose host was not ready yet (recipe image not built, tools volume
  * never synced) is no longer refused — the server does the work and reports it here while
- * the request is long over. `null` on every session that is simply ready.
+ * the request is long over. `null` on every container that is simply ready.
  */
-export interface SessionPreparation {
+export interface ContainerPreparation {
   phase: 'building-image' | 'syncing-tools' | 'creating' | 'starting';
   /** human-readable version of `phase`, including what is being built/synced */
   detail: string;
@@ -161,23 +161,23 @@ export interface SessionPreparation {
   startedAt: string;
 }
 
-/** Runtime status merged over the stored config; this is what GET /api/sessions returns. */
-export interface SessionView extends SessionConfig {
-  /** non-null while the server is preparing the host for this session (v0.2.2) */
-  preparing: SessionPreparation | null;
-  /** name of `hostId`, or the id itself when the host is gone (dangling session) */
+/** Runtime status merged over the stored config; this is what GET /api/containers returns. */
+export interface ContainerView extends ContainerConfig {
+  /** non-null while the server is preparing the host for this container (v0.2.2) */
+  preparing: ContainerPreparation | null;
+  /** name of `hostId`, or the id itself when the host is gone (dangling container) */
   hostName: string;
-  /** the host this session points at no longer exists */
+  /** the host this container points at no longer exists */
   hostMissing: boolean;
   /** the agent ids actually mounted into the container: `agents ?? host.agents.enabled`,
    *  filtered to agents that still exist in the registry */
   resolvedAgents: string[];
-  /** 'absent' = no container exists for this session yet */
+  /** 'absent' = no container exists for this definition yet */
   status: ContainerState | 'absent';
   containerId: string | null;
   containerName: string;
   /**
-   * The STABLE image ref of this session: `<imageNamespace>/<recipe>:latest` for a recipe,
+   * The STABLE image ref of this container: `<imageNamespace>/<recipe>:latest` for a recipe,
    * the custom ref otherwise. Deliberately not what docker reports for the container: a
    * recipe rebuild untags the image the container runs, and docker then answers a bare
    * `sha256:…` digest that means nothing to a user (see containerImage/imageOutdated).
@@ -186,7 +186,7 @@ export interface SessionView extends SessionConfig {
   /** what docker says the container runs — a ref or, after a rebuild, a bare `sha256:…` */
   containerImage: string | null;
   /** the container runs an older image than `resolvedImage` resolves to today: recreate
-   *  the session to pick the new one up (never true without a container) */
+   *  the container to pick the new one up (never true without a container) */
   imageOutdated: boolean;
   startedAt: string | null;
   uptimeSec: number | null;
@@ -200,13 +200,13 @@ export interface SessionView extends SessionConfig {
 
 export const CONTAINER_LABELS = {
   managed: 'porterclaude.managed',
-  session: 'porterclaude.session',
-  /** v0.2: the host id the session belongs to (reconcile/adoption reads it back) */
+  container: 'porterclaude.container',
+  /** v0.2: the host id the container belongs to (reconcile/adoption reads it back) */
   host: 'porterclaude.host',
   /**
    * v0.2: the PorterClaude INSTALL that created this container (config.instanceId).
-   * Session discovery only ever touches containers that carry this install's id or NO id at
-   * all (v0.1 / v0.2.0 containers) — see sessions/service.ts `ownedByThisInstance`.
+   * Container discovery only ever touches containers that carry this install's id or NO id at
+   * all (v0.1 / v0.2.0 containers) — see containers/service.ts `ownedByThisInstance`.
    */
   instance: 'porterclaude.instance',
   /** v0.2: comma separated agent ids mounted into this container */
@@ -216,6 +216,26 @@ export const CONTAINER_LABELS = {
   specHash: 'porterclaude.spec-hash',
   createdAt: 'porterclaude.created-at',
 } as const;
+
+/**
+ * v0.3: the pre-rename name of `CONTAINER_LABELS.container`. COMPATIBILITY READ ONLY — it is
+ * never written any more, and every live container created before v0.3 carries it instead of
+ * the new one. Discovery matches on this label, so dropping the fallback would turn every
+ * running container into an orphan. Remove in v0.4, by which time every container has been
+ * relabelled on its next recreate.
+ */
+export const LEGACY_CONTAINER_LABEL = 'porterclaude.session';
+
+/**
+ * The container name a set of docker labels claims: the v0.3 label, else the v0.2 one.
+ *
+ * THE ONLY way anything may read the container label — matchContainer, reconcile and
+ * synthesizeConfig all go through it so the compatibility read cannot be missed at one of
+ * them (which would strand every pre-v0.3 container as an orphan).
+ */
+export function containerLabelOf(labels?: Record<string, string> | null): string | undefined {
+  return labels?.[CONTAINER_LABELS.container] ?? labels?.[LEGACY_CONTAINER_LABEL];
+}
 
 export const IMAGE_LABELS = {
   recipe: 'porterclaude.recipe',
@@ -228,10 +248,10 @@ export const IMAGE_LABELS = {
  * The agent ids a CONTAINER really mounts — the only truthful source for "can this pane
  * start agent X?".
  *
- * `agents ?? host.agents.enabled` describes what a session SHOULD mount, which drifts the
- * moment an agent is enabled on the host after the container was created (SessionView then
+ * `agents ?? host.agents.enabled` describes what a container SHOULD mount, which drifts the
+ * moment an agent is enabled on the host after the container was created (ContainerView then
  * reports needsRecreate). Starting an agent the container has no auth volume for would hand
- * the user a fresh, unauthenticated instance, so terminals gate on this instead.
+ * the user a fresh, unauthenticated instance, so sessions gate on this instead.
  *
  * Reads the `porterclaude.agents` label (set by buildContainerSpec) and falls back to the
  * `PORTERCLAUDE_AGENT_IDS` env of the container inspect. Returns `null` when the container
@@ -244,7 +264,7 @@ export function containerAgentIds(
 ): string[] | null {
   const raw =
     labels?.[CONTAINER_LABELS.agents] ??
-    env?.find((e) => e.startsWith(`${SESSION_AGENTS_ENV}=`))?.slice(SESSION_AGENTS_ENV.length + 1);
+    env?.find((e) => e.startsWith(`${CONTAINER_AGENTS_ENV}=`))?.slice(CONTAINER_AGENTS_ENV.length + 1);
   if (raw === undefined) return null;
   return raw
     .split(',')
@@ -252,23 +272,23 @@ export function containerAgentIds(
     .filter((id) => id.length > 0);
 }
 
-export function containerNameFor(prefix: string, session: string): string {
-  return `${prefix}${session}`;
+export function containerNameFor(prefix: string, container: string): string {
+  return `${prefix}${container}`;
 }
 
-/** `<volumePrefix>ws-<session>` (v0.1 name with the default prefix `porterclaude-`). */
-export function workspaceVolumeFor(volumePrefix: string, session: string): string {
-  return `${volumePrefix}ws-${session}`;
+/** `<volumePrefix>ws-<container>` (v0.1 name with the default prefix `porterclaude-`). */
+export function workspaceVolumeFor(volumePrefix: string, container: string): string {
+  return `${volumePrefix}ws-${container}`;
 }
 
 /**
  * Private conversation history volume of ONE agent.
  *
- * The claude agent keeps the v0.1 name (`<prefix>hist-<session>`) so an existing session
+ * The claude agent keeps the v0.1 name (`<prefix>hist-<container>`) so an existing container
  * keeps its history across the upgrade; every other agent gets the id suffix.
  */
-export function historyVolumeFor(volumePrefix: string, session: string, agentId: string): string {
+export function historyVolumeFor(volumePrefix: string, container: string, agentId: string): string {
   return agentId === 'claude'
-    ? `${volumePrefix}hist-${session}`
-    : `${volumePrefix}hist-${session}-${agentId}`;
+    ? `${volumePrefix}hist-${container}`
+    : `${volumePrefix}hist-${container}-${agentId}`;
 }
