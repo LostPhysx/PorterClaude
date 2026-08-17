@@ -366,7 +366,7 @@ and docs.
 | **0 — Per-host names** | `<hostId>.<container>` everywhere: store helpers, service, route shape, websocket URL, web keying, existing tests — plus the docker-name suffix and lookup-by-label (§5.7) | ~600–900 | 1–1.5 d | 2–3 h |
 | **A — Identity** | users in config v3 + migration, per-user auth/JWT, login by username, `GET /api/me`, user CRUD, Users panel, per-user `ui`, last-admin guard | ~1 000–1 300 | 1–1.5 d | 2–3 h |
 | **B — Grants** | grant store + the three predicates, the four route buckets, list filtering, WS check, §4.1 spec rule, grant editor UI, the rest of §5 | ~1 000–1 400 | 1.5–2 d | 3–4 h |
-| **C — Tests, docs, QA** | authz matrix suite, helper migration, docs, live pass on claude.example.com | ~300–500 | 0.5–1 d | 1–2 h |
+| **C — Tests, docs, QA** | authz matrix suite, helper migration, docs, live pass on the deployed instance | ~300–500 | 0.5–1 d | 1–2 h |
 | | | | **5–7.5 d** | **10–15 h** |
 
 Phase B stays small because of what the model leaves out: no permission catalog, no roles,

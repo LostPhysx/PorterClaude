@@ -84,18 +84,19 @@ What a full run does:
   the stack `env` array, so the password is stored once, by Portainer.
 * `deploy.sh` never runs `set -x`.
 
-## Reference host facts (2026-08-15)
+## The setup this was developed against
+
+Not a requirement — the shape of a typical target, so the notes below have context. Your own
+values go in `deploy/.env`, which is gitignored.
 
 | | |
 |---|---|
-| Portainer | EE 2.39.5, endpoint `2` ("local", docker.sock) |
-| Docker host | Ubuntu 24.04, **arm64**, 4 CPU, 23 GiB, Docker 29.1.3 |
-| `/var/run/docker.sock` gid | **989** (measured 2026-08-16 — *not* the 999 the compose file defaults to) |
-| nginx-proxy `vhost.d` | bind-mounted from `/srv/nginx/vhost.d` on the host |
-| Reverse proxy | `nginxproxy/nginx-proxy` + `acme-companion` (DEFAULT_EMAIL set), ports 80/443 |
-| Proxy convention | `VIRTUAL_HOST`, `LETSENCRYPT_HOST`, `VIRTUAL_PORT`; networks `portainer_dmz` (internal) + `portainer_gate` |
-| App hostname | `claude.example.com` (DNS ready) |
-| Existing stacks | (redacted) |
+| Portainer | EE 2.x, a `local` (docker.sock) endpoint |
+| Docker host | Ubuntu 24.04, **arm64**, 4 CPU, 23 GiB, Docker 29.x |
+| `/var/run/docker.sock` gid | often **not** the 999 the compose file defaults to — measure it (`stat -c %g /var/run/docker.sock`) and set `DOCKER_GID` |
+| Reverse proxy | `nginxproxy/nginx-proxy` + `acme-companion` on 80/443, with `vhost.d` bind-mounted from the host (`NGINX_VHOST_DIR`, default `/srv/nginx/vhost.d`) |
+| Proxy convention | `VIRTUAL_HOST`, `LETSENCRYPT_HOST`, `VIRTUAL_PORT`; an internal network plus an edge one (`PROXY_NETWORK_APP` / `PROXY_NETWORK_EDGE`) |
+| App hostname | whatever `APP_HOSTNAME` says, with DNS already pointing at the host |
 
 ### Operator action required before the first remote build
 
