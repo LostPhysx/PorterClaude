@@ -1,282 +1,371 @@
-# Users, roles and permissions (v0.3 proposal)
+# Users and permissions (v0.3 proposal)
 
-Status: **proposal / not implemented**. Scopes the work behind "an instance admin configures
-hosts and hands out permissions to other users". Written against the shipped v0.2.1 code
-(single shared password, `sub:'admin'` JWT, 61 authenticated routes, one `config.json`).
+Status: **proposal / not implemented**. Written against shipped v0.2.2 (single shared
+password, `sub:'admin'` JWT, 54 authenticated routes, one `config.json`).
+
+The model is deliberately small: **one admin flag, two kinds of grant, no verbs.**
 
 ---
 
-## 1. Where v0.2.1 stands
+## 0. Vocabulary
 
-| Piece | Today |
+v0.2 uses "session" for three unrelated things: the long-lived container, the shell you
+open inside it, and the login cookie. v0.3 fixes that first, because every sentence below
+depends on it (§7 has the mechanics).
+
+| Word | Means | Lifetime | Was called |
+|---|---|---|---|
+| **host** | a docker engine PorterClaude talks to | permanent | host |
+| **container** | one project's box: image, workspace, mounts, agents | long-lived — spun up per project, left running until the project ends | *session* |
+| **session** | one connection to a shell inside a container | a working stretch — a day's work, closed at clock-out; survives a browser reload, dies when the pane is closed | *terminal* / *pane* |
+| **login** | the authenticated browser, i.e. the cookie | until logout or expiry | *session* (cookie) |
+
+A container is identified by `<hostId>.<container>` (§1); a session, when it ever needs a
+full name, is `<hostId>.<container>.<session>`.
+
+## 1. The model
+
+| Principal | Can do |
 |---|---|
-| Identity | none — one `APP_PASSWORD`, one scrypt hash in `config.auth` |
-| Token | JWT cookie `pc_session`, `{sub:'admin', v: tokenVersion}` |
-| Authorization | `requireAuth` in `routes/index.ts` — binary: authenticated ⇒ everything |
-| Terminals | `authenticateUpgradeRequest()` returns a **boolean**; any cookie holder may attach to any pane of any session |
-| Ownership | sessions have no owner; discovery is by `porterclaude.instance` label only |
-| Audit | pino lines, no actor |
+| **Instance admin** | everything: hosts, credentials, agent definitions, general settings, users, grants, and every container on every host |
+| **User** | **nothing** — until granted |
 
-So the entire authorization surface has to be *added*, not changed — there is no half-built
-role system to extend, and no place in the config schema for a second principal.
+Two grants, both boolean. A user may hold any number of each.
 
-## 2. The uncomfortable part: what a permission can and cannot contain
+| Grant | Points at | Means |
+|---|---|---|
+| **Host** | one `hostId` | everything about that host's containers — **create, define, delete** — plus everything a container grant gives, on **every** container there; see the host and its recipes/images; build an image and sync the tools volume |
+| **Container** | one `<hostId>.<container>` | **operate and use** that one container: start, stop, restart, reset; read its definition, status and logs; open sessions in it |
 
-Three facts about this product decide the design. They must be settled before any permission
-names get written down, because two of the obvious permissions are otherwise **cosmetic**.
+The dividing line: **everything *about* a container is host scope; everything *inside* one is
+container scope.** Existence (create, delete) and definition (image, workspace, mounts,
+ports, limits, which agents and tools are attached) belong to the host grant. A container
+grant runs the thing and works in it.
 
-**2.1 "Create a session" is "root on the docker host" unless it is constrained.**
-A session is a container spec the user controls: image, mounts, ports, env. A user allowed to
-create one can ask for `type:'bind', hostPath:'/'`, or a mount of `/var/run/docker.sock`, and
-own the engine. `WorkspaceHostPathSchema` + `buildContainerSpec` already keep binds under
-`general.workspacesRoot`, which is the right hook — but `mounts[]` is a free-form list today.
-⇒ a *session spec policy* (§6) is a prerequisite for the `host.sessions.create` permission,
-not a later nicety. Without it, "manage sessions on host X" and "admin of host X" are the
-same permission wearing different labels.
+* **Reset** is delete-and-recreate of the docker container from the stored definition. The
+  workspace and history volumes survive it, which is why it is safe to hand out: it is the
+  "turn it off and on again properly" button, not a destructive one.
+* **Configuring an attached agent** — logging Claude in, editing its settings — happens
+  *inside* the container, so a session already covers it. **Attaching** a new agent or tool
+  changes the definition, so it is host scope. (Tools are a host-level shared volume today;
+  there is no per-container tool attachment to scope in the first place.)
 
-**2.2 Agent logins are shared per host.** `porterclaude-auth-<agentId>` is mounted into every
-session on the host, so any user with a shell on that host can read
-`~/.porterclaude/agents/claude/.credentials.json` and the agent's history. That is the *point*
-of the feature in a single-operator install, and a data leak in a multi-user one. Three
-options, decided per host (§7): shared (today), per user, per session.
+Rules:
 
-**2.3 Everyone inside one session is the same OS user** (`dev`, uid 1000). Sharing a session
-means sharing a shell — there is no in-session isolation and there should not be. The
-permission boundary is *which* sessions you can attach to, never what you may do once inside.
+* Effective rights = the **union** of the grants. No deny rules, and no inheritance beyond
+  "a host grant covers every container on that host".
+* **A user without a host grant never creates a container** — not even the one they are
+  permitted to use. It follows that a **grant cannot exist without its target**: a container
+  grant may only be issued for a container that exists, and it is dropped when that container
+  is deleted (§5.4). No grant ever waits for something to be created.
+* A user with no grant sees an empty app: no hosts, no containers, nothing in Settings but
+  their own password and layout.
+* Only an admin creates users and hands out grants. A user can never grant anything — not
+  even on a container they hold.
 
-## 3. Principals
+### The container identifier
+
+A container name is unique **per host**, so the fully qualified identifier is
+`<hostId>.<container>` — `hetzner-1.web`. Both halves are `[a-z0-9-]` only (`HostIdSchema`,
+`SLUG_RE`), so a single dot separates them unambiguously. A container grant is exactly that
+identifier:
+
+```jsonc
+{ "userId": "u-9f3c1a2b", "type": "container", "hostId": "hetzner-1", "container": "web" }
+```
+
+`canContainer(user, hostId, name)` is therefore a lookup, not a search. The UI shows the
+bare `web` inside a single host's list and the qualified `hetzner-1.web` everywhere else —
+grant editor, flat lists, search, toasts, session tab titles.
+
+> **Prerequisite, and its own phase (§8).** v0.2.2 enforces names unique *across* hosts, and
+> that invariant is what lets the terminal websocket route name → host with nothing else.
+> Per-host names touch: the store's helpers (its public API is marked FROZEN), the flat
+> `/api/sessions/:name` route shape, the websocket URL and the web client, and everywhere the
+> UI keys a row or a pane by name. Docker-level names (`<prefix><container>`,
+> `<prefix>ws-<container>`) stay unqualified — they only have to be unique per **engine** —
+> and where one is already taken it gets a numeric suffix (§5.7).
+
+## 2. Route map
+
+The 54 gated routes fall into four buckets (`GET /api/health` and the `/api/auth/*` routes
+stay public). Paths below are the post-rename ones (§7).
+
+| Bucket | Routes | n |
+|---|---|---|
+| **Admin only** | host writes (`POST /api/hosts`, `PUT`/`DELETE /:hostId`, `POST /:hostId/default`, `POST /test` + `/:hostId/test`) · `/api/credentials/*` · `/api/hosts/:id/docker/*` · agent-definition writes (`POST /api/agents`, `PUT`/`DELETE /:id`) · `PUT /api/hosts/:id/agents` · `PUT /api/settings/general` — plus the new `/api/users/*`, admin-only by construction | 23 |
+| **Host grant** on `:hostId` | `GET /api/hosts` (filtered, see below) · `GET /api/hosts/:hostId` + `/info` · `/api/hosts/:hostId/images/*` (recipes, build, jobs, job cancel, tools, tools/sync, pull, custom/validate, image list) · `GET /api/hosts/:hostId/agents` — **plus the container-meta routes**: `POST /api/containers` (create), `PUT /:name` (definition), `DELETE /:name`, `POST /api/containers/reconcile?hostId=` (without `hostId`, i.e. every host, it is admin only) | 18 |
+| **Host grant on the container's host, or a container grant** | the operate-and-use routes: `GET /api/containers` (filtered) · `GET /:name` · `POST /:name/start` · `/stop` · `/restart` · `/recreate` (reset) · `GET /:name/logs` — and the session websocket | 7 |
+| **Any logged-in user** | `GET /api/settings` + `/vendor` · `GET /api/agents` + `/:id` (needed to render the container form) · `POST /api/settings/password` (your own) · `PUT /api/settings/ui` (your own layout and theme, §5.1) | 6 |
+
+Two consequences worth stating out loud, because they are where a route gate is not enough:
+
+1. **Lists must be filtered, not just gated.** `GET /api/hosts` returns the hosts the caller
+   has a grant on — plus, for a container-grantee, the one host their container lives on (id
+   and name only, so the UI can render the row). The cross-host container list returns
+   `containers on host-granted hosts ∪ granted <hostId>.<container> pairs`. Without this, the
+   gate leaks the whole estate to everyone who can log in.
+2. **`GET /api/hosts/:id/images/jobs/:jobId` is in the host bucket, but a container-grantee
+   needs it** — since v0.2.2 a container prepares its host on create and hands the job id
+   back in `preparing.jobs`, and an edit can trigger the same. Rule: you may read a job
+   referenced by a container you hold. That is the one cross-bucket read, and it is a log
+   stream, not a control.
+
+`POST …/images/recipes/:name/build` and `POST …/tools/sync` stay in the host bucket even
+though a container-grantee's **Start** or **Reset** can trigger them implicitly (v0.2.2
+prepares the host for a container that needs it). That is intended and worth keeping
+straight: doing the work because a container you may run needs it is fine; ordering it for
+the host is not.
+
+## 3. Data model
 
 ```jsonc
 // config.users[]
 {
-  "id": "u-9f3c1a2b",             // stable, never reused
-  "username": "alice",            // login name, unique, [a-z0-9._-]{1,32}
+  "id": "u-9f3c1a2b",          // stable, never reused
+  "username": "alice",         // unique, [a-z0-9._-]{1,32}
   "displayName": "Alice",
-  "passwordHash": "scrypt:…",     // same scheme as today
-  "tokenVersion": 1,              // per-user; a password change logs only that user out
-  "disabled": false,              // keep grants, refuse login
-  "mustChangePassword": false,
-  "createdAt": "…", "createdBy": "u-…", "lastLoginAt": "…"
+  "admin": false,              // true = instance admin, ignores grants
+  "passwordHash": "scrypt:…",  // same scheme as today
+  "tokenVersion": 1,           // per user; a password change logs only that user out
+  "disabled": false,           // keep grants, refuse login (and bump tokenVersion, §5.3)
+  "ui": { "layout": null, "theme": "auto" },   // moved off config.ui — see §5.1
+  "createdAt": "…", "lastLoginAt": "…"
 }
-```
 
-JWT becomes `{sub: '<userId>', v: <user.tokenVersion>, r: '<instanceRole>'}`. `config.auth`
-keeps a single global `tokenVersion` as the "revoke every session" switch.
-
-Migration v2 → v3: the existing password hash becomes user `admin` with instance role
-`admin`; `APP_PASSWORD` keeps seeding *that* user only while no user exists. Every existing
-session gets `ownerUserId: '<that admin>'`. Lossless, same shape as the v1 → v2 migration.
-
-## 4. Scopes
-
-Three, and no more — the grant table is a union, there are no deny rules and no inheritance
-beyond this list:
-
-| Scope | Key | Covers |
-|---|---|---|
-| Instance | `instance` | users, credentials, agent definitions, general settings, host create/delete |
-| Host | `host:<hostId>` | one docker engine: its config, images, tools, agents, and its sessions |
-| Session | `session:<name>` | one session (names are unique across hosts today) |
-
-Effective permission set = union of the permissions of every grant whose scope matches the
-request's scope or an enclosing one. `instance` encloses every host; `host:<id>` encloses
-every session on that host.
-
-## 5. The permission catalog
-
-Deny by default. Names are `<scope>.<object>.<verb>`; the middleware takes the name plus a
-scope resolver, so one route = one line.
-
-### 5.1 Instance
-
-| Permission | Guards | Notes |
-|---|---|---|
-| `instance.users.read` | `GET /api/users` | see the roster |
-| `instance.users.write` | create / rename / disable / delete users | |
-| `instance.users.password` | reset another user's password | separate: a helpdesk role wants this without `users.write` |
-| `instance.grants.write` | assign any grant at any scope | **the escalation permission** — implies everything, only real admins get it |
-| `instance.hosts.create` | `POST /api/hosts`, import endpoints | creator gets `host-admin` on the result |
-| `instance.hosts.delete` | `DELETE /api/hosts/:id` | |
-| `instance.credentials.read` | list Portainer credentials (metadata only; keys are never serialised) | a credential is host-root for every endpoint it reaches |
-| `instance.credentials.write` | add / edit / delete / test | |
-| `instance.agents.read` | `GET /api/agents` | definitions, not per-host state |
-| `instance.agents.write` | add / edit / delete custom agent definitions | a definition is an **install command that runs on every host that syncs** ⇒ admin only |
-| `instance.settings.read` / `.write` | `GET/PUT /api/settings/general` | `workspacesRoot`, `volumePrefix`, `containerPrefix`, `containerHome`, `toolsMount` rewrite every container spec ⇒ admin only |
-| `instance.audit.read` | `GET /api/audit` | new (§8) |
-
-### 5.2 Host
-
-| Permission | Guards |
-|---|---|
-| `host.read` | the host appears in `GET /api/hosts`; name / type / status / probe result |
-| `host.probe` | `POST /api/hosts/:id/test` (an outbound call on your behalf) |
-| `host.update` | rename, connection change, per-host setting overrides |
-| `host.delete` | remove the host (see §11 Q3) |
-| `host.docker.read` | `/api/hosts/:id/docker/*` — the raw containers/images/volumes/networks panel, i.e. **every** container on the engine, PorterClaude's or not |
-| `host.images.read` | recipe list + build state |
-| `host.images.build` | `POST …/images/build` — CPU, disk and outbound pulls on the host |
-| `host.images.delete` | prune / remove an image |
-| `host.tools.sync` | `POST …/tools/sync` — installs/updates agents on the host (network + writes to the shared tools volume; disruptive to everyone on that host) |
-| `host.agents.read` | which agents this host has, install state |
-| `host.agents.write` | enable/disable agents for the host |
-| `host.sessions.list` | see **all** sessions on the host, not just your own |
-| `host.sessions.create` | create — **only meaningful together with a spec policy, §6** |
-| `host.sessions.admin` | update / recreate / stop / delete **any** session on the host, including other people's |
-
-### 5.3 Session
-
-| Permission | Guards |
-|---|---|
-| `session.read` | it appears in `GET /api/sessions`; its config (env values redacted unless `session.update`) |
-| `session.use` | open a terminal — `bash`/`sh` pane, full stdin |
-| `session.use.agent` | open an *agent* pane only (`shell=agent:<id>`). Separable from `session.use` so "may run Claude here, may not have a raw shell" is expressible. It is a **UX boundary, not a security one** — every agent can spawn a shell — and the docs must say so |
-| `session.attach.readonly` | attach with stdin dropped server-side (observer / pairing / demo) |
-| `session.lifecycle` | start / stop / restart |
-| `session.logs` | `GET …/logs` |
-| `session.update` | edit the spec (image, mounts, env, ports, limits) ⇒ **inherits the §6 policy**; editing your own session must not be a way around the policy that governed creating it |
-| `session.recreate` | recreate the container from the stored spec |
-| `session.delete` | destroy container (+ volumes) |
-| `session.share` | grant `session.*` on **this** session to another user, bounded by what you hold yourself (no privilege amplification) |
-
-Ownership: `SessionConfig.ownerUserId` plus a `porterclaude.owner=<userId>` container label so
-ownership survives losing `/data` (the adoption path in `sessions/service.ts` reads it back;
-an unlabelled orphan is adopted as owned by the *adopting admin*, never by "everyone").
-The owner implicitly holds every `session.*` on it except `session.share` when the granting
-admin withheld it.
-
-### 5.4 Bundled roles (what the UI actually offers)
-
-| Role | Scope | Expands to |
-|---|---|---|
-| `admin` | instance | every permission at every scope |
-| `auditor` | instance | every `*.read` + `instance.audit.read`, nothing mutating |
-| `host-admin` | host | all `host.*` + all `session.*` on that host |
-| `host-operator` | host | `host.read`, `host.images.read`, `host.agents.read`, `host.sessions.create`, and full `session.*` on **sessions they own** |
-| `host-user` | host | `host.read` only — plus whatever session grants they were given |
-| `session-user` | session | `session.read`, `session.use`, `session.use.agent`, `session.lifecycle`, `session.logs` |
-| `session-observer` | session | `session.read`, `session.attach.readonly` |
-
-Roles are sugar over the catalog; a grant may also carry a raw permission list, so
-`{scope:'host:hetzner-1', perms:['host.read','host.tools.sync']}` is expressible without
-inventing a role.
-
-```jsonc
 // config.grants[]
-{ "userId": "u-9f3c1a2b", "scope": "host:hetzner-1", "role": "host-operator",
-  "perms": null, "grantedBy": "u-admin", "grantedAt": "…" }
+{ "userId": "u-9f3c1a2b", "type": "host",      "hostId": "hetzner-1" }
+{ "userId": "u-9f3c1a2b", "type": "container", "hostId": "hetzner-1", "container": "web" }
+//                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+//                          together: the fully qualified id `hetzner-1.web` (§1)
 ```
 
-## 6. Session spec policy (the prerequisite from §2.1)
+That is the whole authorization state: a flag on the user and a flat list of grants. Every
+grant references something that exists, and dies with it.
 
-Per host, stored on the host config, enforced in `sessions/model.ts` + `container.ts` for
-anyone who does **not** hold `host.sessions.admin`:
+JWT becomes `{ sub: '<userId>', v: <user.tokenVersion> }` — same lifetime, cookie renamed
+(§7). `config.auth.tokenVersion` stays as the global "log everyone out" switch.
 
-```jsonc
-"policy": {
-  "workspaceTypes": ["volume", "git"],            // "bind" off by default for non-admins
-  "bindRoots": ["/srv/porterclaude/workspaces"],  // binds must resolve under one of these
-  "extraMounts": "deny",                          // deny | allowlist | any
-  "mountAllowlist": [],
-  "images": { "recipes": "any", "custom": "deny" },   // or a registry/tag allowlist
-  "ports": { "publish": false, "range": [30000, 32767] },
-  "limits": { "maxCpus": 4, "maxMemoryMb": 8192, "maxSessions": 5 },
-  "forbid": ["privileged", "capAdd", "networkHost", "pidHost", "userns", "deviceMounts"]
-}
-```
+**Migration v2 → v3**: the existing password hash becomes user `admin` with `admin: true`;
+`APP_PASSWORD` keeps seeding that one user while no user exists (it only ever seeds when no
+password is set, so this is unchanged behaviour). Stored containers are not touched beyond
+the key rename — no owner field, because the model has no owner. Same shape as the v1 → v2
+migration, and it writes `config.v2.bak`.
 
-`forbid` is mostly about *keeping* those knobs unreachable — v0.2.1 never exposes them, and
-the policy is what stops a future "advanced options" field from silently becoming a host
-takeover for everyone holding `host.sessions.create`.
+## 4. What the model cannot hide
 
-## 7. Agent credential isolation (the prerequisite from §2.2)
+None of these is a reason to build more machinery. They are facts an admin has to be told,
+in the grant dialog and in `docs/DEPLOYMENT.md`.
 
-Per host: `agentAuthScope: "host" | "user" | "session"`.
+**4.1 Writing a container definition reaches the host — so a host grant is a trust
+decision.** Image, workspace and mounts are the author's to pick: `workspace:
+{type:'bind', hostPath:'…'}` or an `extraMounts` entry aimed at `/` or the docker socket is
+host takeover. Binds are already confined to `general.workspacesRoot`; `extraMounts` is
+free-form. Minimal fixed rule, ~30 lines, no configuration:
 
-* `host` — today's behaviour, `porterclaude-auth-<agentId>`; one login serves everyone. Correct
-  for a team on one seat, and documented as *everyone on this host can read this login*.
-* `user` — `porterclaude-auth-<agentId>-<userId>`. Note the constraint: volumes are attached at
-  container **create**, not at terminal open, so a session carries the auth of its *owner*.
-  Honest rule: the volume is picked by session owner; a session shared with others shares the
-  owner's login. Anything finer means one session per user, which is cheap and fine.
-* `session` — `porterclaude-auth-<agentId>-<session>`; log in per session, no sharing at all.
+> A non-admin may only create or edit a container whose `workspace.type` is `volume` or
+> `git`, with an empty `extraMounts`. Admins keep both. A container that needs a bind is
+> written by an admin and then granted.
 
-## 8. Audit log
+Since definitions are host scope (§1), this rule only ever binds **host**-grantees and
+admins — a container grant cannot reach it at all. Even with the rule, a host grant means
+the grantee runs arbitrary code on that engine, publishes ports and can fill its disk. That
+is what a host grant *is*; a container grant is not that.
 
-Gated by `instance.audit.read`. Append-only JSONL under `<DATA_DIR>/audit/YYYY-MM.jsonl`,
-rotated monthly, one line per mutating request and per terminal open/close:
-`{ts, actor, actorName, ip, action, scope, target, result, detail}`. Cheap once the authorize
-middleware exists (it already knows actor + permission + scope), and it is what separates
-"multi-user" from *proper* user management when something goes wrong in a shared session.
+**4.2 Agent logins are shared per host.** `porterclaude-auth-<agentId>` is mounted into
+every container on the host, so anyone with a session on that host reads
+`~/.porterclaude/agents/claude/.credentials.json` and the agent's conversation history —
+including a user who holds a single container grant there. That is the *point* of the
+feature on a single-operator install and a leak on a shared one. Unchecking "share history"
+does **not** change it: that flag splits `~/.claude/projects`, never the login. The fix, if
+it is ever wanted, is one line of naming (`…-auth-<agentId>-<userId>`, chosen at container
+create) — out of scope here, on record so the trade-off is visible.
 
-## 9. Enforcement points — the actual work list
+**4.3 Everyone inside one container is the same OS user** (`dev`, uid 1000). Sharing a
+container means sharing a machine. The boundary is *which* containers you reach, never what
+you may do once inside.
 
-1. `auth/index.ts` — per-user verify, `req.user`, and `authenticateUpgradeRequest` must return
-   the **user** instead of a boolean (its signature is marked FROZEN and is called from
-   `terminals/ws.ts`).
-2. `authorize(permission, scopeOf)` middleware + a `PermissionSet` resolver, applied to all
-   **61 routes** across 8 routers.
-3. **List filtering, not just route gating** — `GET /api/hosts`, `GET /api/sessions`,
-   `GET /api/hosts/:id/docker/containers`, image/tools status: each must return the caller's
-   subset, or the gate leaks the whole estate to every logged-in user.
-4. `terminals/ws.ts` — resolve session → permission before attach; implement
-   `session.attach.readonly` by dropping inbound binary frames; new close code `4403 forbidden`.
-5. `sessions/service.ts` (1 996 lines, the largest file) — actor-aware `list`/`get`/`create`/
-   `update`/`delete`, owner stamping, owner label, adoption rules, `reconcile` scoping.
-6. `config/{schema,store}.ts` — `users[]`, `grants[]`, `SessionConfig.ownerUserId`, host
-   `policy` + `agentAuthScope`; `CONFIG_VERSION` 3 + a v2→v3 migration writing `.v2.bak`.
-7. New `server/src/users/{model,service,routes}.ts` and
-   `server/src/authz/{catalog,roles,middleware}.ts`.
-8. `GET /api/me` → `{user, instanceRole, permissions:{instance:[…], hosts:{…}, sessions:{…}}}`
-   so the UI gates from the server's answer instead of re-implementing the rules.
-9. Login by username + password; per-username rate limit and lockout on top of the current
-   per-IP limiter.
-10. Web: username field on login; a **Users** sub-tab (6th); permission-driven hiding/disabling
-    in `sessions.js` (1 392), `hosts.js` (1 410), `agents.js` (685), `images.js` (566),
-    `settings.js`; a share dialog; read-only affordance in `terminal.js` (903).
-11. Tests: the context helpers in `server/test/*/helpers.ts` build an authenticated app, and
-    all 474 existing tests route through them — the helper change ripples wide (mechanical),
-    plus a new authz matrix suite.
-12. Docs: promote this file to a design doc, update `docs/DEPLOYMENT.md` (first-admin
-    bootstrap, upgrade note), `docs/AGENTS.md` (credential scope), `CHANGELOG.md`.
+**4.4 A container's `env` is readable by everyone who can read the container**, so a host
+grant exposes every env value on that host — including an API key someone pasted into the
+form.
 
-## 10. Effort
+**4.5 No quota.** A host grant means unlimited containers, volumes and images on that
+engine. "Manage containers on this host" reads milder than "fill this disk"; they are the
+same sentence.
 
-Assumes the same delivery pattern as v0.2 (planner → coders per topic → QA) and *includes*
-migration, tests and docs.
+**4.6 A grantless user still sees a little metadata.** `GET /api/settings` carries the
+general defaults plus host count, `defaultHostId` and `socketHostId`. It is configuration,
+not secrets, and it stays readable — recorded so it is a decision and not an oversight.
+
+## 5. Decisions the model forces
+
+Consequences of "one admin, two grants", each already settled. Listed because they are work
+items that are not obvious from §1, not because anything is undecided.
+
+**5.1 UI state moves into the user record.** `config.ui` is one `{ layout, theme }` for the
+whole install (`config/schema.ts:68`) — one GoldenLayout blob shared by everybody. Two users
+would overwrite each other's workspace, and a stored layout can hold panes for containers
+the next viewer may not open. So `ui` becomes a field on the user, `PUT /api/settings/ui`
+moves to the any-logged-in bucket and writes to `req.user`, and `GET /api/settings` answers
+with the caller's. Lands in phase A — a shared layout is visible on day one of the second
+user.
+
+**5.2 Internal callers act as the system.** Since v0.2.2 the preparation chain runs *after*
+the request is over (build an image, sync tools, then create and start the container), and
+`reconcile()` runs at startup with nobody logged in. Both call the same methods a user's
+request does, so both would be refused by a check that assumes a logged-in caller. The check
+takes an actor that is either a user or the system, and only the HTTP and websocket entry
+points ever supply a real user.
+
+**5.3 Revoking access closes open sessions.** A websocket is authorised once, at connect;
+without this a pane stays live after the grant is taken away, until the server restarts.
+Each connection is tagged with its user (`terminals/ws.ts` already walks its client list on
+shutdown), and removing a grant, disabling or deleting a user closes the matching panes with
+`4403`. Disabling also bumps that user's `tokenVersion`, which invalidates their cookie.
+
+**5.4 Grants live and die with their target.** A container grant can only be issued for an
+existing container, and deleting a host or a container removes every grant pointing at it —
+the confirm dialog says how many. There is no such thing as a grant waiting for something to
+be created, so a name can never be re-used into somebody's old permissions.
+
+Deleting is host scope, so this is always someone else acting: a container-grantee cannot
+delete themselves out of their own access, and cannot be surprised by their own click. What
+they *can* do is **Reset**, which keeps the definition, the grant and the volumes.
+
+**5.5 The last admin is protected.** Disabling, deleting or clearing `admin` is refused when
+it would leave zero enabled admins.
+
+**5.6 There is no default host for a container.** `create()` currently falls back to
+`config.defaultHostId` when the request omits `hostId`, which would let a user granted one
+host aim at another by leaving a field out. A container always states its host explicitly;
+`defaultHostId` survives only as what the New Container form preselects, and the API rejects
+a create without a host.
+
+**5.7 A docker name that is already taken gets a numeric suffix.** Background, because the
+terms are ours:
+
+* The container on the engine is named `<prefix><container>` — derived, not stored. An
+  **orphan** is such a container with no matching entry in `config.json`: the config was lost
+  or restored from a backup, the entry was deleted while the container survived, or a second
+  PorterClaude install shares that engine. **Adoption** is `reconcile()` writing an entry back
+  for it, so it becomes a normal container again.
+* Today `create()` refuses outright when `porterclaude-web` already exists on the target
+  engine, and adoption is a host-level action.
+
+So: the entry keeps the name it was granted, and the docker object becomes
+`porterclaude-web-2` (then `-3`, …) when the plain name is occupied — same for the
+per-container volumes. That means storing the resolved docker names on the entry instead of
+deriving them, and looking containers up by their `porterclaude.container` +
+`porterclaude.host` + `porterclaude.instance` labels, which are written on every container
+already. It also removes an older sharp edge: two configured hosts pointing at the *same*
+docker daemon can now hold same-named containers. Adoption stays a host-level action; it is
+a repair, not a create.
+
+**5.8 Two people in one session share one shell — and the UI says so.** Every pane runs
+`tmux new-session -A -s pc_<name>`; the `-A` means *attach if it exists*, which is what makes
+a browser reload drop back into the running shell. Two connections to the same pane therefore
+land in the same tmux session: both see the same screen including the other's typing, either
+can answer an agent's prompt, `Ctrl-C` from either ends it for both, and tmux sizes the
+window to the **smallest** attached client — a laptop shrinks the 4K user's view while
+attached. This is already reachable today with two browser tabs; grants only make the second
+client a different person. It stays as it is, plus a **viewer count on the pane**: silent
+mirroring is the problem, not mirroring.
+
+## 6. Work list
+
+1. `config/{schema,store}.ts` — `users[]`, `grants[]`, `CONFIG_VERSION` 3 + v2→v3 migration.
+2. New `server/src/users/{model,service,routes}.ts` — user CRUD, grant add/remove, both
+   admin-only. ~7 routes.
+3. `auth/index.ts` — verify against `users[]`, put `req.user` on the request. The FROZEN
+   `authenticateUpgradeRequest(req, ctx): boolean` must return the **user** instead of a
+   boolean (called from the session websocket).
+4. `authz.ts` — three predicates: `isAdmin(u)`, `canHost(u, hostId)`,
+   `canContainer(u, hostId, name)`. That is the entire engine.
+5. Apply them: `requireAdmin` on the admin bucket (one middleware, no arguments),
+   `requireHost` on the host bucket, and per-call checks inside the container service
+   (2 212 lines — actor-aware `list`/`get`/`create`/`update`/`remove`/lifecycle/`logs`).
+6. **List filtering** in the host and container list paths, plus the job-read exception
+   (both from §2).
+7. The session websocket — the URL must carry the **host id** (today the container name
+   alone is enough to route, which is exactly the invariant per-host names give up); then
+   `canContainer` before attach, close code `4403` when it says no; viewer count broadcast
+   (5.8).
+8. The §4.1 spec rule in the container service, on create **and** update.
+9. `GET /api/me` → `{ user, admin, hosts: [...], containers: [...] }` so the UI hides what
+   the server would refuse instead of re-deriving the rules. This also replaces
+   `GET /api/auth/session`, which frees that word (§7).
+10. Login by username + password; keep the per-IP limiter, add a per-username lockout.
+11. Web: username field on login; a **Users** sub-tab in Settings (list, add, password reset,
+    disable, and a grant editor that is two pickers); gating driven by `/api/me`.
+12. The §5 decisions: per-user `ui` (5.1), the system actor (5.2), revoke-closes-panes (5.3),
+    grants dropped with their target (5.4), last-admin guard (5.5), `hostId` required on
+    create (5.6), the docker-name suffix (5.7 — lands with phase 0, same naming code), the
+    viewer count (5.8).
+13. Tests: `server/test/*/helpers.ts` builds the authenticated app for all 480 existing tests
+    — that helper change ripples wide but is mechanical — plus a matrix suite (admin /
+    host-granted / container-granted / no-grant × the four buckets).
+14. Docs: `docs/DEPLOYMENT.md` (first-admin bootstrap, upgrade note), `docs/design/api.md`,
+    `CHANGELOG.md`, and the six facts from §4.
+
+## 7. The rename (phase R)
+
+`session` currently means the container (`sessions/` module, `/api/sessions`, `config.sessions[]`,
+`porterclaude.session`), the shell connection (`terminals/`, tmux `pc_<name>`) and the login
+cookie (`pc_session`, `GET /api/auth/session`). v0.3 gives each its own word (§0):
+
+| From | To |
+|---|---|
+| `server/src/sessions/**` | `server/src/containers/**` |
+| `server/src/terminals/**` | `server/src/sessions/**` |
+| `/api/sessions` | `/api/containers` |
+| `/api/terminals?session=&name=` | `/api/sessions?container=&session=` |
+| `config.sessions[]` | `config.containers[]` (v2→v3 migration, same pass as §3) |
+| `porterclaude.session` label | `porterclaude.container` |
+| `pc_session` cookie | `pc_auth` |
+| `GET /api/auth/session` | folded into `GET /api/me` (§6.9) |
+| `web/public/js/sessions.js` | `containers.js`; terminal pane code keeps its file, renamed to `session.js` |
+
+Two things stop this from being a blind find-and-replace:
+
+* **The three meanings are interleaved in the same files.** Of ~2 690 occurrences of
+  "session" in the repo, ~63 are the auth cookie and ~43 are tmux's own vocabulary
+  (`tmux new-session`, `has-session`, `kill-session` — those stay). Only the remainder become
+  `container`. The 672 occurrences of "terminal" become `session`, except where they mean the
+  xterm.js widget, which is genuinely a terminal.
+* **Live containers carry the old label.** Discovery matches on `porterclaude.session`, so a
+  rename strands every running container. Rule: **write the new label, read either**, and drop
+  the compatibility read in v0.4. The migration note in `CHANGELOG.md` says containers are
+  relabelled on their next recreate.
+
+Do this **first**, as its own commit, with no behaviour change in it — every later phase
+references these names, and a rename mixed into a behaviour change is unreviewable.
+
+## 8. Effort
+
+Same delivery pattern as v0.2 (planner → coders per topic → QA), including migration, tests
+and docs.
 
 | Phase | Contents | New/changed LOC | Human | This setup |
 |---|---|---|---|---|
-| **A — Identity** | users in config v3 + migration, per-user auth/JWT, login by username, `GET /api/me`, user CRUD API, Users panel | ~1 200–1 500 | 1–1.5 d | 2–3 h |
-| **B — Authorization** | catalog + roles + grants, `authorize()` on 61 routes, list filtering, WS check, session ownership + label, grant editors in the UI | ~1 500–2 000 | 2–3 d | 3–5 h |
-| **C — Containment** | session spec policy (§6), read-only attach, agent credential scope (§7), per-host quotas | ~800–1 200 | 1.5–2 d | 2–3 h |
-| **D — Audit, hardening, docs, QA** | audit log, lockout, docs, full QA pass on the live host | ~500–800 | 1–2 d | 2–3 h |
-| | | **~4 000–5 500** | **6–9 d** | **9–14 h** |
+| **R — Vocabulary** | the §7 rename, file moves, config key migration, label compatibility, docs sweep | ~3 300 touched, nearly all mechanical | 1–1.5 d | 2–3 h |
+| **0 — Per-host names** | `<hostId>.<container>` everywhere: store helpers, service, route shape, websocket URL, web keying, existing tests — plus the docker-name suffix and lookup-by-label (§5.7) | ~600–900 | 1–1.5 d | 2–3 h |
+| **A — Identity** | users in config v3 + migration, per-user auth/JWT, login by username, `GET /api/me`, user CRUD, Users panel, per-user `ui`, last-admin guard | ~1 000–1 300 | 1–1.5 d | 2–3 h |
+| **B — Grants** | grant store + the three predicates, the four route buckets, list filtering, WS check, §4.1 spec rule, grant editor UI, the rest of §5 | ~1 000–1 400 | 1.5–2 d | 3–4 h |
+| **C — Tests, docs, QA** | authz matrix suite, helper migration, docs, live pass on claude.example.com | ~300–500 | 0.5–1 d | 1–2 h |
+| | | | **5–7.5 d** | **10–15 h** |
 
-Cut-down variants:
+Phase B stays small because of what the model leaves out: no permission catalog, no roles,
+no per-route permission names, no ownership, no audit log, no per-host policy object. Each
+of those would land back in B if it were added later.
 
-* **Minimal (A + B without per-session grants)** — users, instance `admin`/`user`, per-host
-  roles, sessions filtered by owner. ~2–3 human-days / 4–6 h here. Honest label: *multi-user
-  convenience*. It is **not** a security boundary while §6 is missing: any user who can create
-  a session on a host can reach that host's filesystem.
-* **A + B + C** — the first combination that can be described as a security boundary between
-  users. ~5–7 human-days / 7–11 h here.
-* **Plus SSO (OIDC) or API tokens** — deliberately out of scope; ~1–2 days *after* §3 exists,
-  because a second identity source is then only a new way to fill `req.user`.
+Risk hotspots, in order: **R** (it touches every file, and the three meanings of the word are
+interleaved — the label compatibility read is what keeps live containers alive); **0** (it
+re-keys what every other layer refers to, and `config.json` holds live entries); the v2→v3
+migration; the FROZEN `authenticateUpgradeRequest` signature; the test helper change; and UI
+gating drift — which is why §6.9 puts the answer on the server.
 
-Risk hotspots, in order: the v2→v3 migration (it touches `sessions[]`, which people have live
-containers for); the adoption paths in `sessions/service.ts`; the FROZEN
-`authenticateUpgradeRequest` signature; the test helpers; and frontend gating drift — which is
-why §9.8 puts the answer on the server.
+## 9. Open questions
 
-## 11. Open questions for the operator
-
-1. Is the target *teammates who trust each other* (then Minimal + shared agent logins is right
-   and §6 can follow later) or *users who must not reach each other's data or the host* (then
-   C is mandatory and `bind` workspaces default to off)?
-2. May several users attach to one session at once? Sharing a tmux pane means seeing each
-   other's keystrokes — useful for pairing, surprising otherwise. Proposal: allowed, with a
-   "2 viewers" badge on the pane.
-3. Fold `host.delete` into `instance.hosts.delete`, or let a host-admin remove their own host?
-4. Session names are globally unique today, which is what makes `session:<name>` usable as a
-   scope key. Keep that, or move to `host:<id>/session:<name>` now, before grants make the
-   change expensive?
+None. The identifier is qualified everywhere except inside a single host's list (§1),
+sessions mirror with a viewer count (§5.8), and grants cannot outlive or precede their
+target (§5.4).
