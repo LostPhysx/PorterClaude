@@ -3,7 +3,12 @@
 All notable changes to PorterClaude. Versions are git tags (`vX.Y.Z`); each tag is also
 published as `ghcr.io/lostphysx/porterclaude:<version>`.
 
-## Unreleased
+## v0.3.0 — 2026-08-18
+
+Phase R of the v0.3 plan (`docs/design/users.md`): the vocabulary only, no feature changes.
+The later phases — container names unique per host, then users and grants — are breaking in
+their own right and get their own minor versions rather than 0.3.x patches.
+
 
 - **One word, three meanings — fixed.** "Session" used to mean the long-lived box, the shell
   you open inside it, and the login cookie. It now means exactly one thing each: a

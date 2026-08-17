@@ -12,7 +12,8 @@ per host.
   (five built in, plus your own), images and account; everything is configured in the app,
   nothing hard-coded
 
-Status: **v0.2.2** — multiple hosts and pluggable coding agents. Release notes:
+Status: **v0.3.0** — multiple hosts and pluggable coding agents. A **container** is the
+long-lived box, a **session** is one connection to a shell inside it. Release notes:
 [CHANGELOG.md](CHANGELOG.md). Agent guide: [docs/AGENTS.md](docs/AGENTS.md). See also
 [PLAN.md](PLAN.md), [docs/](docs/) and [docs/design/](docs/design/).
 
