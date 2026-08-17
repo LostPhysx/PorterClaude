@@ -12,26 +12,9 @@ per host.
   (five built in, plus your own), images and account; everything is configured in the app,
   nothing hard-coded
 
-Status: **v0.2 — multiple hosts and pluggable coding agents**, on top of the shipped v0.1.0
-(auth, Portainer + socket backends, recipe/custom-image sessions, multi-pane terminals, all
-QA-verified end-to-end). See [PLAN.md](PLAN.md), [docs/](docs/) and
-[docs/design/](docs/design/).
-
-## What v0.2 adds
-
-- **Multiple Docker hosts.** A host is the local socket or a Portainer credential +
-  endpoint; *Import endpoints* creates one host per Portainer endpoint in a click. Images,
-  volumes, sessions and logins are per host, and one unreachable host never breaks the rest.
-- **Coding agents are data, not code.** Claude Code, opencode, Gemini CLI, Codex CLI and
-  Aider ship built in; you can add your own with a JSON definition (npm / pip / installer
-  script / plain binary). Recipe images no longer bake an agent in — every session mounts
-  the host's tools volume instead, so upgrading an agent is *Upgrade all agents* (a forced
-  **Sync tools**), never an image rebuild.
-- **One login per agent per host.** Each agent gets its own volume
-  (`porterclaude-auth-<agentId>`); log in once and every session on that host is
-  authenticated. Upgrading from v0.1 imports the existing Claude Code login automatically.
-
-Full guide: [docs/AGENTS.md](docs/AGENTS.md).
+Status: **v0.2.1** — multiple hosts and pluggable coding agents. Release notes:
+[CHANGELOG.md](CHANGELOG.md). Agent guide: [docs/AGENTS.md](docs/AGENTS.md). See also
+[PLAN.md](PLAN.md), [docs/](docs/) and [docs/design/](docs/design/).
 
 ## Quick start
 
@@ -79,6 +62,7 @@ need no socket. Full operator documentation: [docs/DEPLOYMENT.md](docs/DEPLOYMEN
 | `deploy/` | reference deployment: `deploy.sh` builds the image through Portainer and creates/updates the stack (secrets gitignored) |
 | `.github/workflows/` | CI (typecheck, lint, test, shell/python, agent-installer contract, compose, image build) and multi-arch release to ghcr.io |
 | `docs/` | [DEPLOYMENT.md](docs/DEPLOYMENT.md), [AGENTS.md](docs/AGENTS.md) + the design docs the implementation follows |
+| `CHANGELOG.md` | release notes per tag |
 
 Stack note: [PLAN.md](PLAN.md) sketched Fastify, React/Vite and dockview. The implementation
 deliberately uses **Express 5 + `ws`** and a **bundler-free** Bootstrap/jQuery/GoldenLayout
