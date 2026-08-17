@@ -862,8 +862,11 @@ empty while the tmux sessions behind those panes stay alive and unreachable.
   filter.
 * xterm.js's own API — `new Terminal(...)`, `FitAddon`, `WebLinksAddon` — the Bootstrap icon
   class `bi bi-terminal`, and `ws.readyState`.
-* The word *terminal* wherever it means the widget: terminal bytes, "no tmux → terminals do
-  not survive a reload", the keyboard belonging to the terminal.
+* The word *terminal* wherever it means the widget: terminal bytes, the keyboard belonging to
+  the terminal, the `bi bi-terminal` icon, and an agent described as a *terminal* coding agent
+  (`agents/builtin.ts`). The custom-image warning is NOT one of these: what does not survive a
+  reload is the shell connection, so it now reads "no tmux in this image: sessions will not
+  survive a reload".
 
 ## 13.3 QA (headless, in addition to §8 and §12.8)
 

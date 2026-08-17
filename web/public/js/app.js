@@ -245,11 +245,16 @@ async function doLogout() {
 // routing
 // ---------------------------------------------------------------------------
 
+/** v0.2 name of the containers view, still in old bookmarks and in localStorage (v0.3). */
+const LEGACY_VIEW = { sessions: 'containers' };
+
 function viewFromHash() {
   const raw = String(location.hash || '').replace(/^#\/?/, '').split('?')[0];
   if (VIEWS.includes(raw)) return raw;
+  if (LEGACY_VIEW[raw]) return LEGACY_VIEW[raw];
   const remembered = storage.get(LS_LAST_VIEW, null);
   if (VIEWS.includes(remembered)) return remembered;
+  if (LEGACY_VIEW[remembered]) return LEGACY_VIEW[remembered];
   return DEFAULT_VIEW;
 }
 
@@ -267,6 +272,11 @@ export function navigate(view) {
  */
 export function route() {
   const next = viewFromHash();
+  // a v0.2 bookmark ('#/sessions') resolves to its v0.3 view; rewrite the bar to match so the
+  // address never disagrees with what is shown (replaceState: no extra history entry)
+  if (location.hash && location.hash !== `#/${next}` && LEGACY_VIEW[location.hash.replace(/^#\/?/, '').split('?')[0]]) {
+    history.replaceState(null, '', `#/${next}`);
+  }
   if (!viewsReady) return;
   for (const name of VIEWS) {
     const link = byId(`nav-${name}`);

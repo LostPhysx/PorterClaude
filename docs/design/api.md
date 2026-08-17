@@ -387,7 +387,7 @@ Body `{ "image": "nginx:1.27" }` →
 ```json
 { "result": { "image": "nginx:1.27", "ok": true, "existsLocally": false, "pulled": true,
               "architecture": "arm64", "user": "root",
-              "warnings": ["no tmux in this image: terminals will not survive a reload"],
+              "warnings": ["no tmux in this image: sessions will not survive a reload"],
               "error": null } }
 ```
 
@@ -784,7 +784,7 @@ imported host becomes the default.
 ```json
 {
   "id": "claude", "name": "Claude Code",
-  "description": "Anthropic's session coding agent",
+  "description": "Anthropic's terminal coding agent (native installer, no runtime needed)",
   "command": "claude", "args": [],
   "versionCommand": ["claude", "--version"],
   "install": { "kind": "script", "url": "https://claude.ai/install.sh", "binPath": "bin/claude" },

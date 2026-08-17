@@ -299,7 +299,11 @@ changes; the upgrade is a pull and a restart. Four things an operator sees:
 2. **`config.json` migrates itself.** `sessions[]` becomes `containers[]` and the version goes
    2 → 3; `config.json.v2.bak` is written before the first v3 write. A v1 file still upgrades
    in one boot (v1 → v2 → v3). **Back up `/data` first** — this rewrites the file that holds
-   every container definition.
+   every container definition. If anything looks wrong, stop the container, **restore the
+   `.v2.bak` file** and go back to the v0.2 image. Do not roll back the image without
+   restoring it: a v0.2 server reads a v3 file "as-is", finds no `sessions[]` key, and reports
+   **zero containers with no error at all** — the definitions are still in the file, but the
+   old server cannot see them.
 3. **Running containers are not touched.** They carry the old label `porterclaude.session`;
    the server writes `porterclaude.container` from now on and **reads either**, so nothing is
    orphaned. A container is relabelled on its next *recreate* — there is no need to force one.

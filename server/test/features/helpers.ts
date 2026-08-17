@@ -161,6 +161,10 @@ export function containerSummary(overrides: Partial<ContainerSummary> = {}): Con
  * Its docker name deliberately does NOT match `<containerPrefix><name>`, so `matchContainer`'s
  * second fallback (match by derived name) cannot mask a missing compatibility read — without
  * `containerLabelOf`'s `?? LEGACY_CONTAINER_LABEL` this container is invisible.
+ *
+ * It carries `porterclaude.instance` because that is the shape a v0.2.1/v0.2.2 container really
+ * has, and `ownedByThisInstance` takes a DIFFERENT branch for a container with no instance label
+ * at all (a v0.1/v0.2.0 one). Pass `{ labels: … }` to model that older shape instead.
  */
 export function legacyContainerSummary(
   name: string,
@@ -174,6 +178,7 @@ export function legacyContainerSummary(
     labels: {
       'porterclaude.managed': 'true',
       [LEGACY_CONTAINER_LABEL]: name,
+      'porterclaude.instance': TEST_INSTANCE_ID,
       'porterclaude.image-type': 'recipe',
       'porterclaude.recipe': 'node',
     },
