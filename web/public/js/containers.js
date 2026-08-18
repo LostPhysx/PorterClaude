@@ -18,7 +18,7 @@ import { api } from './api.js';
 import { bus, EVENTS } from './bus.js';
 import {
   byId, toast, toastError, confirmDialog, escapeHtml, fmtDuration, statusBadgeClass,
-  anyModalOpen, renderAlert, storage, LS_PREFIX,
+  anyModalOpen, renderAlert, storage, LS_PREFIX, fmtBytes, fmtDate,
 } from './util.js';
 import { getHosts, getHost, hostLabel, resolveHostId, hostOptionsHtml } from './hosts.js';
 import { agentLabel } from './agents.js';
@@ -60,6 +60,8 @@ let pollTimer = null;
 let pollFailures = 0;
 let initialised = false;
 let logsState = { name: null, timer: null };
+/** #files-modal: which container's workspace is open and where in it we are. */
+let filesState = { name: null, path: '', root: '/workspace', parent: null, busy: false };
 
 /** FROZEN: F2 calls this for its initial rail paint. @returns {any[]} ContainerView[] */
 export function getContainers() {
@@ -252,6 +254,7 @@ function rowActions(container) {
   }
   parts.push(actionButton(name, 'recreate', 'bi-arrow-repeat', 'Recreate container', { disabled: locked || orphan }));
   parts.push(actionButton(name, 'edit', 'bi-pencil', 'Edit (recreates the container)', { disabled: locked || orphan }));
+  parts.push(actionButton(name, 'files', 'bi-folder2-open', 'Workspace files', { disabled: locked || !running }));
   parts.push(actionButton(name, 'logs', 'bi-file-text', 'Logs', { disabled: locked || absent }));
   parts.push(actionButton(name, 'destroy', 'bi-trash', 'Destroy', { disabled: busy, variant: 'outline-danger' }));
   const spinner = busy ? '<span class="spinner-border spinner-border-sm text-secondary ms-2" role="status" aria-hidden="true"></span>' : '';
@@ -1224,6 +1227,225 @@ export function openLogs(name) {
 }
 
 // ---------------------------------------------------------------------------
+// workspace files modal (GET/POST /api/containers/:name/files*)
+//
+// The server pins every path to the container's workspace mount, so `filesState.path` is
+// always an absolute path inside it and '' simply means "the root".
+// ---------------------------------------------------------------------------
+
+function fileIcon(entry) {
+  if (entry.type === 'dir') return 'bi-folder-fill text-warning';
+  if (entry.type === 'link') return 'bi-link-45deg';
+  return 'bi-file-earmark';
+}
+
+function renderBreadcrumb() {
+  const el = byId('files-breadcrumb');
+  if (!el) return;
+  const root = filesState.root || '/workspace';
+  const rest = (filesState.path || root).slice(root.length).split('/').filter(Boolean);
+  const crumbs = [`<li class="breadcrumb-item"><a href="#" data-path="${escapeHtml(root)}">${escapeHtml(root)}</a></li>`];
+  let acc = root;
+  rest.forEach((part, i) => {
+    acc += `/${part}`;
+    const last = i === rest.length - 1;
+    crumbs.push(
+      last
+        ? `<li class="breadcrumb-item active" aria-current="page">${escapeHtml(part)}</li>`
+        : `<li class="breadcrumb-item"><a href="#" data-path="${escapeHtml(acc)}">${escapeHtml(part)}</a></li>`,
+    );
+  });
+  el.innerHTML = crumbs.join('');
+}
+
+function renderFiles(entries) {
+  const body = byId('files-body');
+  if (!body) return;
+  renderBreadcrumb();
+  const up = byId('btn-files-up');
+  if (up) up.disabled = !filesState.parent;
+  if (!entries.length) {
+    body.innerHTML = '<p class="text-secondary mb-0">This directory is empty.</p>';
+    return;
+  }
+  const rows = entries
+    .map((e) => {
+      const name = escapeHtml(e.name);
+      const nameCell = e.type === 'dir'
+        ? `<a href="#" data-dir="${name}"><i class="bi ${fileIcon(e)} me-1"></i>${name}</a>`
+        : `<span><i class="bi ${fileIcon(e)} me-1"></i>${name}</span>`;
+      const size = e.type === 'dir' ? '<span class="text-secondary">-</span>' : escapeHtml(fmtBytes(e.size));
+      const when = e.mtime
+        ? escapeHtml(fmtDate(new Date(e.mtime * 1000).toISOString()))
+        : '<span class="text-secondary">-</span>';
+      return (
+        `<tr><td class="text-break">${nameCell}</td><td class="text-nowrap">${size}</td>` +
+        `<td class="text-nowrap small text-secondary">${when}</td>` +
+        `<td class="text-end"><button type="button" class="btn btn-sm btn-outline-secondary" data-download="${name}"` +
+        ` title="Download" aria-label="Download ${name}"><i class="bi bi-download"></i></button></td></tr>`
+      );
+    })
+    .join('');
+  body.innerHTML =
+    '<table class="table table-sm table-hover align-middle mb-0">' +
+    '<thead><tr><th>Name</th><th>Size</th><th>Modified</th><th></th></tr></thead>' +
+    `<tbody>${rows}</tbody></table>`;
+}
+
+/** Load `path` (absolute, or '' for the workspace root) into the modal. */
+async function loadFiles(path) {
+  const body = byId('files-body');
+  if (!filesState.name || !body) return;
+  body.innerHTML = '<p class="text-secondary mb-0">loading…</p>';
+  try {
+    const res = await api.containers.files.list(filesState.name, path || undefined);
+    const listing = (res && res.listing) || { path: '', root: '/workspace', parent: null, entries: [] };
+    filesState.path = listing.path;
+    filesState.root = listing.root;
+    filesState.parent = listing.parent;
+    renderFiles(listing.entries || []);
+  } catch (err) {
+    renderBreadcrumb();
+    body.innerHTML = '';
+    renderAlert(body, `Could not list the workspace: ${escapeHtml((err && err.message) || 'unknown error')}`, 'danger');
+  }
+}
+
+/** `null` hides the bar; 0..1 shows it. */
+function setUploadProgress(fraction) {
+  const wrap = byId('files-progress');
+  if (!wrap) return;
+  const bar = wrap.querySelector('.progress-bar');
+  if (fraction === null) {
+    wrap.classList.add('d-none');
+    if (bar) bar.style.width = '0%';
+    return;
+  }
+  wrap.classList.remove('d-none');
+  if (bar) bar.style.width = `${Math.round(fraction * 100)}%`;
+}
+
+/** Upload a FileList into the directory currently shown, one request per file. */
+async function uploadFiles(files) {
+  const list = [...(files || [])];
+  if (!list.length || !filesState.name || filesState.busy) return;
+  filesState.busy = true;
+  let done = 0;
+  const failed = [];
+  try {
+    for (const file of list) {
+      try {
+        await api.containers.files.upload(filesState.name, {
+          dir: filesState.path || undefined,
+          file,
+          onProgress: (f) => setUploadProgress((done + f) / list.length),
+        });
+      } catch (err) {
+        // a directory dropped into the dialog cannot be read as one file: report and go on
+        failed.push(file.name);
+        toastError(err, `Could not upload ${file.name}`);
+      }
+      done += 1;
+      setUploadProgress(done / list.length);
+    }
+    const ok = list.length - failed.length;
+    if (ok > 0) toast(ok === 1 ? `Uploaded ${list[0].name}` : `Uploaded ${ok} files`, { variant: 'success' });
+  } finally {
+    filesState.busy = false;
+    setUploadProgress(null);
+    await loadFiles(filesState.path);
+  }
+}
+
+/** Download an entry of the current directory through a temporary <a download>. */
+function downloadFile(name) {
+  const path = `${filesState.path || filesState.root}/${name}`;
+  const link = document.createElement('a');
+  link.href = api.containers.files.downloadUrl(filesState.name, path);
+  // the server sends Content-Disposition; `download` is only the same-origin fallback name
+  link.download = name;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+}
+
+/** Open #files-modal on the workspace root of `name`. */
+export function openFiles(name) {
+  const modalEl = byId('files-modal');
+  if (!modalEl || typeof bootstrap === 'undefined') return;
+  filesState = { name, path: '', root: '/workspace', parent: null, busy: false };
+  const title = byId('files-modal-title');
+  if (title) title.textContent = `Files · ${name}`;
+  setUploadProgress(null);
+  bootstrap.Modal.getOrCreateInstance(modalEl).show();
+  void loadFiles('');
+}
+
+/** Wire #files-modal once (called from init). */
+function initFilesModal() {
+  const modalEl = byId('files-modal');
+  if (!modalEl) return;
+
+  const body = byId('files-body');
+  if (body) {
+    body.addEventListener('click', (e) => {
+      const dir = e.target.closest('a[data-dir]');
+      if (dir) {
+        e.preventDefault();
+        void loadFiles(`${filesState.path || filesState.root}/${dir.getAttribute('data-dir')}`);
+        return;
+      }
+      const dl = e.target.closest('button[data-download]');
+      if (dl) downloadFile(dl.getAttribute('data-download'));
+    });
+  }
+
+  const crumbs = byId('files-breadcrumb');
+  if (crumbs) {
+    crumbs.addEventListener('click', (e) => {
+      const link = e.target.closest('a[data-path]');
+      if (!link) return;
+      e.preventDefault();
+      void loadFiles(link.getAttribute('data-path'));
+    });
+  }
+
+  const up = byId('btn-files-up');
+  if (up) up.addEventListener('click', () => { if (filesState.parent) void loadFiles(filesState.parent); });
+  const refresh = byId('btn-files-refresh');
+  if (refresh) refresh.addEventListener('click', () => { void loadFiles(filesState.path); });
+
+  const input = byId('files-input');
+  const pick = byId('btn-files-upload');
+  if (pick && input) pick.addEventListener('click', () => input.click());
+  if (input) {
+    input.addEventListener('change', () => {
+      const picked = [...input.files];
+      input.value = '';
+      void uploadFiles(picked);
+    });
+  }
+
+  const drop = byId('files-drop');
+  if (drop) {
+    const stop = (e) => { e.preventDefault(); e.stopPropagation(); };
+    ['dragenter', 'dragover'].forEach((ev) => {
+      drop.addEventListener(ev, (e) => { stop(e); drop.classList.add('pc-files-dragover'); });
+    });
+    ['dragleave', 'drop'].forEach((ev) => {
+      drop.addEventListener(ev, (e) => { stop(e); drop.classList.remove('pc-files-dragover'); });
+    });
+    drop.addEventListener('drop', (e) => {
+      void uploadFiles(e.dataTransfer ? e.dataTransfer.files : null);
+    });
+  }
+
+  modalEl.addEventListener('hidden.bs.modal', () => {
+    filesState = { name: null, path: '', root: '/workspace', parent: null, busy: false };
+  });
+}
+
+// ---------------------------------------------------------------------------
 // row actions
 // ---------------------------------------------------------------------------
 
@@ -1282,6 +1504,9 @@ async function runAction(action, name) {
       return;
     case 'logs':
       openLogs(name);
+      return;
+    case 'files':
+      openFiles(name);
       return;
     case 'destroy':
       await destroyContainer(container);
@@ -1381,6 +1606,7 @@ const containersView = {
     }
     const containerModal = byId('container-modal');
     if (containerModal) containerModal.addEventListener('hidden.bs.modal', () => { editing = null; });
+    initFilesModal();
 
     bus.on(EVENTS.AUTH_LOST, () => {
       if (pollTimer) clearTimeout(pollTimer);

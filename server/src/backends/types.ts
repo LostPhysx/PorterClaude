@@ -1,5 +1,7 @@
 // FROZEN (planner-authored, types only). THE contract between B1 (implementations) and
-// B2 (consumers: containers / sessions / images). Do not change any exported shape.
+// B2 (consumers: containers / sessions / images). Do not change any exported shape;
+// ADDING a member is allowed (v0.3.1: getArchive/putArchive) and must land in both
+// backends plus the test stub (server/test/features/helpers.ts) in the same change.
 import type { Readable } from 'node:stream';
 
 export type BackendKind = 'portainer' | 'socket';
@@ -283,6 +285,24 @@ export interface DockerBackend {
   pullImage(ref: string, opts?: PullOptions): Promise<void>;
   removeImage(ref: string, opts?: { force?: boolean }): Promise<void>;
   buildImage(opts: BuildOptions): Promise<void>;
+
+  /**
+   * docker `GET /containers/{id}/archive?path=` — a TAR stream of `path` (one entry for a
+   * file, the whole subtree for a directory). Added in v0.3.1 for the workspace file
+   * transfer; both transports implement it.
+   */
+  getArchive(containerId: string, path: string): Promise<Readable>;
+  /**
+   * docker `PUT /containers/{id}/archive?path=` — extract `tar` INTO the existing directory
+   * `path`. `noOverwriteDirNonDir` makes docker refuse to replace a directory with a file
+   * (and vice versa) instead of failing halfway.
+   */
+  putArchive(
+    containerId: string,
+    path: string,
+    tar: Readable,
+    opts?: { noOverwriteDirNonDir?: boolean },
+  ): Promise<void>;
 
   listVolumes(): Promise<VolumeSummary[]>;
   createVolume(spec: { name: string; labels?: Record<string, string>; driver?: string }): Promise<VolumeSummary>;

@@ -158,3 +158,14 @@ html, body { height: 100%; }
 #hosts-tbody .badge, #credentials-list .badge { font-weight: 500; }
 /* the agent picker of the container dialog greys out while it inherits the host's set */
 #sf-agents.opacity-50 { pointer-events: none; }
+
+/* workspace files modal: the whole body is the drop target */
+.pc-files-drop { transition: background-color .12s ease-in-out, box-shadow .12s ease-in-out; }
+.pc-files-dragover {
+  background-color: rgba(var(--bs-primary-rgb), .08);
+  box-shadow: inset 0 0 0 2px rgba(var(--bs-primary-rgb), .5);
+}
+#files-body table { margin-bottom: 0; }
+#files-body a { text-decoration: none; }
+#files-progress { height: .4rem; }
+#files-breadcrumb { margin-bottom: .25rem; }

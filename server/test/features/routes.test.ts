@@ -4,6 +4,7 @@
 // host id to every ImageService call); containers stay flat because names are unique.
 import { describe, expect, it, beforeEach } from 'vitest';
 import express from 'express';
+import { Readable } from 'node:stream';
 import request from 'supertest';
 import type { AppContext } from '../../src/context.js';
 import { AppError, toAppError } from '../../src/http/errors.js';
@@ -105,6 +106,20 @@ function makeApp() {
         rec('getJobLines', [id, since, hostId], { lines: ['a'], nextIndex: 1 }),
       cancelJob: (id: string, hostId?: string) => rec('cancelJob', [id, hostId], job),
     },
+    files: {
+      list: async (name: string, path: string | undefined) =>
+        rec('files.list', [name, path], { path: '/workspace', root: '/workspace', parent: null, entries: [] }),
+      download: async (name: string, path: string) =>
+        rec('files.download', [name, path], {
+          kind: 'file',
+          filename: 'a bä.txt',
+          size: 5,
+          stream: Readable.from([Buffer.from('hello')]),
+        }),
+      upload: async (name: string, dir: string | undefined, file: string, _body: unknown, size: number) =>
+        rec('files.upload', [name, dir, file, size], { path: `/workspace/${file}`, size }),
+    },
+    log: { warn: () => undefined, error: () => undefined, info: () => undefined },
     // v0.2: every host-scoped URL resolves its host first - an unknown id is a 404
     hosts: {
       require: (hostId: string) => {
@@ -353,5 +368,44 @@ describe('/api/hosts/:hostId/images', () => {
     await request(app).get('/api/images').expect(404);
     await request(app).get('/api/images/recipes').expect(404);
     await request(app).post('/api/images/tools/sync').expect(404);
+  });
+});
+
+describe('/api/containers/:name/files', () => {
+  it('GET lists the workspace and passes the path through', async () => {
+    const res = await request(makeApp()).get('/api/containers/web/files?path=src').expect(200);
+    expect(res.body.listing.root).toBe('/workspace');
+    expect(calls.find((c) => c.method === 'files.list')?.args).toEqual(['web', 'src']);
+  });
+
+  it('GET /download streams the file with both Content-Disposition forms', async () => {
+    const res = await request(makeApp())
+      .get('/api/containers/web/files/download?path=a.txt')
+      .expect(200);
+    expect(res.headers['content-type']).toBe('application/octet-stream');
+    expect(res.headers['content-length']).toBe('5');
+    // non-ascii is replaced in the quoted name and percent-encoded in the RFC 5987 one
+    expect(res.headers['content-disposition']).toBe(
+      `attachment; filename="a b_.txt"; filename*=UTF-8''a%20b%C3%A4.txt`,
+    );
+    expect(calls.find((c) => c.method === 'files.download')?.args).toEqual(['web', 'a.txt']);
+  });
+
+  it('POST /upload passes the target dir, file name and length', async () => {
+    const res = await request(makeApp())
+      .post('/api/containers/web/files/upload?path=src&name=notes.md')
+      .set('Content-Type', 'application/octet-stream')
+      .send(Buffer.from('hello'))
+      .expect(201);
+    expect(res.body.file).toEqual({ path: '/workspace/notes.md', size: 5 });
+    expect(calls.find((c) => c.method === 'files.upload')?.args).toEqual(['web', 'src', 'notes.md', 5]);
+  });
+
+  it('POST /upload without a file name is a 422', async () => {
+    await request(makeApp())
+      .post('/api/containers/web/files/upload?path=src')
+      .set('Content-Type', 'application/octet-stream')
+      .send(Buffer.from('hello'))
+      .expect(422);
   });
 });

@@ -35,6 +35,7 @@ import { HostManager } from './hosts/manager.js';
 import { AgentRegistry } from './agents/registry.js';
 import { createAuthService } from './auth/index.js';
 import { ContainerService } from './containers/service.js';
+import { ContainerFilesService } from './containers/files.js';
 import { ImageService } from './images/service.js';
 import { SessionService } from './sessions/service.js';
 import { attachSessionWs } from './sessions/ws.js';
@@ -83,6 +84,7 @@ export async function start(): Promise<StartedServer> {
   const containers = new ContainerService(deps, images);
   // the third argument is the tools-volume gate for `shell=agent:<id>` (see SessionService)
   const sessions = new SessionService(deps, containers, images);
+  const files = new ContainerFilesService(deps, containers);
   const auth = createAuthService({ config, secrets, env, log });
 
   const ctx: AppContext = {
@@ -91,6 +93,7 @@ export async function start(): Promise<StartedServer> {
     auth,
     credentials,
     containers,
+    files,
     images,
     sessions,
     version: readVersion(),

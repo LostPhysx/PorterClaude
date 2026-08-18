@@ -1,4 +1,5 @@
 // OWNER: B2. Test doubles shared by the feature tests. No docker host, no B1 runtime code.
+import { Readable } from 'node:stream';
 import pino from 'pino';
 import type { ServiceDeps } from '../../src/context.js';
 import { AppError } from '../../src/http/errors.js';
@@ -259,6 +260,8 @@ export function stubBackend(overrides: Partial<DockerBackend> = {}): StubBackend
     execInspect: async (execId) => record('execInspect', [execId], { running: true, exitCode: null, pid: 1 }),
     runExec: async (containerId, cmd, opts) =>
       record('runExec', [containerId, cmd, opts], { exitCode: 0, stdout: '', stderr: '' } satisfies ExecResult),
+    getArchive: async (id, path) => record('getArchive', [id, path], Readable.from([])),
+    putArchive: async (id, path, tar, opts) => record('putArchive', [id, path, tar, opts], undefined),
     listImages: async () =>
       record(
         'listImages',

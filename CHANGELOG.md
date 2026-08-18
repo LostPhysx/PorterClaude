@@ -3,6 +3,22 @@
 All notable changes to PorterClaude. Versions are git tags (`vX.Y.Z`); each tag is also
 published as `ghcr.io/lostphysx/porterclaude:<version>`.
 
+## v0.3.1 — 2026-08-18
+
+- **Workspace file transfer.** Every running container gets a **Files** action in the
+  Containers tab: browse `/workspace` (the container's `workspaceMount`), walk into
+  subdirectories, download a file, download a directory as `.tar.gz`, and upload by picking
+  files or dropping them into the dialog. Uploads land in the directory shown, are written as
+  the container's own uid/gid, and are capped at 512 MiB each.
+- New routes `GET /api/containers/:name/files`, `GET …/files/download` and
+  `POST …/files/upload` (`docs/design/api.md`). Transfers use the docker archive endpoints —
+  `DockerBackend` gained `getArchive`/`putArchive`, implemented for both the socket and the
+  Portainer transport — so nothing is buffered on the way through and no new container
+  tooling is required. The listing is one `sh` exec per directory.
+- Paths are pinned to the workspace mount: anything resolving outside it is refused. That is
+  a guard rail for the UI, not a sandbox — a session in the same container still sees the
+  whole filesystem.
+
 ## v0.3.0 — 2026-08-18
 
 Phase R of the v0.3 plan (`docs/design/users.md`): the vocabulary only, no feature changes.

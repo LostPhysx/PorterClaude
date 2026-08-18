@@ -139,7 +139,7 @@ web/
                                          sessionWsUrl() (complete)
     js/util.js                      F1   escapeHtml, toast, confirmDialog, fmt*, debounce, storage
     js/app.js                       F1   boot, auth gate, hash routing, theme, view lifecycle
-    js/containers.js                F1   Containers tab (table, modal, actions, logs)
+    js/containers.js                F1   Containers tab (table, modal, actions, logs, files)
     js/settings.js                  F1   Settings tab (backend / general / account)
     js/images.js                    F1   Settings → Images sub-panel (recipes, jobs, tools)
     js/code.js                      F2   Code tab: GoldenLayout, rail, layout persistence
@@ -204,8 +204,10 @@ Ids may be **added**, never renamed or removed. F1 owns the file but must leave 
 **Containers tab (F1)**: `#containers-table` / `#containers-tbody` / `#containers-empty` /
 `#containers-alert`, buttons `#btn-container-new`, `#btn-containers-refresh`, `#btn-reconcile`;
 modals `#container-modal` (+ `#container-form`, `#container-form-body`, `#container-modal-title`,
-`#btn-container-save`, `#container-form-error`) and `#logs-modal` (+ `#logs-body`, `#logs-tail`,
-`#btn-logs-refresh`).
+`#btn-container-save`, `#container-form-error`), `#logs-modal` (+ `#logs-body`, `#logs-tail`,
+`#btn-logs-refresh`) and `#files-modal` (v0.3.1: `#files-modal-title`, `#files-breadcrumb`,
+`#files-body`, `#files-drop`, `#files-progress`, `#files-input`, `#btn-files-up`,
+`#btn-files-refresh`, `#btn-files-upload`).
 
 **Settings tab (F1)**: `#settings-subtabs` with `.pc-subview[data-subtab]` panes
 `backend | general | images | account`; `#backend-form` (+ `#backend-kind-socket`,

@@ -1,12 +1,17 @@
 {
   "name": "porterclaude",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "type": "module",
   "description": "Self-hosted web app that launches Claude Code dev containers and attaches browser terminals",
   "license": "UNLICENSED",
-  "engines": { "node": ">=22" },
-  "workspaces": ["server", "web"],
+  "engines": {
+    "node": ">=22"
+  },
+  "workspaces": [
+    "server",
+    "web"
+  ],
   "scripts": {
     "dev": "npm run dev --workspace server",
     "build": "npm run build --workspaces --if-present",

@@ -8,6 +8,7 @@
 // with the Portainer backend (Portainer only proxies the same engine API), so the mapping
 // exists exactly once.
 import fs from 'node:fs/promises';
+import type { Readable } from 'node:stream';
 import Docker from 'dockerode';
 import { DockerApiError } from '../http/errors.js';
 import type {
@@ -459,6 +460,28 @@ export class SocketBackend implements DockerBackend {
       }),
     );
     return decodeDockerStream(Buffer.isBuffer(buf) ? buf : Buffer.from(String(buf), 'utf8'));
+  }
+
+  async getArchive(containerId: string, path: string): Promise<Readable> {
+    const stream = await this.call(`read ${path} from container ${containerId}`, () =>
+      this.docker.getContainer(containerId).getArchive({ path }),
+    );
+    return stream as unknown as Readable;
+  }
+
+  async putArchive(
+    containerId: string,
+    path: string,
+    tar: Readable,
+    opts?: { noOverwriteDirNonDir?: boolean },
+  ): Promise<void> {
+    await this.call(`write ${path} into container ${containerId}`, () =>
+      // @types/dockerode types the options as `{}`; the engine reads path/noOverwriteDirNonDir
+      this.docker.getContainer(containerId).putArchive(tar as unknown as NodeJS.ReadableStream, {
+        path,
+        ...(opts?.noOverwriteDirNonDir ? { noOverwriteDirNonDir: 'true' } : {}),
+      }),
+    );
   }
 
   async execCreate(spec: ExecSpec): Promise<{ execId: string }> {

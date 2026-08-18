@@ -141,6 +141,46 @@ export function request(method, path, opts = {}) {
   });
 }
 
+/**
+ * Raw binary POST with upload progress. jQuery's $.ajax reports none, so this is a bare XHR;
+ * the response envelope and the 401 handling match `request()` above.
+ *
+ * @param {string} path
+ * @param {{query?:Record<string,unknown>, file:File|Blob, onProgress?:(fraction:number)=>void}} opts
+ * @returns {Promise<any>}
+ */
+export function uploadBinary(path, opts) {
+  const url = buildUrl(path, opts.query);
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', url, true);
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+    if (opts.onProgress && xhr.upload) {
+      xhr.upload.addEventListener('progress', (ev) => {
+        if (ev.lengthComputable && ev.total > 0) opts.onProgress(ev.loaded / ev.total);
+      });
+    }
+    xhr.addEventListener('error', () => reject(new ApiError('network', 0, 'Server unreachable')));
+    xhr.addEventListener('abort', () => reject(new ApiError('network', 0, 'Upload cancelled')));
+    xhr.addEventListener('load', () => {
+      let parsed = null;
+      try {
+        parsed = xhr.responseText ? JSON.parse(xhr.responseText) : null;
+      } catch {
+        parsed = null;
+      }
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(parsed);
+        return;
+      }
+      const err = errorFromXhr({ status: xhr.status, responseJSON: parsed, responseText: xhr.responseText }, 'error');
+      if (err.status === 401) bus.emit(EVENTS.AUTH_REQUIRED, {});
+      reject(err);
+    });
+    xhr.send(opts.file);
+  });
+}
+
 const get = (p, query) => request('GET', p, { query });
 const post = (p, body) => request('POST', p, { body });
 const put = (p, body) => request('PUT', p, { body });
@@ -303,6 +343,28 @@ export const api = {
         tail: opts.tail, timestamps: opts.timestamps ? 1 : undefined,
       }),
     reconcile: () => post('/containers/reconcile', {}),
+
+    /** v0.3.1: browse / download / upload the container's workspace mount. */
+    files: {
+      /** @param {string} [path] absolute inside the container, or relative to the workspace
+       *  @returns {Promise<{listing:{path:string, root:string, parent:string|null, entries:any[]}}>} */
+      list: (name, path) => get(`/containers/${enc(name)}/files`, { path }),
+      /** URL for an <a download>: the auth cookie rides along with the navigation. */
+      downloadUrl: (name, path) =>
+        `${API_BASE}/containers/${enc(name)}/files/download?path=${enc(path || '')}`,
+      /**
+       * One file into the directory `dir`. The body is the raw File (Content-Length is what
+       * the server turns into the tar header), so there is no multipart parser on the server.
+       * @param {{dir?:string, file:File, onProgress?:(fraction:number)=>void}} opts
+       * @returns {Promise<{file:{path:string,size:number}}>}
+       */
+      upload: (name, opts) =>
+        uploadBinary(`/containers/${enc(name)}/files/upload`, {
+          query: { path: opts.dir, name: opts.file.name },
+          file: opts.file,
+          onProgress: opts.onProgress,
+        }),
+    },
   },
 };
 

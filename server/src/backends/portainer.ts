@@ -410,6 +410,48 @@ export class PortainerBackend implements DockerBackend {
     return decodeDockerStream(Buffer.isBuffer(buf) ? buf : Buffer.from(String(buf ?? ''), 'utf8'));
   }
 
+  async getArchive(containerId: string, path: string): Promise<Readable> {
+    const what = `read ${path} from container ${containerId}`;
+    let res: RawResponse;
+    try {
+      // no client timeout: a big directory tar can take a while to stream
+      res = await this.send('GET', this.dockerUrl(`/containers/${containerId}/archive`, { path }), {
+        timeoutMs: null,
+      });
+    } catch (err) {
+      throw toDockerApiError(err, what);
+    }
+    if (res.status >= 400) {
+      const buf = await PortainerBackend.readAll(res.stream);
+      throw new DockerApiError(`${what}: ${PortainerBackend.errorMessage(buf, res.status)}`, res.status);
+    }
+    return res.stream;
+  }
+
+  async putArchive(
+    containerId: string,
+    path: string,
+    tar: Readable,
+    opts?: { noOverwriteDirNonDir?: boolean },
+  ): Promise<void> {
+    const what = `write ${path} into container ${containerId}`;
+    // the tar is a stream, so this goes out chunked (like /build already does through this
+    // same transport) — its length is only known once the last byte of the upload is in
+    let res: RawResponse;
+    try {
+      res = await this.send('PUT', this.dockerUrl(`/containers/${containerId}/archive`, {
+        path,
+        noOverwriteDirNonDir: opts?.noOverwriteDirNonDir ? 'true' : undefined,
+      }), { body: tar, contentType: 'application/x-tar', timeoutMs: null });
+    } catch (err) {
+      throw toDockerApiError(err, what);
+    }
+    const buf = await PortainerBackend.readAll(res.stream);
+    if (res.status >= 400) {
+      throw new DockerApiError(`${what}: ${PortainerBackend.errorMessage(buf, res.status)}`, res.status);
+    }
+  }
+
   async execCreate(spec: ExecSpec): Promise<{ execId: string }> {
     const res = await this.request<Raw>('POST', `/containers/${spec.containerId}/exec`, {
       body: dockerMap.toExecBody(spec),

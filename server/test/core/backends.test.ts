@@ -207,7 +207,8 @@ describe('both backends implement the DockerBackend surface', () => {
   const members: Array<keyof DockerBackend> = [
     'ping', 'info', 'listContainers', 'inspectContainer', 'createContainer', 'startContainer',
     'stopContainer', 'restartContainer', 'removeContainer', 'waitContainer', 'containerLogs',
-    'execCreate', 'execStart', 'execResize', 'execInspect', 'runExec', 'listImages',
+    'execCreate', 'execStart', 'execResize', 'execInspect', 'runExec', 'getArchive', 'putArchive',
+    'listImages',
     'inspectImage', 'pullImage', 'removeImage', 'buildImage', 'listVolumes', 'createVolume',
     'removeVolume', 'listNetworks', 'close',
   ];

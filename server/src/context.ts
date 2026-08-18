@@ -10,6 +10,7 @@ import type { Env } from './env.js';
 import type { Logger } from './logger.js';
 import type { Paths } from './paths.js';
 import type { ContainerService } from './containers/service.js';
+import type { ContainerFilesService } from './containers/files.js';
 import type { ImageService } from './images/service.js';
 import type { SessionService } from './sessions/service.js';
 
@@ -37,6 +38,8 @@ export interface AppContext extends ServiceDeps {
   credentials: CredentialStore;
   /** v0.3: the long-lived project containers (was `sessions`) */
   containers: ContainerService;
+  /** v0.3.1: browse / download / upload the workspace of a running container */
+  files: ContainerFilesService;
   images: ImageService;
   /** v0.3: the shell connections inside a container (was `terminals`) */
   sessions: SessionService;

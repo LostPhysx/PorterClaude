@@ -454,6 +454,38 @@
     </div>
   </div>
 
+  <!-- workspace files: browse / download / upload (owner: F1) -->
+  <div class="modal fade" id="files-modal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-xl modal-dialog-scrollable">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title" id="files-modal-title">Files</h5>
+          <div class="ms-auto d-flex gap-2 align-items-center">
+            <button id="btn-files-up" class="btn btn-sm btn-outline-secondary" type="button"
+                    title="Parent directory" aria-label="Parent directory"><i class="bi bi-arrow-90deg-up"></i></button>
+            <button id="btn-files-refresh" class="btn btn-sm btn-outline-secondary" type="button"
+                    title="Refresh" aria-label="Refresh"><i class="bi bi-arrow-clockwise"></i></button>
+            <button id="btn-files-upload" class="btn btn-sm btn-primary" type="button">
+              <i class="bi bi-upload me-1"></i>Upload</button>
+            <input id="files-input" type="file" multiple class="d-none">
+            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+          </div>
+        </div>
+        <div class="modal-body pc-files-drop" id="files-drop">
+          <nav aria-label="path"><ol class="breadcrumb small mb-2" id="files-breadcrumb"></ol></nav>
+          <div id="files-progress" class="progress mb-2 d-none" role="progressbar" aria-label="upload progress">
+            <div class="progress-bar progress-bar-striped progress-bar-animated" style="width:0%"></div>
+          </div>
+          <div id="files-body"></div>
+          <p class="text-secondary small mt-2 mb-0">
+            Drop files anywhere in this dialog to upload them into the directory shown above.
+            Directories download as <code>.tar.gz</code>.
+          </p>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- build/job output (owner: F1) -->
   <div class="modal fade" id="job-modal" tabindex="-1" aria-hidden="true">
     <div class="modal-dialog modal-xl modal-dialog-scrollable">

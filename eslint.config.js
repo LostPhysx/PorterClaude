@@ -33,7 +33,8 @@ export default [
         setInterval: 'readonly', clearInterval: 'readonly',
         requestAnimationFrame: 'readonly', cancelAnimationFrame: 'readonly',
         matchMedia: 'readonly', URL: 'readonly', URLSearchParams: 'readonly',
-        Blob: 'readonly', TextEncoder: 'readonly', TextDecoder: 'readonly',
+        Blob: 'readonly', File: 'readonly', XMLHttpRequest: 'readonly',
+        TextEncoder: 'readonly', TextDecoder: 'readonly',
         CustomEvent: 'readonly', Event: 'readonly', HTMLElement: 'readonly',
         // third-party globals loaded from /vendor/** by index.html
         $: 'readonly', jQuery: 'readonly', bootstrap: 'readonly',

@@ -7,13 +7,16 @@ per host.
 - **Code** — terminal workspace (tabs, drag-to-split panes, reconnect-safe via tmux); every
   pane is a shell or a coding agent
 - **Containers** — create / edit / destroy dev containers on any host, from curated recipes
-  (node, dotnet, php-fpm+nginx, python, go, base) or any custom image
+  (node, dotnet, php-fpm+nginx, python, go, base) or any custom image; **Files** browses each
+  running container's `/workspace` and moves files in and out of it (drag-and-drop upload,
+  directories download as `.tar.gz`)
 - **Settings** — **hosts** (local Docker socket and/or Portainer endpoints), **agents**
   (five built in, plus your own), images and account; everything is configured in the app,
   nothing hard-coded
 
-Status: **v0.3.0** — multiple hosts and pluggable coding agents. A **container** is the
-long-lived box, a **session** is one connection to a shell inside it. Release notes:
+Status: **v0.3.1** — multiple hosts, pluggable coding agents and workspace file transfer. A
+**container** is the long-lived box, a **session** is one connection to a shell inside it.
+Release notes:
 [CHANGELOG.md](CHANGELOG.md). Agent guide: [docs/AGENTS.md](docs/AGENTS.md). See also
 [PLAN.md](PLAN.md), [docs/](docs/) and [docs/design/](docs/design/).
 

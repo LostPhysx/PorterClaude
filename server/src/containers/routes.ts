@@ -3,6 +3,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 import type { AppContext } from '../context.js';
 import { asyncHandler } from '../http/async.js';
+import { AppError } from '../http/errors.js';
 import { parseBody, parseParams, parseQuery } from '../http/validate.js';
 import { ContainerInputSchema, ContainerNameSchema } from './model.js';
 
@@ -21,6 +22,11 @@ const RemoveQuery = z.object({ removeVolumes: boolish });
 
 /** v0.2: optional host filter for the list; container NAMES stay globally unique. */
 const ListQuery = z.object({ hostId: z.string().min(1).max(32).optional() });
+
+/** `path` is absolute inside the container or relative to the workspace mount. */
+const FilesQuery = z.object({ path: z.string().max(4096).optional() });
+
+const UploadQuery = FilesQuery.extend({ name: z.string().min(1).max(255) });
 
 const LogsQuery = z.object({
   tail: z.coerce.number().int().min(1).max(10_000).optional().default(200),
@@ -44,6 +50,10 @@ const LogsQuery = z.object({
  * POST   /api/containers/:name/restart   -> { container: ContainerView }
  * POST   /api/containers/:name/recreate  -> { container: ContainerView }
  * GET    /api/containers/:name/logs?tail=200&timestamps=0 -> { logs: string }
+ * GET    /api/containers/:name/files?path=<dir>            -> { listing: FileListing }
+ * GET    /api/containers/:name/files/download?path=<p>     -> the file, or <dir>.tar.gz
+ * POST   /api/containers/:name/files/upload?path=<dir>&name=<file>
+ *                                         raw body (Content-Length required) -> 201 { file }
  * POST   /api/containers/reconcile?hostId=<id> -> { report: ReconcileReport }
  *                                         (every host, or just one)
  */
@@ -154,5 +164,62 @@ export function createContainersRouter(ctx: AppContext): Router {
     }),
   );
 
+  // ---- workspace file transfer (containers/files.ts) ----------------------
+
+  router.get(
+    '/:name/files',
+    asyncHandler(async (req, res) => {
+      const { name } = parseParams(NameParams, req);
+      const { path } = parseQuery(FilesQuery, req);
+      res.json({ listing: await ctx.files.list(name, path) });
+    }),
+  );
+
+  router.get(
+    '/:name/files/download',
+    asyncHandler(async (req, res) => {
+      const { name } = parseParams(NameParams, req);
+      const { path } = parseQuery(FilesQuery, req);
+      const file = await ctx.files.download(name, path ?? '');
+      res.setHeader('Content-Type', file.kind === 'dir' ? 'application/gzip' : 'application/octet-stream');
+      res.setHeader('Content-Disposition', contentDisposition(file.filename));
+      if (file.size !== null) res.setHeader('Content-Length', String(file.size));
+      // the tab may be closed mid-download: stop pulling from the engine when it is
+      res.on('close', () => file.stream.destroy());
+      // a failure here is asynchronous and the headers are already out, so there is no error
+      // envelope left to send — the truncated response IS the error signal. It must not be
+      // rethrown either: nothing would catch it and the process would die.
+      file.stream.on('error', (err: Error) => {
+        ctx.log.warn({ err, container: name }, 'workspace download stream failed');
+        res.destroy(err);
+      });
+      file.stream.pipe(res);
+    }),
+  );
+
+  router.post(
+    '/:name/files/upload',
+    asyncHandler(async (req, res) => {
+      const { name } = parseParams(NameParams, req);
+      const { path, name: filename } = parseQuery(UploadQuery, req);
+      // the tar header carries the size, so the length has to be known before the first byte
+      const length = Number(req.headers['content-length']);
+      if (!Number.isInteger(length) || length < 0) {
+        throw AppError.badRequest('Content-Length is required for an upload');
+      }
+      const file = await ctx.files.upload(name, path, filename, req, length);
+      res.status(201).json({ file });
+    }),
+  );
+
   return router;
+}
+
+/**
+ * `attachment; filename="x"; filename*=UTF-8''x` — the quoted form for old clients (with
+ * everything a header may not carry replaced), the RFC 5987 form for everyone else.
+ */
+function contentDisposition(filename: string): string {
+  const ascii = filename.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_');
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(filename)}`;
 }

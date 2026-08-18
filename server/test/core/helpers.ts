@@ -13,6 +13,7 @@ import { CredentialStore } from '../../src/hosts/credentials.js';
 import { HostManager } from '../../src/hosts/manager.js';
 import { AgentRegistry } from '../../src/agents/registry.js';
 import { createAuthService } from '../../src/auth/index.js';
+import { ContainerFilesService } from '../../src/containers/files.js';
 import { ContainerService } from '../../src/containers/service.js';
 import { ImageService } from '../../src/images/service.js';
 import { SessionService } from '../../src/sessions/service.js';
@@ -64,14 +65,16 @@ export async function buildContext(env: Record<string, string> = {}): Promise<{ 
     backends: hosts.legacyAccess(),
   };
   const images = new ImageService(deps);
+  const containers = new ContainerService(deps);
   const ctx: AppContext = {
     ...deps,
     secrets,
     auth: createAuthService({ config, secrets, env: parsed, log }),
     credentials,
-    containers: new ContainerService(deps),
+    containers,
+    files: new ContainerFilesService(deps, containers),
     images,
-    sessions: new SessionService(deps, new ContainerService(deps), images),
+    sessions: new SessionService(deps, containers, images),
     version: '0.0.0-test',
     startedAt: Date.now(),
   };

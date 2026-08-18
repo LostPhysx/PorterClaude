@@ -247,9 +247,31 @@ outside this install ever appears there.
 | POST | `/api/containers/:name/restart` | – | `{ "container": ContainerView }` |
 | POST | `/api/containers/:name/recreate` | – | `{ "container": ContainerView }` |
 | GET | `/api/containers/:name/logs?tail=200&timestamps=0` | – | `{ "logs": "…" }` |
+| GET | `/api/containers/:name/files?path=<dir>` | – | `{ "listing": FileListing }` |
+| GET | `/api/containers/:name/files/download?path=<p>` | – | the raw file, or `<dir>.tar.gz` |
+| POST | `/api/containers/:name/files/upload?path=<dir>&name=<file>` | raw bytes | `201 { "file": { "path": "…", "size": 12 } }` |
 | POST | `/api/containers/reconcile` | – | `{ "report": { "known": 3, "running": 2, "orphans": [], "adopted": ["x"], "missing": ["y"] } }` |
 
 Notes
+* **Workspace files (v0.3.1).** The three `…/files*` routes browse and transfer the
+  container's workspace mount (`general.workspaceMount`, `/workspace` by default) and need a
+  **running** container. `path` is absolute inside the container or relative to that mount;
+  anything resolving outside it is `400 bad_request`. The listing comes from one `sh` exec,
+  the transfers from the docker archive endpoints:
+
+  ```json
+  { "listing": { "path": "/workspace/src", "root": "/workspace", "parent": "/workspace",
+                 "entries": [{ "name": "app.ts", "type": "file", "size": 1200, "mtime": 1755400000 }] } }
+  ```
+
+  `type` is `file` | `dir` | `link` | `other`, `mtime` unix seconds (0 when `stat` could not
+  answer). `download` streams a file as `application/octet-stream` with its `Content-Length`,
+  and a directory as the gzipped docker tar (`application/gzip`, chunked); both carry a
+  `Content-Disposition` filename. `upload` takes ONE file as the raw request body (no
+  multipart) — `Content-Length` is required because it becomes the tar header, the body is
+  streamed into the container without being buffered, the file is written as the container's
+  own uid/gid with mode 0644, and anything over 512 MiB is refused. `404` = the container is
+  gone or `path` does not exist, `409` = the container is not running.
 * `resolvedImage` is never the raw docker value: a recipe rebuild retags
   `<ns>/<recipe>:latest`, after which docker reports a bare `sha256:…` for every container
   created before it. That digest is `containerImage`; `imageOutdated` says whether
