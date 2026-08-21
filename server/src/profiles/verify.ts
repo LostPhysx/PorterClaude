@@ -348,8 +348,9 @@ ${installHelp.stderr}`)
 ${help.stderr}`);
       if (!pluginCommand.supportsYesFlag) {
         warnings.push(
-          'this claude build does not advertise `-y`/`--yes` for `plugin install`: server-side plugin ' +
-            'installs may hang on a prompt and be reported as failed',
+          'this claude build does not advertise `-y`/`--yes` for `plugin install` (2.1.224 does not). ' +
+            'Plugin sync measures the flags per run and omits it, so installs still work — but a ' +
+            'build that prompts instead of defaulting would time out.',
         );
       }
 

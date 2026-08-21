@@ -2031,6 +2031,8 @@ describe('ContainerService profile plugin sync (v0.4 #3)', () => {
       profile?: ProfileConfig | null;
       marker?: { syncedAt: string; installed: string[] } | null;
       failInstalls?: string[];
+      /** what `claude plugin install --help` advertises (2.1.224 advertises NEITHER) */
+      cliFlags?: { yes?: boolean; scope?: boolean };
     } = {},
   ) {
     const profile = opts.profile === undefined ? pluginProfile() : opts.profile;
@@ -2040,6 +2042,17 @@ describe('ContainerService profile plugin sync (v0.4 #3)', () => {
         calls.push({ cmd, opts: execOpts });
         if (cmd[0] === 'sh' && String(cmd[2]).startsWith('cat ')) {
           return { exitCode: 0, stdout: opts.marker ? JSON.stringify(opts.marker) : '', stderr: '' };
+        }
+        if (cmd[0] === 'claude' && cmd[1] === 'plugin' && cmd[3] === '--help') {
+          const f = opts.cliFlags ?? {};
+          const optionLines = [
+            '  --config <key=value>  Set a userConfig option',
+            '  -h, --help            Display help for command',
+            ...(f.scope ? ['  -s, --scope <scope>   Installation scope (default: "user")'] : []),
+            ...(f.yes ? ['  -y, --yes             Skip confirmation prompts'] : []),
+          ].join('\n');
+          const help = 'Usage: claude plugin install [options] <plugin>\n\nOptions:\n' + optionLines + '\n';
+          return { exitCode: 0, stdout: help, stderr: '' };
         }
         if (cmd[0] === 'claude' && (opts.failInstalls ?? []).includes(String(cmd[3]))) {
           return { exitCode: 1, stdout: '', stderr: 'marketplace not found' };
@@ -2058,7 +2071,10 @@ describe('ContainerService profile plugin sync (v0.4 #3)', () => {
     return { service, calls, backend };
   }
 
-  const pluginExecs = (calls: ExecCall[]) => calls.filter((c) => c.cmd[0] === 'claude' && c.cmd[1] === 'plugin');
+  /** the install/uninstall execs — NOT the `--help` capability probe that precedes them */
+  const pluginExecs = (calls: ExecCall[]) =>
+    calls.filter((c) => c.cmd[0] === 'claude' && c.cmd[1] === 'plugin' && !c.cmd.includes('--help'));
+  const helpProbes = (calls: ExecCall[]) => calls.filter((c) => c.cmd.includes('--help'));
   const markerWrites = (calls: ExecCall[]) =>
     calls.filter(
       (c) => c.cmd[0] === 'sh' && String(c.cmd[2]).includes(MARKER) && String(c.cmd[2]).includes('base64 -d'),
@@ -2088,13 +2104,36 @@ describe('ContainerService profile plugin sync (v0.4 #3)', () => {
 
     const execs = pluginExecs(calls);
     expect(execs).toHaveLength(1);
-    expect(execs[0]!.cmd).toEqual(['claude', 'plugin', 'install', 'fmt@acme', '-y']);
+    // NO -y: claude 2.1.224's `plugin install` does not advertise it and commander rejects
+    // unknown options, so passing it unconditionally failed EVERY install — found by pointing
+    // the #4 probe at a real container. The flags are measured per run, see the next test.
+    expect(execs[0]!.cmd).toEqual(['claude', 'plugin', 'install', 'fmt@acme']);
     expect(execs[0]!.opts?.user).toBeUndefined(); // root-owned ~/.claude breaks the next /login
     expect(execs[0]!.opts?.timeoutMs).toBe(180_000);
 
     const writes = markerWrites(calls);
     expect(writes).toHaveLength(1);
     expect(decodeScriptPayload(writes[0]!.cmd[2] as string).installed).toEqual(['fmt@acme']);
+  });
+
+  it('passes only the flags the installed CLI advertises', async () => {
+    // a build that DOES advertise them gets them...
+    const rich = pluginService({ marker: null, cliFlags: { yes: true, scope: true } });
+    await rich.service.restart('web');
+    expect(pluginExecs(rich.calls)[0]!.cmd).toEqual([
+      'claude', 'plugin', 'install', 'fmt@acme', '--scope', 'user', '-y',
+    ]);
+
+    // ...and a build whose help cannot be read at all falls back to the bare command, which
+    // is the only form that works everywhere
+    const blind = pluginService({ marker: null, cliFlags: {} });
+    await blind.service.restart('web');
+    expect(pluginExecs(blind.calls)[0]!.cmd).toEqual(['claude', 'plugin', 'install', 'fmt@acme']);
+
+    // the capability probe itself is read-only and runs once
+    expect(helpProbes(blind.calls).map((c) => c.cmd)).toEqual([
+      ['claude', 'plugin', 'install', '--help'],
+    ]);
   });
 
   it('uninstalls a dropped ref on a PRIVATE login set', async () => {
@@ -2106,7 +2145,7 @@ describe('ContainerService profile plugin sync (v0.4 #3)', () => {
 
     // the FULL ref, not the bare name: that is the form the plugin docs' own example uses,
     // and it disambiguates two marketplaces shipping the same plugin name
-    expect(pluginExecs(calls).map((c) => c.cmd)).toEqual([['claude', 'plugin', 'uninstall', 'old@acme', '-y']]);
+    expect(pluginExecs(calls).map((c) => c.cmd)).toEqual([['claude', 'plugin', 'uninstall', 'old@acme']]);
     expect(decodeScriptPayload(markerWrites(calls)[0]!.cmd[2] as string).installed).toEqual(['fmt@acme']);
   });
 

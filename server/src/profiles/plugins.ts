@@ -68,6 +68,50 @@ export function pluginNameOf(ref: string): string {
 }
 
 /**
+ * Which optional flags a `claude plugin <sub>` build accepts.
+ *
+ * MEASURED, never assumed. claude 2.1.224's `plugin install` advertises only `--config`,
+ * `-h/--help` and `-s/--scope` — there is NO `-y`/`--yes`, even though the CLI reference
+ * describes `-y` as available "for relevant commands". commander rejects an unknown option
+ * outright, so passing `-y` unconditionally made EVERY install exit non-zero and be reported
+ * as failed. Found by pointing the verify probe (issue #4) at a real container.
+ */
+export interface PluginCliFlags {
+  yes: boolean;
+  scope: boolean;
+}
+
+/** Parse `claude plugin <sub> --help` into the flags we may pass. */
+export function parsePluginCliFlags(help: string): PluginCliFlags {
+  const text = help ?? '';
+  const flag = (re: RegExp): boolean => re.test(text);
+  return {
+    yes: flag(/(^|[\s,[(|])(-y|--yes)(?=$|[\s,\]).=|])/),
+    scope: flag(/(^|[\s,[(|])(-s|--scope)(?=$|[\s,\]).=|<])/),
+  };
+}
+
+/**
+ * argv for one install. `--scope user` is passed only when the build advertises it: the
+ * default IS `user` on 2.1.224, but stating it keeps plugins landing in `~/.claude` (i.e. in
+ * the mounted login-set volume) should a later build change that default.
+ */
+export function installArgvFor(ref: string, flags: PluginCliFlags): string[] {
+  const argv = ['claude', 'plugin', 'install', ref];
+  if (flags.scope) argv.push('--scope', 'user');
+  if (flags.yes) argv.push('-y');
+  return argv;
+}
+
+/** argv for one uninstall; see `uninstallArgFor` for why the full ref is used. */
+export function uninstallArgvFor(ref: string, flags: PluginCliFlags): string[] {
+  const argv = ['claude', 'plugin', 'uninstall', uninstallArgFor(ref)];
+  if (flags.yes) argv.push('-y');
+  return argv;
+}
+
+
+/**
  * The argument `claude plugin uninstall` is called with.
  *
  * The CLI reference spells the parameter `<name>`, but the plugin docs' own example passes
@@ -146,6 +190,27 @@ export async function syncProfilePlugins(opts: SyncProfilePluginsOptions): Promi
   }
 }
 
+/**
+ * `claude plugin install --help` -> the flags this build accepts. A failure to read the help
+ * is answered with "no optional flags": the bare command is the only form that works on every
+ * build, so an unreadable help degrades to the safe call rather than to a broken one.
+ */
+async function probePluginCliFlags(opts: SyncProfilePluginsOptions): Promise<PluginCliFlags> {
+  try {
+    const res = await opts.backend.runExec(opts.containerId, ['claude', 'plugin', 'install', '--help'], {
+      timeoutMs: 15_000,
+    });
+    if (res.exitCode !== 0) return { yes: false, scope: false };
+    const flags = parsePluginCliFlags(`${res.stdout ?? ''}
+${res.stderr ?? ''}`);
+    opts.log?.debug({ flags }, 'claude plugin install flags detected');
+    return flags;
+  } catch (err) {
+    opts.log?.debug({ err: (err as Error).message }, 'could not read `claude plugin install --help`');
+    return { yes: false, scope: false };
+  }
+}
+
 async function syncLocked(opts: SyncProfilePluginsOptions, desired: string[]): Promise<string[]> {
   const marker = await readMarker(opts);
   const installed = [...new Set(marker.installed)];
@@ -166,10 +231,14 @@ async function syncLocked(opts: SyncProfilePluginsOptions, desired: string[]): P
   const present = new Set(installed);
   const wanted = new Set(desired);
   const canUninstall = loginSetIsPrivate(opts.loginSet, opts.profileId);
+  // Ask the binary what it accepts before passing anything optional. One extra exec, and
+  // only on a run that already has work to do (the fast path returned above) — the
+  // alternative is guessing, which is exactly how `-y` broke every install.
+  const flags = await probePluginCliFlags(opts);
 
   for (const ref of desired) {
     if (present.has(ref)) continue;
-    const failure = await runPluginCommand(opts, ['claude', 'plugin', 'install', ref, '-y']);
+    const failure = await runPluginCommand(opts, installArgvFor(ref, flags));
     if (failure) {
       // NOT recorded as installed: the next start retries it by itself
       warnings.push(`installing the plugin '${ref}' failed${failure}`);
@@ -186,7 +255,7 @@ async function syncLocked(opts: SyncProfilePluginsOptions, desired: string[]): P
       opts.log?.debug({ ref, loginSet: opts.loginSet }, 'plugin dropped from a shared login set without uninstalling');
       continue;
     }
-    const failure = await runPluginCommand(opts, ['claude', 'plugin', 'uninstall', uninstallArgFor(ref), '-y']);
+    const failure = await runPluginCommand(opts, uninstallArgvFor(ref, flags));
     if (failure) {
       // still listed, so the next start retries the uninstall
       warnings.push(`removing the plugin '${ref}' failed${failure}`);
