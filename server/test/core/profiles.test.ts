@@ -437,13 +437,23 @@ describe('profile verify probe (v0.4 #4)', () => {
     expect(cmds).toEqual([
       ['claude', '--version'],
       ['claude', 'plugin', '--help'],
+      // the -y flag is advertised by the SUBCOMMAND, not by the group containing it
+      ['claude', 'plugin', 'install', '--help'],
       ['claude', 'plugin', 'list', '--json'],
       ['sh', '-c', `[ -f '${MANAGED_SETTINGS_PATH}' ] || exit 3\ncat '${MANAGED_SETTINGS_PATH}'`],
       ['sh', '-c', `cat '${pluginMarkerPath('/home/dev')}' 2>/dev/null || true`],
     ]);
-    // nothing may install, uninstall, write or remove
-    const joined = cmds.map((c) => c.join(' ')).join('\n');
-    expect(joined).not.toMatch(/install|uninstall|\brm\b|chmod|chown|mkdir|tee|base64 -d/);
+    // nothing may install, uninstall, write or remove. `plugin install --help` is the one
+    // probe naming a mutating verb without performing it, so it is asserted to be a help
+    // invocation rather than pattern-matched away.
+    for (const cmd of cmds) {
+      const joined = cmd.join(' ');
+      if (/\b(install|uninstall)\b/.test(joined)) {
+        expect(cmd).toContain('--help');
+      } else {
+        expect(joined).not.toMatch(/\brm\b|chmod|chown|mkdir|tee|base64 -d/);
+      }
+    }
     expect(report.probes.length).toBeLessThanOrEqual(MAX_PROBES);
     for (const probe of report.probes) expect(probe.output.length).toBeLessThanOrEqual(MAX_PROBE_OUTPUT + 1);
   });

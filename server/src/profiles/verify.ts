@@ -85,9 +85,14 @@ export function capOutput(raw: string): string {
 }
 
 /**
- * Does `claude plugin --help` advertise the non-interactive flag plugins.ts passes?
+ * Does this help text advertise the non-interactive flag plugins.ts passes?
  * Both spellings count, but only where they appear as a FLAG (surrounded by whitespace or
  * the usual usage punctuation) — never as part of a longer option or an English word.
+ *
+ * Feed it the help of the SUBCOMMAND (`claude plugin install --help`): commander prints
+ * only `-h, --help` in the Options block of a parent that merely groups subcommands, so
+ * asking `claude plugin --help` reports every build as lacking `-y` — measured against
+ * 2.1.224, which does accept the flag on `install`.
  */
 export function supportsYesFlag(help: string): boolean {
   return /(^|[\s,[(|])(-y|--yes)(?=$|[\s,\]).=|])/.test(help ?? '');
@@ -333,10 +338,17 @@ export async function runVerifyProbes(input: RunVerifyProbesInput): Promise<Prof
     const help = await run(['claude', 'plugin', '--help']);
     pluginCommand.available = help.exitCode === 0;
     if (pluginCommand.available) {
-      pluginCommand.supportsYesFlag = supportsYesFlag(`${help.stdout}\n${help.stderr}`);
+      // the flag lives on the SUBCOMMAND, not on the group that contains it
+      const installHelp = await run(['claude', 'plugin', 'install', '--help']);
+      pluginCommand.supportsYesFlag =
+        installHelp.exitCode === 0
+          ? supportsYesFlag(`${installHelp.stdout}
+${installHelp.stderr}`)
+          : supportsYesFlag(`${help.stdout}
+${help.stderr}`);
       if (!pluginCommand.supportsYesFlag) {
         warnings.push(
-          'this claude build does not advertise `-y`/`--yes` for `plugin`: server-side plugin ' +
+          'this claude build does not advertise `-y`/`--yes` for `plugin install`: server-side plugin ' +
             'installs may hang on a prompt and be reported as failed',
         );
       }
