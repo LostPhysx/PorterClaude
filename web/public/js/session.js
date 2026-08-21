@@ -236,6 +236,15 @@ export class SessionPane {
 
     this.term.open(this.termEl);
 
+    // Clipboard ergonomics (Windows console style): Enter copies a selection,
+    // Ctrl+C copies when something is selected (interrupts otherwise),
+    // Ctrl+Shift+C always copies, right-click / Ctrl+V paste.
+    this.term.attachCustomKeyEventHandler((ev) => this._onTerminalKey(ev));
+    this.termEl.addEventListener('contextmenu', (ev) => {
+      ev.preventDefault();
+      this._pasteFromClipboard();
+    });
+
     this.term.onData((data) => this._onData(data));
     this.term.onResize(({ cols, rows }) => {
       this.sendJson({ type: 'resize', cols, rows });
@@ -480,6 +489,59 @@ export class SessionPane {
   // -------------------------------------------------------------------------
   // internals
   // -------------------------------------------------------------------------
+
+  /**
+   * Custom key handler for clipboard shortcuts.
+   * @param {KeyboardEvent} ev
+   * @returns {boolean} false => xterm ignores the key
+   */
+  _onTerminalKey(ev) {
+    if (ev.type !== 'keydown' || !this.term) return true;
+    const key = ev.key && ev.key.length === 1 ? ev.key.toLowerCase() : ev.key;
+    const ctrl = ev.ctrlKey && !ev.altKey && !ev.metaKey;
+
+    // Enter copies the active selection (console QuickEdit style).
+    if (ev.key === 'Enter' && this.term.hasSelection()) {
+      ev.preventDefault();
+      this._copySelection();
+      return false;
+    }
+    // Ctrl+C copies when a selection exists, interrupts otherwise;
+    // Ctrl+Shift+C always copies.
+    if (ctrl && key === 'c' && (ev.shiftKey || this.term.hasSelection())) {
+      ev.preventDefault();
+      this._copySelection();
+      return false;
+    }
+    // Ctrl+V / Ctrl+Shift+V paste (matching right-click paste).
+    if (ctrl && key === 'v') {
+      ev.preventDefault();
+      this._pasteFromClipboard();
+      return false;
+    }
+    return true;
+  }
+
+  /** Copy the current xterm selection to the clipboard, then clear it. */
+  _copySelection() {
+    const text = this.term?.getSelection();
+    this.term?.clearSelection();
+    if (!text) return;
+    navigator.clipboard?.writeText(text)?.catch?.((err) => {
+      console.debug('[terminal] copy failed', err);
+    });
+  }
+
+  /** Read the clipboard and send it to the pty as keystrokes. */
+  _pasteFromClipboard() {
+    if (!navigator.clipboard?.readText) return;
+    navigator.clipboard.readText()
+      .then((text) => {
+        if (!text) return;
+        this._onData(text.replace(/\r\n?|\n/g, '\r'));
+      })
+      .catch((err) => console.debug('[terminal] paste failed', err));
+  }
 
   /** @param {string} data keystrokes from xterm */
   _onData(data) {

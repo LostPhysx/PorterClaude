@@ -389,9 +389,15 @@ ws.binaryType = 'arraybuffer'
   the countdown shown in the pane; the delay resets after a socket that stayed open > 10 s.
   `4409` (container not running) additionally offers a "start container" button.
 * `dispose()` is idempotent: clear timers, `ws.close(1000)`, `term.dispose()`.
-* Copy/paste: rely on xterm defaults (`Ctrl+Shift+C/V`); do not intercept `Ctrl+C`, it must
-  reach the pty. No app-level keyboard shortcuts inside a pane — the keyboard belongs to the
-  terminal; pane management happens with the mouse and the toolbar.
+* Copy/paste (Windows console QuickEdit style, wired via `attachCustomKeyEventHandler` +
+  a `contextmenu` listener on the pane's terminal element — xterm defaults give you none of
+  this): **Enter** copies the active selection; **Ctrl+C** copies when a selection exists,
+  otherwise `\x03` reaches the pty; **Ctrl+Shift+C** always copies; **right-click** and
+  **Ctrl+V / Ctrl+Shift+V** paste via the async clipboard API (browser prompts for read
+  permission once). Copy is explicit — no copy-on-select. Beyond these clipboard keys there
+  are no app-level shortcuts inside a pane — the keyboard belongs to the terminal; pane
+  management happens with the mouse and the toolbar. (Was: rely on xterm defaults, never
+  intercept `Ctrl+C` — see issue #1.)
 
 ## 6. Error handling
 
