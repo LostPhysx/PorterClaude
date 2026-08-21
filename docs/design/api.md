@@ -1076,3 +1076,104 @@ exactly the "unlabelled = mine" case above, so they stay visible and manageable.
 Env seeds keep their v0.1 names (`PORTERCLAUDE_BACKEND`, `PORTAINER_URL`,
 `PORTAINER_API_KEY`, `PORTAINER_ENDPOINT_ID`, `DOCKER_SOCKET`) but now create the first host
 instead of a global backend, and only while no host exists.
+
+---
+
+# v0.4 — profiles and login sets (issues #2/#3)
+
+## Vocabulary addition
+
+* **Profile** — a named per-container configuration set (`/api/profiles`). A container pins
+  AT MOST ONE profile (`containers[].profileId`, `null` = none, the default and the entire
+  pre-v0.4 behavior). Per agent, a profile picks the **login set**, may overlay provider
+  credentials (API key + endpoint + model slugs — for non-Anthropic providers; Anthropic
+  usage stays interactive `/login`), a free-form settings object, and a plugin list.
+* **Login set** — a named per-host per-agent shared auth volume: `<volumePrefix>auth-<agentId>`
+  for the built-in set `default`, `<volumePrefix>auth-<agentId>_<set>` for any other name
+  (`_` is illegal in agent/profile/set ids, so the name parses one way). Every container
+  mounts exactly one set per agent; everything behind the agent's symlinks — login, history,
+  plugin FILES — is shared with it. `default` keeps the v0.2 volume name verbatim, so an
+  unprofiled container's spec hash never changes.
+
+## Profiles
+
+```
+GET    /api/profiles                    -> { profiles: SanitizedProfile[] }
+POST   /api/profiles                    { id?, name, description?, agents } -> 201 { profile }
+GET    /api/profiles/:id                -> { profile } | 404
+PUT    /api/profiles/:id                same body (id immutable) -> { profile }
+DELETE /api/profiles/:id                -> 204 | 409 { containers: [names] } while in use
+                                       ?force=1 strips profileId from those containers first
+                                       (they flip needsRecreate exactly once);
+                                       &removeVolumes=1 additionally removes the login-set
+                                       volumes this profile is the SOLE owner of, on every
+                                       reachable host, best effort. The `default` set and any
+                                       set another profile still resolves to are never removed.
+                                       Flags are read from the QUERY STRING and only `1`,
+                                       `true`, `yes` enable them (`?force=0` does not force).
+```
+
+`agents` is a record keyed by agent id; only `claude` is consumed today (the shape is
+agent-neutral). Each slice:
+
+```json
+{ "loginSet": "team | default | null",
+  "env":        { "ANTHROPIC_BASE_URL": "https://relay.example/v1" },
+  "envSecrets": { "ANTHROPIC_API_KEY": "sk-… (write-only)" },
+  "settings":   { "model": "provider-slug" },
+  "marketplaces": [ { "name": "corp", "source": "owner/repo" } ],
+  "plugins":    [ { "ref": "linter@anthropics" } ] }
+```
+
+* `loginSet`: `"default"` mounts the host-wide shared login (the v0.2 volume); any other
+  name mounts/creates `auth-<agentId>_<set>` — shared by every profile referencing it, and
+  the FIRST container to use a new set does its one-time `/login`; `null` means an implicit
+  set NAMED AFTER THE PROFILE ID.
+* Login set names are **one flat namespace**: a profile that explicitly sets
+  `loginSet: "<other profile id>"` deliberately joins that profile's implicit set. `default`
+  is therefore a **reserved profile id** (422) — a profile called `default` would otherwise
+  adopt the volume every unprofiled container mounts.
+* An agent a profile does not mention keeps the `default` set; a container whose profile was
+  DELETED keeps the set named after the stored id, so its login is never silently re-shared.
+* `envSecrets` is **write-only** (the Portainer-credential contract): a string sets, `null`
+  or `""` clears, an omitted key keeps the stored value. Values are encrypted at rest
+  (`enc:v1:…`) and never leave the server; `SanitizedProfile.agents[id].envSecrets` exposes
+  `{ set: boolean, hint: "last 4 chars" }` per key.
+* `settings` is merged verbatim into the container's managed settings; the keys `env`,
+  `enabledPlugins` and `extraKnownMarketplaces` are server-owned and rejected (422).
+
+## Delivery inside the container (claude)
+
+Profile env (plain + decrypted secrets), `enabledPlugins` and `extraKnownMarketplaces` are
+composed into `/etc/claude-code/managed-settings.json` — written by a root exec on every
+container start (`afterStart`), root-owned `0600`. NOT docker env: env would land in the
+spec hash (a rotated key would demand fleet recreates) and in `docker inspect`. Consequence:
+**profile edits apply on the next container restart**, not on a recreate.
+
+Unprofiled containers get no managed-settings file at all — behavior identical to v0.3.
+
+## Containers changes
+
+* `POST/PUT /api/containers` accept `profileId: string | null`; an unknown id is `422`.
+* `ContainerView` carries `profileId`. The container label `porterclaude.profile` records it
+  (recovered on adoption, excluded from the spec hash).
+* A profiled container adds the env `PORTERCLAUDE_PROFILE=<id>` and mounts the login-set
+  volumes per the table above; both hash, so assigning/changing/removing a profile flips
+  `needsRecreate` exactly once — intended and visible.
+
+## Plugin management (issue #3)
+
+Plugin FILES are installed into the login set's volume (`claude plugin install <ref> -y` as
+the container user, marketplaces pre-declared via `extraKnownMarketplaces`); per-profile
+ENABLEMENT rides the managed-settings `enabledPlugins`. Two profiles sharing a login set
+therefore share files but enable their own subsets. Uninstalls run only when the set is
+private to the profile; shared and default sets never uninstall server-side. Sync is
+idempotent (a marker file in the agent volume; fast path = zero execs), offline-tolerant
+(failures become container warnings and retry on the next start).
+
+## Config file (v4)
+
+`version: 4`, adds `profiles: [ ProfileConfig ]`; `containers[]` gains `profileId` (null by
+default). The v3 → v4 migration is purely additive and writes `config.json.v3.bak` first;
+a v1/v2/v3 file chains to v4 on a single boot. Stored profiles that no longer parse are
+dropped (logged) instead of quarantining config.json — same rule as custom agents.

@@ -261,6 +261,140 @@ describe('buildContainerSpec', () => {
   });
 });
 
+describe('profiles and login sets (v0.4)', () => {
+  const CLAUDE_VOL = 'porterclaude-auth-claude';
+
+  function profiledSpec(profile: { id: string; agents: Record<string, { loginSet: string | null }> } | null) {
+    return buildContainerSpec({
+      container: containerConfig({ profileId: profile?.id ?? null }),
+      general,
+      agents,
+      profile,
+      resolvedImage: 'porterclaude/node:latest',
+      imageType: 'recipe',
+      instanceId: TEST_INSTANCE_ID,
+    });
+  }
+
+  const authSource = (spec: ReturnType<typeof recipeSpec>): string | undefined =>
+    spec.mounts?.find((m) => m.target === CLAUDE_DIR)?.source;
+
+  // THE no-churn guarantee: profiles must not touch an unprofiled container's spec at all,
+  // otherwise every existing container on every install reports needsRecreate after the
+  // upgrade. Compare the WHOLE spec, not just the hash.
+  it('leaves an unprofiled container byte-identical to the pre-profile spec', () => {
+    const withoutField = recipeSpec();
+    const withNullProfile = profiledSpec(null);
+
+    expect(withNullProfile).toEqual(withoutField);
+    expect(specHash(withNullProfile)).toBe(specHash(withoutField));
+    expect(authSource(withNullProfile)).toBe(CLAUDE_VOL);
+    expect(withNullProfile.env?.PORTERCLAUDE_PROFILE).toBeUndefined();
+    expect(withNullProfile.labels?.[CONTAINER_LABELS.profile]).toBeUndefined();
+  });
+
+  it("mounts the legacy volume for the reserved 'default' login set", () => {
+    const spec = profiledSpec({ id: 'work', agents: { claude: { loginSet: 'default' } } });
+    expect(authSource(spec)).toBe(CLAUDE_VOL);
+    // ...but the container is still marked as profiled (settings/plugins still apply)
+    expect(spec.env?.PORTERCLAUDE_PROFILE).toBe('work');
+    expect(spec.labels?.[CONTAINER_LABELS.profile]).toBe('work');
+  });
+
+  it('mounts a shared login-set volume that two profiles can point at', () => {
+    const a = profiledSpec({ id: 'work', agents: { claude: { loginSet: 'team' } } });
+    const b = profiledSpec({ id: 'other', agents: { claude: { loginSet: 'team' } } });
+    expect(authSource(a)).toBe('porterclaude-auth-claude_team');
+    // the whole point of a shared login: different profiles, ONE login volume
+    expect(authSource(b)).toBe(authSource(a));
+    // ...while the profile identity itself stays distinct
+    expect(a.env?.PORTERCLAUDE_PROFILE).toBe('work');
+    expect(b.env?.PORTERCLAUDE_PROFILE).toBe('other');
+  });
+
+  it('gives a profile without an explicit login set its own private volume', () => {
+    const spec = profiledSpec({ id: 'work', agents: { claude: { loginSet: null } } });
+    expect(authSource(spec)).toBe('porterclaude-auth-claude_work');
+  });
+
+  // A deleted profile and "a profile that does not mention this agent" must NOT behave the
+  // same: the first has to keep the container's existing private volume, the second is an
+  // explicit statement that the agent is untouched. The caller distinguishes them by passing
+  // `null` vs `{ id, agents: {} }` (containers/service.ts profileSpecInput).
+  it('keeps the volume stable for a dangling profile id instead of re-sharing the default', () => {
+    const spec = buildContainerSpec({
+      container: containerConfig({ profileId: 'work' }),
+      general,
+      agents,
+      profile: null, // the profile was deleted; only the stored id survives
+      resolvedImage: 'porterclaude/node:latest',
+      imageType: 'recipe',
+      instanceId: TEST_INSTANCE_ID,
+    });
+    expect(authSource(spec)).toBe('porterclaude-auth-claude_work');
+    expect(authSource(spec)).not.toBe(CLAUDE_VOL);
+    // the container still carries its identity, so the spec (and hash) does not churn
+    expect(spec.env?.PORTERCLAUDE_PROFILE).toBe('work');
+    expect(spec.labels?.[CONTAINER_LABELS.profile]).toBe('work');
+  });
+
+  it('leaves the agent on the default volume when a REAL profile does not mention it', () => {
+    const spec = profiledSpec({ id: 'work', agents: { codex: { loginSet: 'team' } } });
+    expect(authSource(spec)).toBe(CLAUDE_VOL);
+  });
+
+  it('leaves an agent the profile does not mention on the default volume', () => {
+    const spec = buildContainerSpec({
+      container: containerConfig({ profileId: 'work' }),
+      general,
+      agents: [agent('claude'), agent('codex')],
+      profile: { id: 'work', agents: { claude: { loginSet: 'team' } } },
+      resolvedImage: 'porterclaude/node:latest',
+      imageType: 'recipe',
+      instanceId: TEST_INSTANCE_ID,
+    });
+    const sourceFor = (id: string) =>
+      spec.mounts?.find((m) => m.target === `/home/dev/.porterclaude/agents/${id}`)?.source;
+    expect(sourceFor('claude')).toBe('porterclaude-auth-claude_team');
+    expect(sourceFor('codex')).toBe('porterclaude-auth-codex');
+  });
+
+  it('nests the private history volume inside the login-set volume', () => {
+    const spec = buildContainerSpec({
+      container: containerConfig({ profileId: 'work', shareHistory: false }),
+      general,
+      agents,
+      profile: { id: 'work', agents: { claude: { loginSet: 'team' } } },
+      resolvedImage: 'porterclaude/node:latest',
+      imageType: 'recipe',
+      instanceId: TEST_INSTANCE_ID,
+    });
+    expect(authSource(spec)).toBe('porterclaude-auth-claude_team');
+    // the history mount target still sits INSIDE the agent dir, i.e. inside that volume
+    const hist = spec.mounts?.find((m) => m.source?.startsWith('porterclaude-hist-'));
+    expect(hist?.target.startsWith(`${CLAUDE_DIR}/`)).toBe(true);
+  });
+
+  it('hashes the login set and the profile id, so switching profiles needs a recreate', () => {
+    const plain = specHash(profiledSpec(null));
+    const shared = specHash(profiledSpec({ id: 'work', agents: { claude: { loginSet: 'team' } } }));
+    const privateSet = specHash(profiledSpec({ id: 'work', agents: { claude: { loginSet: null } } }));
+    const otherProfile = specHash(profiledSpec({ id: 'other', agents: { claude: { loginSet: 'team' } } }));
+
+    expect(new Set([plain, shared, privateSet, otherProfile]).size).toBe(4);
+    // the label alone must never move the hash (labels are excluded by contract)
+    expect(specHash(profiledSpec({ id: 'work', agents: { claude: { loginSet: 'team' } } }))).toBe(shared);
+  });
+
+  it('never lets a profiled volume collide with a plain volume of another agent', () => {
+    // agent 'claude' in set 'x' vs a hypothetical agent literally named 'claude-x':
+    // '_' is illegal in both id charsets, so the two names can never meet
+    const profiled = profiledSpec({ id: 'p', agents: { claude: { loginSet: 'x' } } });
+    expect(authSource(profiled)).toBe('porterclaude-auth-claude_x');
+    expect(authSource(profiled)).not.toBe('porterclaude-auth-claude-x');
+  });
+});
+
 describe('workspaceMountFor', () => {
   it('uses porterclaude-ws-<slug> by default and honours an explicit volume', () => {
     expect(workspaceMountFor(containerConfig(), general)).toEqual({

@@ -1,6 +1,6 @@
 {
   "name": "porterclaude",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "description": "Self-hosted web app that launches Claude Code dev containers and attaches browser terminals",

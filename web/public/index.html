@@ -136,6 +136,7 @@
         <ul class="nav nav-tabs mb-3" id="settings-subtabs" role="tablist">
           <li class="nav-item"><button class="nav-link active" data-subtab="hosts" type="button">Hosts</button></li>
           <li class="nav-item"><button class="nav-link" data-subtab="agents" type="button">Agents</button></li>
+          <li class="nav-item"><button class="nav-link" data-subtab="profiles" type="button">Profiles</button></li>
           <li class="nav-item"><button class="nav-link" data-subtab="general" type="button">General</button></li>
           <li class="nav-item"><button class="nav-link" data-subtab="images" type="button">Images</button></li>
           <li class="nav-item"><button class="nav-link" data-subtab="account" type="button">Account</button></li>
@@ -194,6 +195,23 @@
           <div id="agents-host-note" class="small text-secondary mb-2"></div>
           <!-- one card per AgentView, rendered by js/agents.js -->
           <div id="agents-list" class="row g-2"></div>
+        </div>
+
+        <!-- ---------- profiles (js/profiles.js) ---------- -->
+        <div class="pc-subview d-none" data-subtab="profiles">
+          <div class="d-flex align-items-center gap-2 mb-2">
+            <h6 class="mb-0 me-auto">Profiles</h6>
+            <button id="btn-profiles-refresh" class="btn btn-sm btn-outline-secondary" type="button" title="Refresh"><i class="bi bi-arrow-clockwise"></i></button>
+            <button id="btn-profile-new" class="btn btn-sm btn-primary" type="button"><i class="bi bi-plus-lg me-1"></i>New profile</button>
+          </div>
+          <div class="form-text mb-2">
+            A profile picks the <strong>login set</strong> a container mounts &mdash; the volume that carries the
+            agent login, its history and its plugins &mdash; and overlays env, secrets and settings on top.
+            The first container of a new set runs <code>/login</code> once; every later container with the same
+            set is already logged in. A container without a profile keeps the host-wide login volume.
+          </div>
+          <!-- one card per SanitizedProfile, rendered by js/profiles.js -->
+          <div id="profiles-list" class="row g-2"></div>
         </div>
 
         <!-- ---------- general ---------- -->
@@ -414,6 +432,27 @@
     </div>
   </div>
 
+  <!-- profile create/edit (owner: F1, js/profiles.js) -->
+  <div class="modal fade" id="profile-modal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-lg modal-dialog-scrollable">
+      <div class="modal-content">
+        <form id="profile-form" novalidate>
+          <div class="modal-header"><h5 class="modal-title" id="profile-modal-title">New profile</h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+          <!-- body is built by js/profiles.js: name, id, description and one section per
+               agent (login set, env rows, write-only secrets, settings JSON, marketplaces,
+               plugins) -->
+          <div class="modal-body" id="profile-form-body"></div>
+          <div class="modal-footer">
+            <span id="profile-form-error" class="small text-danger me-auto"></span>
+            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+            <button type="submit" class="btn btn-primary" id="btn-profile-save">Save</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
   <!-- container create/edit (owner: F1) -->
   <div class="modal fade" id="container-modal" tabindex="-1" aria-hidden="true">
     <div class="modal-dialog modal-lg modal-dialog-scrollable">
@@ -515,7 +554,7 @@
   <!-- toasts (owner: F1, used by every module through util.toast) -->
   <div id="toast-area" class="toast-container position-fixed bottom-0 end-0 p-3"></div>
 
-  <!-- app entry (module graph: app.js -> api/util/bus/hosts/agents/settings/containers/images/code) -->
+  <!-- app entry (module graph: app.js -> api/util/bus/hosts/agents/profiles/settings/containers/images/code) -->
   <script type="module" src="/js/app.js"></script>
 </body>
 </html>

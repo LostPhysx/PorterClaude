@@ -18,19 +18,29 @@
 //   * `sessions[]` (the long-lived container)    -> `containers[]`; nothing else moves.
 // The v2 -> v3 migration writes `<DATA_DIR>/config.json.v2.bak` first, and a v1 file chains
 // v1 -> v2 -> v3 in one pass (ConfigStore.migrate).
+//
+// v0.4 (CONFIG_VERSION 4) — profiles (issues #2/#3):
+//   * `profiles[]`                               -> new (named per-container config sets)
+//   * `containers[].profileId`                   -> new (null = no profile, the default)
+// The v3 -> v4 migration writes `<DATA_DIR>/config.json.v3.bak` first, is purely additive,
+// and a v1/v2 file chains through to v4 in one pass.
 import { z } from 'zod';
 import { GENERAL_FIELD_SCHEMAS, stored } from './fields.js';
 import { ContainerConfigSchema } from '../containers/model.js';
 import { HostConfigSchema, HostIdSchema, PortainerCredentialConfigSchema } from '../hosts/model.js';
 import { AgentDefinitionSchema } from '../agents/model.js';
+import { ProfileConfigSchema } from '../profiles/model.js';
 
-export const CONFIG_VERSION = 3;
+export const CONFIG_VERSION = 4;
 
 /** the version this config was migrated FROM (v1 = the v0.1 single-backend shape) */
 export const CONFIG_VERSION_V1 = 1;
 
 /** the version this config was migrated FROM (v2 = the v0.2 shape, `sessions[]` = containers) */
 export const CONFIG_VERSION_V2 = 2;
+
+/** the version this config was migrated FROM (v3 = the v0.3 shape, before profiles) */
+export const CONFIG_VERSION_V3 = 3;
 
 export const AuthConfigSchema = z.object({
   /** scrypt hash string "scrypt:<N>:<r>:<p>:<saltB64>:<hashB64>"; null until first boot seeds it */
@@ -116,6 +126,8 @@ export const AppConfigSchema = z.object({
   defaultHostId: HostIdSchema.nullable().default(null),
   credentials: CredentialsConfigSchema.default({}),
   agents: AgentsConfigSchema.default({}),
+  /** v0.4: named per-container configuration sets (profiles/model.ts); never mutated by migrations */
+  profiles: z.array(ProfileConfigSchema).default([]),
   general: GeneralConfigSchema.default({}),
   containers: z.array(ContainerConfigSchema).default([]),
   ui: UiConfigSchema.default({}),

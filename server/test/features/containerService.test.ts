@@ -8,6 +8,8 @@ import type { ContainerInspect } from '../../src/backends/types.js';
 import { buildContainerSpec } from '../../src/containers/container.js';
 import { ContainerService } from '../../src/containers/service.js';
 import { BUILTIN_AGENTS } from '../../src/agents/builtin.js';
+import { SecretBox } from '../../src/config/crypto.js';
+import { ProfileConfigSchema, type ProfileConfig } from '../../src/profiles/model.js';
 import {
   containerConfig,
   containerInput,
@@ -1811,5 +1813,359 @@ describe('cross-instance isolation on a shared engine', () => {
       code: 'conflict',
     });
     expect(sb!.calls).not.toContain('createContainer');
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// v0.4 (#2): the managed settings applier. A container's profile becomes
+// /etc/claude-code/managed-settings.json, written by one root exec in afterStart.
+// ---------------------------------------------------------------------------
+describe('ContainerService profile managed settings (v0.4 #2)', () => {
+  const MANAGED_PATH = '/etc/claude-code/managed-settings.json';
+
+  function profileConfig(secrets: SecretBox, overrides: Partial<ProfileConfig> = {}): ProfileConfig {
+    return ProfileConfigSchema.parse({
+      id: 'zai',
+      name: 'Z.ai',
+      agents: {
+        claude: {
+          loginSet: null,
+          env: { ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic' },
+          envSecretsEnc: { ANTHROPIC_AUTH_TOKEN: secrets.encrypt('sk-secret-token') },
+          settings: { model: 'glm-4.6', permissions: { defaultMode: 'acceptEdits' } },
+        },
+      },
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+      ...overrides,
+    });
+  }
+
+  /** a stored+running container, restarted (restart() runs afterStart with the stored cfg) */
+  function profileService(opts: { profile?: ProfileConfig | null; profileId?: string | null; backend?: ReturnType<typeof stubBackend> } = {}) {
+    const secrets = new SecretBox('test-master-secret');
+    const profile = opts.profile === undefined ? profileConfig(secrets) : opts.profile;
+    const profileId = opts.profileId === undefined ? (profile ? profile.id : null) : opts.profileId;
+    const stored = containerConfig({ name: 'web', profileId });
+    const cfg = stubConfigStore([stored]);
+    (cfg.store as unknown as { getProfile: (id: string) => ProfileConfig | null }).getProfile = (id) =>
+      profile && profile.id === id ? profile : null;
+    const sb = opts.backend ?? stubBackend();
+    sb.containers.push(containerSummary({ id: 'c-web', name: 'pc-web', names: ['pc-web'] }));
+    const hosts = stubHostManager(sb.backend);
+    const service = new ContainerService({ ...serviceDeps({ config: cfg.store, hosts }), secrets });
+    return { service, sb, secrets, profile };
+  }
+
+  function managedExecs(sb: ReturnType<typeof stubBackend>) {
+    return sb.log
+      .filter((c) => c.method === 'runExec' && String((c.args[1] as string[])[2]).includes(MANAGED_PATH))
+      .map((c) => ({ script: String((c.args[1] as string[])[2]), opts: c.args[2] as { user?: string } }));
+  }
+
+  /** the JSON the script carries: `printf '%s' '<b64>' | base64 -d` */
+  function decodePayload(script: string): Record<string, unknown> {
+    const match = /printf '%s' '([A-Za-z0-9+/=]+)'/.exec(script);
+    expect(match).toBeTruthy();
+    return JSON.parse(Buffer.from(match![1] as string, 'base64').toString('utf8'));
+  }
+
+  it('writes the composed settings with one root exec', async () => {
+    const { service, sb } = profileService();
+    await service.restart('web');
+
+    const execs = managedExecs(sb);
+    expect(execs).toHaveLength(1);
+    const { script, opts } = execs[0]!;
+    expect(opts.user).toBe('0'); // only uid 0 can write /etc
+    expect(script).toContain("mkdir -p '/etc/claude-code'");
+    expect(script).toContain(`base64 -d > '${MANAGED_PATH}'`);
+    expect(script).toContain(`chmod 0600 '${MANAGED_PATH}'`);
+    expect(script).toContain(`chown "$own" '${MANAGED_PATH}'`);
+
+    const payload = decodePayload(script);
+    expect(payload.model).toBe('glm-4.6');
+    expect(payload.permissions).toEqual({ defaultMode: 'acceptEdits' });
+    expect(payload.env).toEqual({
+      ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
+      ANTHROPIC_AUTH_TOKEN: 'sk-secret-token',
+    });
+  });
+
+  it('ships the DECRYPTED secret, never the stored enc:v1 blob', async () => {
+    const { service, sb } = profileService();
+    await service.restart('web');
+
+    const script = managedExecs(sb)[0]!.script;
+    expect(script).not.toContain('enc:v1:');
+    const raw = JSON.stringify(decodePayload(script));
+    expect(raw).toContain('sk-secret-token');
+    expect(raw).not.toContain('enc:v1:');
+  });
+
+  it('removes a stale file when the profile no longer sets anything', async () => {
+    const empty = ProfileConfigSchema.parse({
+      id: 'zai',
+      name: 'Z.ai',
+      agents: { claude: {} },
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    });
+    const { service, sb } = profileService({ profile: empty });
+    await service.restart('web');
+
+    const execs = managedExecs(sb);
+    expect(execs).toHaveLength(1);
+    expect(execs[0]!.script).toContain(`rm -f '${MANAGED_PATH}'`);
+    expect(execs[0]!.script).not.toContain('base64 -d');
+  });
+
+  it('does nothing at all for a container without a profile', async () => {
+    const { service, sb } = profileService({ profile: null, profileId: null });
+    await service.restart('web');
+    expect(managedExecs(sb)).toHaveLength(0);
+  });
+
+  it('turns a failing exec into a warning instead of failing the start', async () => {
+    const failing = stubBackend({
+      runExec: async (containerId: string, cmd: string[]) =>
+        String(cmd[2]).includes(MANAGED_PATH)
+          ? { exitCode: 1, stdout: '', stderr: 'cannot create /etc/claude-code' }
+          : { exitCode: 0, stdout: '', stderr: '' },
+    });
+    const { service } = profileService({ backend: failing });
+
+    const view = await service.restart('web');
+    expect(view.warnings.join(' ')).toContain('applying the profile settings failed');
+    expect(view.warnings.join(' ')).toContain('cannot create /etc/claude-code');
+  });
+
+  // A dangling profile means the profile is GONE — so the file it wrote (old API key, old
+  // base URL) must be cleared, not left in place. Managed settings outrank everything the
+  // user can set, so leaving it would keep routing that container through a provider whose
+  // profile no longer exists.
+  it('clears the settings and warns when the profileId dangles', async () => {
+    const { service, sb } = profileService({ profile: null, profileId: 'gone' });
+    const view = await service.restart('web');
+
+    const execs = managedExecs(sb);
+    expect(execs).toHaveLength(1);
+    expect(execs[0]!.script).toContain(`rm -f '${MANAGED_PATH}'`);
+    expect(execs[0]!.script).not.toContain('base64 -d');
+    expect(view.warnings.join(' ')).toContain("profile 'gone' no longer exists");
+  });
+
+  it('clears a stale settings file after the profile was detached from the container', async () => {
+    // the container still runs the pre-detach container (needsRecreate), so its label still
+    // says `porterclaude.profile` while the stored config says null
+    const secrets = new SecretBox('test-master-secret');
+    const stored = containerConfig({ name: 'web', profileId: null });
+    const cfg = stubConfigStore([stored]);
+    (cfg.store as unknown as { getProfile: () => null }).getProfile = () => null;
+    const sb = stubBackend();
+    sb.containers.push(containerSummary({ id: 'c-web', name: 'pc-web', names: ['pc-web'] }));
+    // the running container still carries the label it was CREATED with; the stub's inspect
+    // is generic, so the label is bolted on here
+    const inspect = sb.backend.inspectContainer.bind(sb.backend);
+    sb.backend.inspectContainer = async (id: string) => ({
+      ...(await inspect(id)),
+      labels: { 'porterclaude.profile': 'work' },
+    });
+    const service = new ContainerService({
+      ...serviceDeps({ config: cfg.store, hosts: stubHostManager(sb.backend) }),
+      secrets,
+    });
+
+    await service.restart('web');
+    const execs = managedExecs(sb);
+    expect(execs).toHaveLength(1);
+    expect(execs[0]!.script).toContain(`rm -f '${MANAGED_PATH}'`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.4 (#3): PLUGIN SYNC. Files belong to the LOGIN SET (installed by execs into the
+// mounted volume, recorded in a marker at the top of it), enablement belongs to the
+// PROFILE (`enabledPlugins` in the managed settings — no exec at all).
+// ---------------------------------------------------------------------------
+describe('ContainerService profile plugin sync (v0.4 #3)', () => {
+  const MARKER = '/home/dev/.porterclaude/agents/claude/.porterclaude-plugins.json';
+  const MANAGED_PATH = '/etc/claude-code/managed-settings.json';
+
+  interface ExecCall {
+    cmd: string[];
+    opts?: { user?: string; timeoutMs?: number };
+  }
+
+  function pluginProfile(
+    overrides: {
+      id?: string;
+      loginSet?: string | null;
+      plugins?: string[];
+      marketplaces?: Array<{ name: string; source: string }>;
+    } = {},
+  ): ProfileConfig {
+    return ProfileConfigSchema.parse({
+      id: overrides.id ?? 'zai',
+      name: 'Z.ai',
+      agents: {
+        claude: {
+          loginSet: overrides.loginSet ?? null,
+          plugins: (overrides.plugins ?? ['fmt@acme']).map((ref) => ({ ref })),
+          marketplaces: overrides.marketplaces ?? [],
+        },
+      },
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    });
+  }
+
+  /**
+   * A restartable stored container plus a backend whose runExec is scripted: the marker
+   * `cat` answers with `marker`, and a `claude plugin install <ref>` listed in
+   * `failInstalls` fails the way an unreachable marketplace does.
+   */
+  function pluginService(
+    opts: {
+      profile?: ProfileConfig | null;
+      marker?: { syncedAt: string; installed: string[] } | null;
+      failInstalls?: string[];
+    } = {},
+  ) {
+    const profile = opts.profile === undefined ? pluginProfile() : opts.profile;
+    const calls: ExecCall[] = [];
+    const backend = stubBackend({
+      runExec: async (_id: string, cmd: string[], execOpts?: { user?: string; timeoutMs?: number }) => {
+        calls.push({ cmd, opts: execOpts });
+        if (cmd[0] === 'sh' && String(cmd[2]).startsWith('cat ')) {
+          return { exitCode: 0, stdout: opts.marker ? JSON.stringify(opts.marker) : '', stderr: '' };
+        }
+        if (cmd[0] === 'claude' && (opts.failInstalls ?? []).includes(String(cmd[3]))) {
+          return { exitCode: 1, stdout: '', stderr: 'marketplace not found' };
+        }
+        return { exitCode: 0, stdout: '', stderr: '' };
+      },
+    });
+    const stored = containerConfig({ name: 'web', profileId: profile ? profile.id : null });
+    const cfg = stubConfigStore([stored]);
+    (cfg.store as unknown as { getProfile: (id: string) => ProfileConfig | null }).getProfile = (id) =>
+      profile && profile.id === id ? profile : null;
+    backend.containers.push(containerSummary({ id: 'c-web', name: 'pc-web', names: ['pc-web'] }));
+    const hosts = stubHostManager(backend.backend);
+    const secrets = new SecretBox('test-master-secret');
+    const service = new ContainerService({ ...serviceDeps({ config: cfg.store, hosts }), secrets });
+    return { service, calls, backend };
+  }
+
+  const pluginExecs = (calls: ExecCall[]) => calls.filter((c) => c.cmd[0] === 'claude' && c.cmd[1] === 'plugin');
+  const markerWrites = (calls: ExecCall[]) =>
+    calls.filter(
+      (c) => c.cmd[0] === 'sh' && String(c.cmd[2]).includes(MARKER) && String(c.cmd[2]).includes('base64 -d'),
+    );
+
+  function decodeScriptPayload(script: string): Record<string, unknown> {
+    const match = /printf '%s' '([A-Za-z0-9+/=]+)'/.exec(script);
+    expect(match).toBeTruthy();
+    return JSON.parse(Buffer.from(match![1] as string, 'base64').toString('utf8'));
+  }
+
+  it('fast path: an up-to-date marker costs zero plugin execs', async () => {
+    const { service, calls } = pluginService({
+      marker: { syncedAt: '2026-01-01T00:00:00.000Z', installed: ['fmt@acme'] },
+    });
+    await service.restart('web');
+
+    expect(pluginExecs(calls)).toHaveLength(0);
+    expect(markerWrites(calls)).toHaveLength(0);
+    // exactly one marker read, and no network at all
+    expect(calls.filter((c) => c.cmd[0] === 'sh' && String(c.cmd[2]).startsWith('cat '))).toHaveLength(1);
+  });
+
+  it('installs a missing ref as the CONTAINER USER, never as uid 0', async () => {
+    const { service, calls } = pluginService({ marker: null });
+    await service.restart('web');
+
+    const execs = pluginExecs(calls);
+    expect(execs).toHaveLength(1);
+    expect(execs[0]!.cmd).toEqual(['claude', 'plugin', 'install', 'fmt@acme', '-y']);
+    expect(execs[0]!.opts?.user).toBeUndefined(); // root-owned ~/.claude breaks the next /login
+    expect(execs[0]!.opts?.timeoutMs).toBe(180_000);
+
+    const writes = markerWrites(calls);
+    expect(writes).toHaveLength(1);
+    expect(decodeScriptPayload(writes[0]!.cmd[2] as string).installed).toEqual(['fmt@acme']);
+  });
+
+  it('uninstalls a dropped ref on a PRIVATE login set', async () => {
+    const { service, calls } = pluginService({
+      profile: pluginProfile({ loginSet: null, plugins: ['fmt@acme'] }),
+      marker: { syncedAt: 'x', installed: ['fmt@acme', 'old@acme'] },
+    });
+    await service.restart('web');
+
+    expect(pluginExecs(calls).map((c) => c.cmd)).toEqual([['claude', 'plugin', 'uninstall', 'old', '-y']]);
+    expect(decodeScriptPayload(markerWrites(calls)[0]!.cmd[2] as string).installed).toEqual(['fmt@acme']);
+  });
+
+  it('never uninstalls on a SHARED login set — it only forgets the ref', async () => {
+    for (const loginSet of ['default', 'team']) {
+      const { service, calls } = pluginService({
+        profile: pluginProfile({ loginSet, plugins: ['fmt@acme'] }),
+        marker: { syncedAt: 'x', installed: ['fmt@acme', 'old@acme'] },
+      });
+      await service.restart('web');
+
+      expect(pluginExecs(calls)).toHaveLength(0);
+      expect(decodeScriptPayload(markerWrites(calls)[0]!.cmd[2] as string).installed).toEqual(['fmt@acme']);
+    }
+  });
+
+  it('turns a failing install into a warning and does not record the ref', async () => {
+    const { service, calls } = pluginService({
+      profile: pluginProfile({ plugins: ['fmt@acme', 'bad@acme'] }),
+      marker: null,
+      failInstalls: ['bad@acme'],
+    });
+
+    const view = await service.restart('web');
+    expect(view.warnings.join(' ')).toContain("installing the plugin 'bad@acme' failed");
+    expect(view.warnings.join(' ')).toContain('marketplace not found');
+    expect(decodeScriptPayload(markerWrites(calls)[0]!.cmd[2] as string).installed).toEqual(['fmt@acme']);
+  });
+
+  it('does nothing at all without a profile, or with an empty plugin list', async () => {
+    const none = pluginService({ profile: null });
+    await none.service.restart('web');
+    expect(pluginExecs(none.calls)).toHaveLength(0);
+    expect(none.calls.some((c) => String(c.cmd[2] ?? '').includes(MARKER))).toBe(false);
+
+    const empty = pluginService({ profile: pluginProfile({ plugins: [] }) });
+    await empty.service.restart('web');
+    expect(pluginExecs(empty.calls)).toHaveLength(0);
+    expect(empty.calls.some((c) => String(c.cmd[2] ?? '').includes(MARKER))).toBe(false);
+  });
+
+  it('enables the plugins and declares the marketplaces in the managed settings', async () => {
+    const { service, calls } = pluginService({
+      profile: pluginProfile({
+        plugins: ['fmt@acme', 'lint@acme'],
+        marketplaces: [
+          { name: 'acme', source: 'acme/plugins' },
+          { name: 'internal', source: 'https://git.example.com/plugins.git' },
+        ],
+      }),
+      marker: { syncedAt: 'x', installed: ['fmt@acme', 'lint@acme'] },
+    });
+    await service.restart('web');
+
+    const managed = calls.find((c) => c.cmd[0] === 'sh' && String(c.cmd[2]).includes(MANAGED_PATH));
+    expect(managed).toBeTruthy();
+    const payload = decodeScriptPayload(managed!.cmd[2] as string);
+    expect(payload.enabledPlugins).toEqual({ 'fmt@acme': true, 'lint@acme': true });
+    expect(payload.extraKnownMarketplaces).toEqual({
+      acme: { source: { source: 'github', repo: 'acme/plugins' } },
+      internal: { source: { source: 'git', url: 'https://git.example.com/plugins.git' } },
+    });
   });
 });

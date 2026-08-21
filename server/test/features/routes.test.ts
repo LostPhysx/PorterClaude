@@ -177,6 +177,27 @@ describe('/api/containers', () => {
     });
   });
 
+  it('POST / passes profileId through and defaults it to null (v0.4)', async () => {
+    await request(makeApp())
+      .post('/api/containers')
+      .send({ ...body, profileId: 'work' })
+      .expect(201);
+    expect(calls.find((c) => c.method === 'create')?.args[0]).toMatchObject({ profileId: 'work' });
+
+    calls.length = 0;
+    await request(makeApp()).post('/api/containers').send(body).expect(201);
+    // the default must be an explicit null, not undefined: buildContainerSpec branches on it
+    expect(calls.find((c) => c.method === 'create')?.args[0]).toMatchObject({ profileId: null });
+  });
+
+  it('POST / rejects a profileId that is not a slug (v0.4)', async () => {
+    const res = await request(makeApp())
+      .post('/api/containers')
+      .send({ ...body, profileId: 'Not A Profile' })
+      .expect(422);
+    expect(res.body.error.code).toBe('validation_error');
+  });
+
   it('POST / rejects a hostId that is not a slug', async () => {
     const res = await request(makeApp())
       .post('/api/containers')

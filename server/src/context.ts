@@ -13,6 +13,7 @@ import type { ContainerService } from './containers/service.js';
 import type { ContainerFilesService } from './containers/files.js';
 import type { ImageService } from './images/service.js';
 import type { SessionService } from './sessions/service.js';
+import type { ProfileStore } from './profiles/service.js';
 
 /** What every service constructor receives (first argument). */
 export interface ServiceDeps {
@@ -24,6 +25,12 @@ export interface ServiceDeps {
   hosts: HostManager;
   /** v0.2: agent definitions (built-in + custom) and their per-host/-container resolution */
   agents: AgentRegistry;
+  /**
+   * v0.4: the SecretBox, so the container machinery can decrypt a profile's secret env
+   * (profiles/apply.ts) without reaching through the route-facing ProfileStore. Optional:
+   * a service constructed without it simply skips secret env (and says so in the log).
+   */
+  secrets?: SecretBox;
   /**
    * @deprecated v0.1 compatibility shim (`hosts.legacyAccess()`), pinned to the DEFAULT
    * host. It exists only so the v0.1 services compile while B2 threads `hostId` through
@@ -40,6 +47,8 @@ export interface AppContext extends ServiceDeps {
   containers: ContainerService;
   /** v0.3.1: browse / download / upload the workspace of a running container */
   files: ContainerFilesService;
+  /** v0.4: named per-container configuration sets (issues #2/#3) */
+  profiles: ProfileStore;
   images: ImageService;
   /** v0.3: the shell connections inside a container (was `terminals`) */
   sessions: SessionService;

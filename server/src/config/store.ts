@@ -10,6 +10,7 @@ import {
   CONFIG_VERSION,
   CONFIG_VERSION_V1,
   CONFIG_VERSION_V2,
+  CONFIG_VERSION_V3,
   defaultConfig,
 } from './schema.js';
 import type { AppConfig, GeneralConfig, SanitizedSettings } from './schema.js';
@@ -19,6 +20,8 @@ import { LEGACY_HOST_ID } from '../hosts/model.js';
 import { DEFAULT_ENABLED_AGENT_IDS } from '../agents/builtin.js';
 import { AgentDefinitionSchema } from '../agents/model.js';
 import type { AgentDefinition } from '../agents/model.js';
+import { ProfileConfigSchema } from '../profiles/model.js';
+import type { ProfileConfig } from '../profiles/model.js';
 import type { SecretBox } from './crypto.js';
 import { hashPassword } from './crypto.js';
 import type { Env } from '../env.js';
@@ -127,7 +130,7 @@ export class ConfigStore extends EventEmitter {
     } catch {
       return null;
     }
-    const migrated = this.dropInvalidCustomAgents(this.migrate(json));
+    const migrated = this.dropInvalidProfiles(this.dropInvalidCustomAgents(this.migrate(json)));
     const parsed = AppConfigSchema.safeParse(migrated);
     if (!parsed.success) {
       this.deps.log.error({ issues: parsed.error.issues }, 'config.json does not match the schema');
@@ -165,6 +168,32 @@ export class ConfigStore extends EventEmitter {
   }
 
   /**
+   * Same contract as `dropInvalidCustomAgents`, for stored profiles: one profile that no
+   * longer satisfies `ProfileConfigSchema` (e.g. written by a newer build with extra fields
+   * that a later schema tightened) must not quarantine config.json — hosts, credentials and
+   * containers stay loaded. The offending profile is logged and not loaded.
+   */
+  private dropInvalidProfiles(raw: unknown): unknown {
+    if (!raw || typeof raw !== 'object') return raw;
+    const obj = raw as Record<string, unknown>;
+    if (!Array.isArray(obj.profiles)) return obj;
+
+    const kept = obj.profiles.filter((entry) => {
+      const parsed = ProfileConfigSchema.safeParse(entry);
+      if (!parsed.success) {
+        const id = (entry as { id?: unknown } | null)?.id;
+        this.deps.log.error(
+          { id, issues: parsed.error.issues },
+          'dropping a stored profile that does not match the schema',
+        );
+      }
+      return parsed.success;
+    });
+    if (kept.length === obj.profiles.length) return obj;
+    return { ...obj, profiles: kept };
+  }
+
+  /**
    * Version-based migrations, applied to the RAW json before AppConfigSchema parses it.
    *
    * v1 -> v2 (v0.1 single backend -> hosts). MUST be lossless:
@@ -194,11 +223,17 @@ export class ConfigStore extends EventEmitter {
    *   2. `sessions[]` is renamed to `containers[]` verbatim (no entry is touched) and
    *      version becomes 3.
    *
+   * v3 -> v4 (v0.4 profiles, issues #2/#3): purely additive —
+   *   1. write <configFile>.v3.bak (best effort, once);
+   *   2. `profiles: []` when the key is absent (the schema default would do the same; writing
+   *      it makes the file self-describing) and version becomes 4. Stored containers need no
+   *      touch: `containers[].profileId` defaults to null.
+   *
    * The steps are GUARDED INDIVIDUALLY, not short-circuited on the file's version: a v1 file
-   * must chain v1 -> v2 -> v3 in ONE pass, and the v3 step must see the object the v1 step
-   * produced (which is where the v1 step wrote `sessions`). A file that is already v3 passes
-   * through untouched (and writes no backup). A file from a NEWER version is used as-is with
-   * a warning (same rule as v0.1).
+   * must chain v1 -> v2 -> v3 -> v4 in ONE pass, and the v3 step must see the object the v1
+   * step produced (which is where the v1 step wrote `sessions`). A file that is already v4
+   * passes through untouched (and writes no backup). A file from a NEWER version is used
+   * as-is with a warning (same rule as v0.1).
    */
   private migrate(raw: unknown): unknown {
     if (!raw || typeof raw !== 'object') return raw;
@@ -293,12 +328,12 @@ export class ConfigStore extends EventEmitter {
 
     // ---- v2 -> v3: sessions[] (the long-lived container) -> containers[] ----
     // Runs on the INTERMEDIATE object, i.e. after the v1 step wrote `next.sessions`.
-    if (version < CONFIG_VERSION) {
+    if (version < CONFIG_VERSION_V3) {
       this.backupV2(next);
 
       next.containers = next.sessions ?? [];
       delete next.sessions;
-      next.version = CONFIG_VERSION;
+      next.version = CONFIG_VERSION_V3;
 
       this.deps.log.info(
         {
@@ -309,7 +344,34 @@ export class ConfigStore extends EventEmitter {
       );
     }
 
+    // ---- v3 -> v4: profiles[] (additive; containers[].profileId defaults to null) ----
+    if (version < CONFIG_VERSION) {
+      this.backupV3(next);
+
+      if (!Array.isArray(next.profiles)) next.profiles = [];
+      next.version = CONFIG_VERSION;
+
+      const migratedProfiles = next.profiles as unknown[];
+      this.deps.log.info(
+        { profiles: migratedProfiles.length, from: version || CONFIG_VERSION_V1 },
+        'migrated config.json to version 4 (profiles)',
+      );
+    }
+
     return next;
+  }
+
+  /** `<configFile>.v3.bak`, written once (best effort) before the first v4 write. */
+  private backupV3(obj: Record<string, unknown>): void {
+    const target = `${this.deps.paths.configFile}.v3.bak`;
+    try {
+      fsSync.writeFileSync(target, `${JSON.stringify(obj, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
+      this.deps.log.info({ backup: target }, 'kept a copy of the v3 config before migrating');
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') {
+        this.deps.log.warn({ err: (err as Error).message }, 'could not write the v3 config backup');
+      }
+    }
   }
 
   /** `<configFile>.v1.bak`, written once (best effort) before the first v2 write. */
@@ -569,6 +631,40 @@ export class ConfigStore extends EventEmitter {
       const idx = draft.agents.custom.findIndex((a) => a.id === id);
       if (idx >= 0) {
         draft.agents.custom.splice(idx, 1);
+        removed = true;
+      }
+    });
+    return removed;
+  }
+
+  // --- profiles (v0.4) ------------------------------------------------------
+
+  listProfiles(): ProfileConfig[] {
+    return this.get().profiles.map((p) => structuredClone(p) as ProfileConfig);
+  }
+
+  getProfile(id: string): ProfileConfig | null {
+    const found = this.get().profiles.find((p) => p.id === id);
+    return found ? (structuredClone(found) as ProfileConfig) : null;
+  }
+
+  /** Insert or replace by id; persists. */
+  async putProfile(profile: ProfileConfig): Promise<ProfileConfig> {
+    await this.update((draft) => {
+      const idx = draft.profiles.findIndex((p) => p.id === profile.id);
+      if (idx >= 0) draft.profiles[idx] = profile;
+      else draft.profiles.push(profile);
+    });
+    return this.getProfile(profile.id) as ProfileConfig;
+  }
+
+  /** Returns true when a profile was removed. Callers guard against containers in use. */
+  async deleteProfile(id: string): Promise<boolean> {
+    let removed = false;
+    await this.update((draft) => {
+      const idx = draft.profiles.findIndex((p) => p.id === id);
+      if (idx >= 0) {
+        draft.profiles.splice(idx, 1);
         removed = true;
       }
     });

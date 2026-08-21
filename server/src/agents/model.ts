@@ -330,6 +330,58 @@ export function agentAuthVolumeFor(volumePrefix: string, agentId: string): strin
   return `${volumePrefix}auth-${agentId}`;
 }
 
+/**
+ * v0.4: the built-in login set (docs/design/users.md §0) every unprofiled container mounts.
+ * Its volume keeps the v0.2 name VERBATIM — a profileless container's spec hash must never
+ * change because of profiles.
+ */
+export const DEFAULT_LOGIN_SET = 'default';
+
+/**
+ * v0.4: the auth volume of one agent in one LOGIN SET. `default` maps to the v0.2 volume
+ * name; every other set appends `_` + the set name. `_` is illegal in agent ids, profile
+ * ids and login set names alike (AGENT_ID_RE / PROFILE_ID_RE / LOGIN_SET_RE), so
+ * `auth-claude_team` can only parse one way and can never collide with an agent's plain
+ * volume (`auth-claude-x` for an agent literally named `claude-x`).
+ */
+export function agentLoginVolumeFor(volumePrefix: string, agentId: string, loginSet: string): string {
+  return loginSet === DEFAULT_LOGIN_SET
+    ? agentAuthVolumeFor(volumePrefix, agentId)
+    : `${volumePrefix}auth-${agentId}_${loginSet}`;
+}
+
+/**
+ * v0.4: the login set a container actually mounts for one agent:
+ *
+ *   no profile at all                  -> `default` (the v0.2 volume; nothing changes)
+ *   profile, no entry for this agent   -> `default` (the profile does not touch that agent)
+ *   entry with an explicit loginSet    -> that set (shared with every profile naming it)
+ *   entry with loginSet: null          -> the PROFILE ID as an implicit private set
+ *   profileId set but profile === null -> the PROFILE ID (dangling: see below)
+ *
+ * Structurally typed: agents/model.ts cannot import ProfileConfig (profiles/model.ts imports
+ * this file).
+ *
+ * The dangling case (profile deleted, config hand-edited) is why `profile === null` with a
+ * `profileId` resolves to the id rather than `default`: falling back to the shared volume
+ * would silently re-share a private login with every container on the host. Callers must
+ * therefore pass `null` — never `{ id, agents: {} }` — when the profile does not exist.
+ */
+export function loginSetFor(
+  profileId: string | null,
+  profile: { agents: Record<string, { loginSet: string | null }> } | null,
+  agentId: string,
+): string {
+  if (!profileId) return DEFAULT_LOGIN_SET;
+  // dangling profileId: keep the volume the container already uses
+  if (!profile) return profileId;
+  const entry = profile.agents[agentId];
+  if (!entry) return DEFAULT_LOGIN_SET;
+  const explicit = entry.loginSet;
+  if (typeof explicit === 'string' && explicit.length > 0) return explicit;
+  return profileId;
+}
+
 /** `<containerHome>/.porterclaude/agents` */
 export function agentDataRoot(containerHome: string): string {
   return `${containerHome.replace(/\/+$/, '')}/.porterclaude/agents`;

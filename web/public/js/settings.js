@@ -1,7 +1,8 @@
 // OWNER: F1. Settings tab shell: sub-tab switching plus the two panels that live in this
-// file (General, Account). The other three panels are separate modules with the same
-// lifecycle contract: hosts.js (Hosts + Portainer credentials), agents.js (Coding agents),
-// images.js (recipe images, jobs, tools volume).
+// file (General, Account). The other panels are separate modules with the same lifecycle
+// contract: hosts.js (Hosts + Portainer credentials), agents.js (Coding agents),
+// profiles.js (v0.4 profiles: login sets, env, settings, plugins), images.js (recipe
+// images, jobs, tools volume).
 //
 // v0.2: the "Docker backend" panel is GONE. `PUT /api/settings/backend`,
 // `POST /api/settings/backend/test` and `POST /api/settings/backend/endpoints` do not exist
@@ -20,6 +21,7 @@ import { byId, toast, toastError, escapeHtml } from './util.js';
 import imagesPanel from './images.js';
 import hostsPanel from './hosts.js';
 import agentsPanel from './agents.js';
+import profilesPanel from './profiles.js';
 
 /** @type {any|null} */
 let settings = null;
@@ -28,7 +30,7 @@ let initialised = false;
 let currentSubtab = 'hosts';
 
 /** The sub-tabs of the Settings view, in display order. FROZEN (index.html data-subtab). */
-export const SUBTABS = ['hosts', 'agents', 'general', 'images', 'account'];
+export const SUBTABS = ['hosts', 'agents', 'profiles', 'general', 'images', 'account'];
 
 /** FROZEN: F2 reads ui.layout / ui.theme from here. @returns {any|null} SanitizedSettings */
 export function getSettings() {
@@ -204,13 +206,13 @@ async function changePassword(event) {
  * @returns {Record<string, {init:Function, show:Function, hide:Function}>}
  */
 function panels() {
-  return { hosts: hostsPanel, agents: agentsPanel, images: imagesPanel };
+  return { hosts: hostsPanel, agents: agentsPanel, profiles: profilesPanel, images: imagesPanel };
 }
 
 /**
  * Sub-tab switcher for #settings-subtabs / .pc-subview. Exactly one panel is "shown" at a
  * time: the others get hide() so their polls/job tails stop.
- * @param {'hosts'|'agents'|'general'|'images'|'account'} name
+ * @param {'hosts'|'agents'|'profiles'|'general'|'images'|'account'} name
  */
 export function showSubtab(name) {
   currentSubtab = SUBTABS.includes(name) ? name : 'hosts';

@@ -11,12 +11,23 @@ import type { AgentDefinition } from '../agents/model.js';
 import {
   CONTAINER_AGENTS_ENV,
   CONTAINER_AGENT_LINKS_ENV,
-  agentAuthVolumeFor,
   agentDataDir,
   agentHistoryTarget,
   agentLinks,
+  agentLoginVolumeFor,
   encodeAgentLinks,
+  loginSetFor,
 } from '../agents/model.js';
+
+/**
+ * The profile slice buildContainerSpec needs: the id (label + implicit login set) and the
+ * per-agent loginSet picks. Structural so container.ts stays decoupled from the profile
+ * model (profiles/model.ts imports agents/model.ts; the cycle would be real).
+ */
+export interface ProfileSpecInput {
+  id: string;
+  agents: Record<string, { loginSet: string | null }>;
+}
 
 export interface BuildSpecInput {
   container: ContainerConfig;
@@ -28,6 +39,18 @@ export interface BuildSpecInput {
    * `porterclaude.agents` label and the spec hash, so pass it sorted by id.
    */
   agents: AgentDefinition[];
+  /**
+   * v0.4: the profile pinned by `container.profileId`, or null. MUST be null (not undefined)
+   * whenever profileId is null — a null-profile spec must stay byte-identical to v0.3 so no
+   * existing container ever reports needsRecreate.
+   *
+   * A DANGLING profileId (the profile was deleted) is passed as `null` — NOT as
+   * `{ id, agents: {} }`, which means a real profile that does not touch this agent and
+   * resolves to the shared `default` set. With null, `loginSetFor` keeps the container on the
+   * implicit private volume named after the id instead of silently re-sharing the host-wide
+   * login (containers/service.ts `profileSpecInput`).
+   */
+  profile?: ProfileSpecInput | null;
   /**
    * `config.instanceId()` — the install this container belongs to. It becomes the
    * `porterclaude.instance` label and is what keeps a second PorterClaude on the same engine
@@ -188,12 +211,18 @@ export function buildContainerSpec(input: BuildSpecInput): CreateContainerSpec {
 
   const mounts: MountSpec[] = [];
 
-  // One auth volume per agent, mounted at the agent dir. Its private-history overlay (when
-  // the container does not share history) is nested INSIDE that mount on purpose.
+  // One auth volume per agent, mounted at the agent dir — the volume of the LOGIN SET the
+  // container's profile picks (v0.4; `default` = the v0.2 name, so a null-profile spec is
+  // unchanged). The private-history overlay (when the container does not share history) is
+  // nested INSIDE that mount on purpose.
   for (const agent of agents) {
     mounts.push({
       type: 'volume',
-      source: agentAuthVolumeFor(general.volumePrefix, agent.id),
+      source: agentLoginVolumeFor(
+        general.volumePrefix,
+        agent.id,
+        loginSetFor(container.profileId, input.profile ?? null, agent.id),
+      ),
       target: agentDataDir(home, agent.id),
       readOnly: false,
     });
@@ -237,6 +266,15 @@ export function buildContainerSpec(input: BuildSpecInput): CreateContainerSpec {
     [CONTAINER_AGENTS_ENV]: agents.map((a) => a.id).join(','),
     [CONTAINER_AGENT_LINKS_ENV]: encodeAgentLinks(links),
   };
+  // v0.4: profile marker, present on profiled containers ONLY — this is what makes the
+  // null-profile spec byte-identical to v0.3 (specHash covers env). Profile env/secrets are
+  // deliberately NOT here: they ride /etc/claude-code/managed-settings.json (profiles/apply.ts)
+  // so rotating a key needs a restart, not a recreate.
+  //
+  // Keyed off `container.profileId`, NOT `input.profile`: a container whose profile was
+  // deleted keeps the id it was created with, so its spec (and hash) stays stable instead of
+  // reporting needsRecreate for a change nobody made — same rule as the mount and the label.
+  if (container.profileId) env.PORTERCLAUDE_PROFILE = container.profileId;
   // agent-declared env first, the user's own env always wins
   for (const agent of agents) for (const [k, v] of Object.entries(agent.env)) env[k] = v;
   for (const [k, v] of Object.entries(container.env)) env[k] = v;
@@ -251,6 +289,9 @@ export function buildContainerSpec(input: BuildSpecInput): CreateContainerSpec {
     [CONTAINER_LABELS.createdAt]: container.createdAt,
   };
   if (container.image.type === 'recipe') labels[CONTAINER_LABELS.recipe] = container.image.recipe;
+  // v0.4: recovered by synthesizeConfig so adopting a profiled container is lossless. Labels
+  // are excluded from specHash, and the mount/env changes hash on their own.
+  if (container.profileId) labels[CONTAINER_LABELS.profile] = container.profileId;
 
   const ports: PortMapSpec[] = container.ports.map((p) => ({
     containerPort: p.containerPort,

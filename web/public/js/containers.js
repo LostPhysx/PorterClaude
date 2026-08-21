@@ -5,6 +5,10 @@
 // and a host filter; the dialog gains a host picker and an agent picker; every lookup the
 // dialog needs (recipes, images, networks, agents) is host scoped.
 //
+// v0.4: a container may also carry a PROFILE (`profileId`, null = none). The profile decides
+// which login set the agent mounts plus its env/settings overlay; changing it flips
+// `needsRecreate` exactly like any other config change.
+//
 // CROSS-PACKAGE CONTRACT (FROZEN):
 //   * after every successful list()/poll/CRUD, emit
 //     bus.emit(EVENTS.CONTAINERS_CHANGED, { containers }) with the raw, UNFILTERED ContainerView[]
@@ -22,6 +26,7 @@ import {
 } from './util.js';
 import { getHosts, getHost, hostLabel, resolveHostId, hostOptionsHtml } from './hosts.js';
 import { agentLabel } from './agents.js';
+import { getProfiles, loadProfiles, profileOptionsHtml } from './profiles.js';
 
 /** Poll cadence (mirrors app.js CONTAINER_POLL_MS; kept local to avoid an import cycle). */
 export const POLL_MS = 5000;
@@ -354,6 +359,24 @@ export function agentChips(container) {
 }
 
 /**
+ * The profile badge shown next to the agent chips: the profile name (the raw id in the
+ * tooltip), nothing at all when the container has no profile. v0.4.
+ * @param {any} container ContainerView
+ * @returns {string}
+ */
+export function profileChip(container) {
+  const id = String((container && container.profileId) || '');
+  if (!id) return '';
+  const profile = getProfiles().find((p) => p && p.id === id) || null;
+  const label = (profile && profile.name) || id;
+  const title = profile ? `profile ${id}` : `profile ${id} (deleted)`;
+  return (
+    `<span class="badge text-bg-primary pc-agent-chip" title="${escapeHtml(title)}">` +
+    `<i class="bi bi-person-badge me-1"></i>${escapeHtml(label)}</span>`
+  );
+}
+
+/**
  * The rows the table shows: `containers` filtered by `hostFilter` ('' = all).
  * The bus payload is NEVER filtered - see the contract at the top of this file.
  * @returns {any[]}
@@ -432,11 +455,13 @@ function render() {
       const warnIcon = warnings.length
         ? ` <i class="bi bi-exclamation-triangle-fill text-warning"${warnTitle}></i>`
         : '';
+      const profile = profileChip(s);
       return (
         `<tr data-name="${escapeHtml(s.name)}"${busyRows.has(s.name) ? ' class="opacity-75"' : ''}>` +
         `<td><div class="fw-semibold">${escapeHtml(s.name)}${warnIcon}${pills(s)}</div>` +
         (s.displayName ? `<div class="small text-secondary">${escapeHtml(s.displayName)}</div>` : '') +
         agentChips(s) +
+        (profile ? `<div class="mt-1">${profile}</div>` : '') +
         '</td>' +
         hostCell(s) +
         `<td><div>${escapeHtml(imageLabel(s))}</div>` +
@@ -545,6 +570,9 @@ async function loadRecipes(hostId) {
  */
 async function loadLookups(hostId) {
   await loadRecipes(hostId);
+  // profiles are install-global (not host scoped), but this is the one place the dialog
+  // refreshes its pickers, so they ride along
+  await loadProfiles().catch(() => {});
   imageRefs = [];
   networks = [];
   formAgents = [];
@@ -695,6 +723,25 @@ function agentsFieldHtml(container) {
   );
 }
 
+/**
+ * The profile picker (v0.4). "None" is the v0.3 behaviour: the container mounts the
+ * host-wide shared login volume. Changing it on an existing container flips
+ * `needsRecreate`, which the table surfaces as the "config changed" badge.
+ * @param {any|null} container
+ * @returns {string}
+ */
+function profileFieldHtml(container) {
+  const selected = container ? String(container.profileId || '') : '';
+  return (
+    '<div class="col-md-6"><label class="form-label" for="sf-profile">Profile</label>' +
+    `<select class="form-select" id="sf-profile">${profileOptionsHtml(selected)}</select>` +
+    '<div class="form-text">A profile decides which <strong>login set</strong> the agent mounts ' +
+    '(the first container of a set logs in once, every later one is already logged in) plus its ' +
+    'env, secrets and settings overlay. Manage them under Settings &rarr; Profiles. Changing it ' +
+    'here recreates the container.</div></div>'
+  );
+}
+
 function containerFormHtml(container) {
   const isEdit = !!container;
   const s = container || {};
@@ -786,6 +833,7 @@ function containerFormHtml(container) {
     `<div class="col-md-3"><label class="form-label" for="sf-user">User</label>
        <input class="form-control" id="sf-user" value="${escapeHtml(s.user || '')}" placeholder="image default"></div>` +
     agentsFieldHtml(container) +
+    profileFieldHtml(container) +
     '<div class="col-12 d-flex gap-4">' +
     '<div class="form-check"><input class="form-check-input" type="checkbox" id="sf-share-history"' +
     `${s.shareHistory === false ? '' : ' checked'}>` +
@@ -956,6 +1004,9 @@ export function readContainerForm() {
     input.agents = agentIds;
   }
 
+  // v0.4: '' = no profile (the host-wide shared login volume)
+  input.profileId = value('sf-profile') || null;
+
   input.shareHistory = checked('sf-share-history');
   input.autoStart = checked('sf-autostart');
   input.network = value('sf-network') || null;
@@ -1086,6 +1137,15 @@ function repaintLookups(container) {
   // the default workspace volume name follows the host's volumePrefix (FE-QA-02)
   const volumeName = byId('sf-ws-volume-name');
   if (volumeName) volumeName.placeholder = volumeNamePlaceholder(formHostId);
+
+  // the profile list is global; the option list is rebuilt so a profile added meanwhile
+  // shows up, keeping whatever the user picked
+  const profileSelect = byId('sf-profile');
+  if (profileSelect) {
+    const current = profileSelect.value || (container ? String(container.profileId || '') : '');
+    profileSelect.innerHTML = profileOptionsHtml(current);
+    profileSelect.value = current;
+  }
 
   // the agent picker belongs to the host, so it is rebuilt from scratch - the inherit flag
   // the user set is preserved
@@ -1635,6 +1695,8 @@ const containersView = {
     renderHostFilter();
     await reload().catch(() => {});
     void loadRecipes(resolveHostId(hostFilter || null));
+    // the row badge needs the profile names before the dialog is ever opened
+    void loadProfiles().then(() => render()).catch(() => {});
     startPolling();
   },
   show() {

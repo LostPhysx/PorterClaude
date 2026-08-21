@@ -36,6 +36,7 @@ import { AgentRegistry } from './agents/registry.js';
 import { createAuthService } from './auth/index.js';
 import { ContainerService } from './containers/service.js';
 import { ContainerFilesService } from './containers/files.js';
+import { ProfileStore } from './profiles/service.js';
 import { ImageService } from './images/service.js';
 import { SessionService } from './sessions/service.js';
 import { attachSessionWs } from './sessions/ws.js';
@@ -77,7 +78,7 @@ export async function start(): Promise<StartedServer> {
   // down there would abort in-flight builds, pulls and execs.
   config.on('change', () => hosts.invalidateChanged());
 
-  const deps: ServiceDeps = { env, log, paths, config, hosts, agents, backends: hosts.legacyAccess() };
+  const deps: ServiceDeps = { env, log, paths, config, hosts, agents, secrets, backends: hosts.legacyAccess() };
   const images = new ImageService(deps);
   // the second argument is the tools-volume gate for CREATING a container: a host that was
   // never synced can only produce crash-looping containers (see ContainerService)
@@ -85,6 +86,7 @@ export async function start(): Promise<StartedServer> {
   // the third argument is the tools-volume gate for `shell=agent:<id>` (see SessionService)
   const sessions = new SessionService(deps, containers, images);
   const files = new ContainerFilesService(deps, containers);
+  const profiles = new ProfileStore({ config, secrets, log });
   const auth = createAuthService({ config, secrets, env, log });
 
   const ctx: AppContext = {
@@ -94,6 +96,7 @@ export async function start(): Promise<StartedServer> {
     credentials,
     containers,
     files,
+    profiles,
     images,
     sessions,
     version: readVersion(),

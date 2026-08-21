@@ -20,6 +20,8 @@ depends on it (§7 has the mechanics).
 | **container** | one project's box: image, workspace, mounts, agents | long-lived — spun up per project, left running until the project ends | *session* |
 | **session** | one connection to a shell inside a container | a working stretch — a day's work, closed at clock-out; survives a browser reload, dies when the pane is closed | *terminal* / *pane* |
 | **login** | the authenticated browser, i.e. the cookie | until logout or expiry | *session* (cookie) |
+| **profile** (v0.4) | a named per-container configuration set: which login set to mount, provider credentials/settings, plugins | until deleted; containers pin it via `profileId` | – |
+| **login set** (v0.4) | a named shared auth volume per agent per host (`auth-<agentId>` for `default`, `auth-<agentId>_<set>` otherwise); everything behind the agent's symlinks — login, history, plugin files — is shared with it | until no profile references it (and `?removeVolumes=1`) | the one implicit set everyone shared |
 
 A container is identified by `<hostId>.<container>` (§1); a session, when it ever needs a
 full name, is `<hostId>.<container>.<session>`.

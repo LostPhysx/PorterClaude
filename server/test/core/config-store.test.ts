@@ -73,6 +73,7 @@ function sampleContainer(name: string): ContainerConfig {
     name,
     hostId: 'default',
     agents: null,
+    profileId: null,
     image: { type: 'recipe', recipe: 'node' },
     workspace: { type: 'volume' },
     env: {},
@@ -94,7 +95,7 @@ describe('ConfigStore', () => {
     const { ctx } = await buildContext({ DATA_DIR: dir });
 
     const onDisk = JSON.parse(await readFile(path.join(dir, 'config.json'), 'utf8'));
-    expect(onDisk.version).toBe(3);
+    expect(onDisk.version).toBe(4);
     expect(onDisk.backend).toBeUndefined();
     expect(onDisk.hosts).toEqual([]);
     expect(onDisk.defaultHostId).toBeNull();
@@ -208,7 +209,7 @@ describe('ConfigStore', () => {
     const { ctx } = await buildContext({ DATA_DIR: dir, APP_SECRET: FIXTURE_SECRET });
     const cfg = ctx.config.get();
 
-    expect(cfg.version).toBe(3);
+    expect(cfg.version).toBe(4);
     expect(cfg.defaultHostId).toBe('default');
     expect(cfg.hosts).toHaveLength(1);
     expect(cfg.hosts[0]!.connection).toEqual({
@@ -248,7 +249,7 @@ describe('ConfigStore', () => {
     expect(backup.backend.kind).toBe('portainer');
     const onDisk = JSON.parse(await readFile(path.join(dir, 'config.json'), 'utf8'));
     expect(onDisk.backend).toBeUndefined();
-    expect(onDisk.version).toBe(3);
+    expect(onDisk.version).toBe(4);
     expect(onDisk.sessions).toBeUndefined();
     expect(onDisk.containers.map((c: { name: string }) => c.name)).toEqual(['alpha', 'beta']);
   });
@@ -284,7 +285,7 @@ describe('ConfigStore', () => {
     expect(second.ctx.config.get().hosts).toHaveLength(1);
     expect(second.ctx.config.get().containers[0]!.hostId).toBe('default');
     const third = await buildContext({ DATA_DIR: dir });
-    expect(third.ctx.config.get().version).toBe(3);
+    expect(third.ctx.config.get().version).toBe(4);
     // the backup is written exactly once and never overwritten
     expect(await readFile(path.join(dir, 'config.json.v1.bak'), 'utf8')).toBe(backupBefore);
   });
@@ -337,7 +338,7 @@ describe('ConfigStore', () => {
     const { ctx } = await buildContext({ DATA_DIR: dir });
     const cfg = ctx.config.get();
 
-    expect(cfg.version).toBe(3);
+    expect(cfg.version).toBe(4);
     // the entries themselves survive the key rename untouched
     expect(cfg.containers.map((c) => c.name)).toEqual(['alpha', 'beta']);
     expect(cfg.containers[1]!.shareHistory).toBe(false);
@@ -355,7 +356,7 @@ describe('ConfigStore', () => {
     expect(backup.version).toBe(2);
     expect(backup.sessions.map((s: { name: string }) => s.name)).toEqual(['alpha', 'beta']);
     const onDisk = JSON.parse(await readFile(path.join(dir, 'config.json'), 'utf8'));
-    expect(onDisk.version).toBe(3);
+    expect(onDisk.version).toBe(4);
     expect(onDisk.sessions).toBeUndefined();
     expect(onDisk.containers.map((c: { name: string }) => c.name)).toEqual(['alpha', 'beta']);
     // a v2 file was never a v1: no v1 backup is written on this path
@@ -363,9 +364,130 @@ describe('ConfigStore', () => {
 
     // flag 'wx': the backup is written exactly once and never overwritten
     const second = await buildContext({ DATA_DIR: dir });
-    expect(second.ctx.config.get().version).toBe(3);
+    expect(second.ctx.config.get().version).toBe(4);
     expect(second.ctx.config.get().containers.map((c) => c.name)).toEqual(['alpha', 'beta']);
     expect(await readFile(path.join(dir, 'config.json.v2.bak'), 'utf8')).toBe(backupRaw);
+  });
+
+  // v0.4 (CONFIG_VERSION 4): `profiles[]` is added; nothing else moves. The interesting
+  // properties: a stored container gains profileId:null (the schema default), the v3 backup
+  // is written once, and a v1 file CHAINS through to v4 in one pass.
+  it('migrates a v0.3 config: profiles[] is added, containers untouched, config.json.v3.bak is kept', async () => {
+    const dir = await freshDir();
+    const v3 = {
+      version: 3,
+      instanceId: 'pc-0123456789ab',
+      auth: { passwordHash: null, tokenVersion: 1, updatedAt: null },
+      hosts: [],
+      defaultHostId: null,
+      credentials: { portainer: [] },
+      agents: { custom: [] },
+      general: {},
+      containers: [sampleContainer('alpha')],
+      ui: { layout: null, theme: 'auto' },
+    };
+    await writeFile(path.join(dir, 'config.json'), JSON.stringify(v3, null, 2), 'utf8');
+
+    const { ctx } = await buildContext({ DATA_DIR: dir });
+    const cfg = ctx.config.get();
+
+    expect(cfg.version).toBe(4);
+    expect(cfg.profiles).toEqual([]);
+    // stored containers parse with the profileId default and nothing else moved
+    expect(cfg.containers).toHaveLength(1);
+    expect(cfg.containers[0]!.profileId).toBeNull();
+
+    const backupRaw = await readFile(path.join(dir, 'config.json.v3.bak'), 'utf8');
+    const backup = JSON.parse(backupRaw);
+    expect(backup.version).toBe(3);
+    expect(backup.profiles).toBeUndefined();
+    // a v3 file was never v1 or v2: no earlier backups on this path
+    await expect(stat(path.join(dir, 'config.json.v1.bak'))).rejects.toThrow();
+    await expect(stat(path.join(dir, 'config.json.v2.bak'))).rejects.toThrow();
+
+    // flag 'wx': written exactly once
+    const second = await buildContext({ DATA_DIR: dir });
+    expect(second.ctx.config.get().version).toBe(4);
+    expect(await readFile(path.join(dir, 'config.json.v3.bak'), 'utf8')).toBe(backupRaw);
+  });
+
+  it('migrates a v0.1 config straight to v4 and drops a stored profile that no longer parses', async () => {
+    const dir = await freshDir();
+    await writeFile(
+      path.join(dir, 'config.json'),
+      JSON.stringify(v1Config({ kind: 'socket', portainer: {}, socket: { socketPath: '/var/run/docker.sock' } })),
+      'utf8',
+    );
+    const { ctx } = await buildContext({ DATA_DIR: dir });
+    const cfg = ctx.config.get();
+    expect(cfg.version).toBe(4);
+    expect(cfg.profiles).toEqual([]);
+    for (const bak of ['config.json.v1.bak', 'config.json.v2.bak', 'config.json.v3.bak']) {
+      await stat(path.join(dir, bak));
+    }
+
+    // a corrupted profile must not quarantine the whole file on the next boot: it is written
+    // straight to disk (update() would refuse it), exactly what an older/newer build leaves behind
+    const onDisk = JSON.parse(await readFile(path.join(dir, 'config.json'), 'utf8'));
+    onDisk.profiles = [
+      { id: 'broken', name: 'Broken' },
+      {
+        id: 'fine',
+        name: 'Fine',
+        description: null,
+        agents: {
+          claude: {
+            loginSet: 'team',
+            env: { ANTHROPIC_BASE_URL: 'https://relay.example' },
+            envSecretsEnc: {},
+            settings: {},
+            marketplaces: [],
+            plugins: [],
+          },
+        },
+        createdAt: '2026-01-01T00:00:00.000Z',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+      },
+    ];
+    await writeFile(path.join(dir, 'config.json'), JSON.stringify(onDisk, null, 2), 'utf8');
+
+    const reloaded = await buildContext({ DATA_DIR: dir });
+    expect(reloaded.ctx.config.listProfiles().map((p) => p.id)).toEqual(['fine']);
+    expect(reloaded.ctx.config.getProfile('fine')?.agents.claude?.loginSet).toBe('team');
+  });
+
+  it('stores and replaces profiles via the profile CRUD helpers', async () => {
+    const dir = await freshDir();
+    const { ctx } = await buildContext({ DATA_DIR: dir });
+    const now = new Date().toISOString();
+    await ctx.config.putProfile({
+      id: 'work',
+      name: 'Work',
+      description: null,
+      agents: {
+        claude: {
+          loginSet: null,
+          env: {},
+          envSecretsEnc: { ANTHROPIC_API_KEY: 'enc:v1:x' },
+          settings: {},
+          marketplaces: [],
+          plugins: [{ ref: 'linter@anthropics' }],
+        },
+      },
+      createdAt: now,
+      updatedAt: now,
+    });
+    expect(ctx.config.listProfiles().map((p) => p.id)).toEqual(['work']);
+    expect(ctx.config.getProfile('work')?.agents.claude?.envSecretsEnc.ANTHROPIC_API_KEY).toBe('enc:v1:x');
+    expect(ctx.config.getProfile('missing')).toBeNull();
+
+    const replaced = { ...ctx.config.getProfile('work')!, name: 'Work acct' };
+    await ctx.config.putProfile(replaced);
+    expect(ctx.config.getProfile('work')?.name).toBe('Work acct');
+
+    expect(await ctx.config.deleteProfile('work')).toBe(true);
+    expect(await ctx.config.deleteProfile('work')).toBe(false);
+    expect(ctx.config.listProfiles()).toEqual([]);
   });
 
   it('emits change and never leaves a partial file under concurrent writes', async () => {

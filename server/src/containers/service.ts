@@ -47,12 +47,18 @@ import { shQuote } from '../util/slug.js';
 import type { HostConfig } from '../hosts/model.js';
 import type { AgentDefinition } from '../agents/model.js';
 import {
-  agentAuthVolumeFor,
+  DEFAULT_LOGIN_SET,
   agentDataDir,
   agentDataRoot,
   agentHistoryTarget,
   agentLinks,
+  agentLoginVolumeFor,
+  loginSetFor,
 } from '../agents/model.js';
+import { PROFILE_ID_RE } from '../profiles/model.js';
+import type { ProfileConfig } from '../profiles/model.js';
+import { applyManagedSettings } from '../profiles/apply.js';
+import { syncProfilePlugins } from '../profiles/plugins.js';
 import type { ContainerConfig, ContainerInput, ContainerPreparation, ContainerView } from './model.js';
 import {
   CONTAINER_LABELS,
@@ -73,6 +79,7 @@ import {
   toolsPathPrefix,
   workspaceMountFor,
 } from './container.js';
+import type { ProfileSpecInput } from './container.js';
 
 /** label of the short-lived helper containers; deliberately NOT porterclaude.managed. */
 const VOLUME_INIT_LABEL = 'porterclaude.volume-init';
@@ -80,12 +87,18 @@ const VOLUME_INIT_LABEL = 'porterclaude.volume-init';
 /** label every auth volume carries so the UI/QA can tell whose login lives in it. */
 const VOLUME_AGENT_LABEL = 'porterclaude.agent';
 
+/** v0.4: label on a NON-default login-set volume, naming the set (docs/design/users.md §0). */
+const VOLUME_LOGIN_SET_LABEL = 'porterclaude.login-set';
+
 /** scratch mount prefix of a private history volume inside the volume-init container. */
 const HISTORY_INIT_MOUNT = '/pc-hist';
 
 /** uid:gid the recipe images give their container user - the canonical owner of the shared
  *  agent volumes while they are still root-owned (docker/recipes/common.sh). */
 const SHARED_VOLUME_OWNER = '1000:1000';
+
+/** the only agent whose profile slice becomes a managed-settings file today (v0.4) */
+const MANAGED_SETTINGS_AGENT_ID = 'claude';
 
 /** marker every file generated inside a container carries (docker/tools/entrypoint.sh). */
 const GENERATED_MARKER = '# porterclaude (generated) - do not duplicate';
@@ -506,6 +519,7 @@ export class ContainerService {
   async create(input: ContainerInput): Promise<ContainerView> {
     const hostId = this.deps.hosts.requireHostId(input.hostId);
     this.assertKnownAgents(input.agents);
+    this.assertKnownProfile(input.profileId);
     const scope = this.scope(hostId);
 
     // names are unique ACROSS hosts (api.md v0.2)
@@ -600,6 +614,7 @@ export class ContainerService {
       );
     }
     this.assertKnownAgents(input.agents);
+    this.assertKnownProfile(input.profileId);
     const cfg: ContainerConfig = {
       ...input,
       hostId: stored.hostId,
@@ -856,18 +871,26 @@ export class ContainerService {
   }
 
   /**
-   * Ensure the per-agent auth volumes of a container exist on ITS host (idempotent). The v0.1
-   * shared claude volumes are NOT created any more — they only survive as the source of the
-   * one-time legacy import done by the tools sync (images/service.ts).
+   * Ensure the per-agent auth volumes of a container exist on ITS host (idempotent). v0.4:
+   * the volume of the LOGIN SET the container's profile picks (`default` = the v0.2 name).
+   * The v0.1 shared claude volumes are NOT created any more — they only survive as the
+   * source of the one-time legacy import done by the tools sync (images/service.ts).
    */
-  async ensureAgentVolumes(scope: HostScope, agents: AgentDefinition[]): Promise<void> {
+  async ensureAgentVolumes(
+    scope: HostScope,
+    agents: AgentDefinition[],
+    profileId: string | null = null,
+  ): Promise<void> {
+    const profile = this.resolveProfileForSpec(profileId);
     for (const agent of agents) {
+      const loginSet = loginSetFor(profileId, profile, agent.id);
       await scope.backend.createVolume({
-        name: agentAuthVolumeFor(scope.general.volumePrefix, agent.id),
+        name: agentLoginVolumeFor(scope.general.volumePrefix, agent.id, loginSet),
         labels: {
           [CONTAINER_LABELS.managed]: 'true',
           [CONTAINER_LABELS.instance]: this.deps.config.instanceId(),
           [VOLUME_AGENT_LABEL]: agent.id,
+          ...(loginSet === DEFAULT_LOGIN_SET ? {} : { [VOLUME_LOGIN_SET_LABEL]: loginSet }),
         },
       });
     }
@@ -887,6 +910,40 @@ export class ContainerService {
         unknown.map((id) => ({ path: ['agents'], message: `unknown agent '${id}'` })),
       );
     }
+  }
+
+  /**
+   * v0.4: `profileId` may only name a stored profile. Passing a typo would otherwise store
+   * an id whose implicit login-set volume differs from every existing volume — a container
+   * that looks configured but starts with an empty login.
+   */
+  private assertKnownProfile(profileId: string | null | undefined): void {
+    if (!profileId) return;
+    if (!this.deps.config.getProfile(profileId)) {
+      throw AppError.validation(`unknown profile '${profileId}'`, [
+        { path: ['profileId'], message: `unknown profile '${profileId}'` },
+      ]);
+    }
+  }
+
+  /** v0.4: the stored profile, or null for none. No throw — used on rendering paths. */
+  private resolveProfileForSpec(profileId: string | null): ProfileConfig | null {
+    if (!profileId) return null;
+    return this.deps.config.getProfile(profileId);
+  }
+
+  /**
+   * v0.4: the profile slice `buildContainerSpec` needs, or null.
+   *
+   * A DANGLING profileId (profile deleted behind the container's back) deliberately yields
+   * null, not `{ id, agents: {} }`: `loginSetFor` then keeps the container on its implicit
+   * private volume instead of reading "no entry for this agent" and re-sharing the host-wide
+   * login. `{ id, agents: {} }` is a REAL profile that simply does not touch this agent.
+   */
+  private profileSpecInput(cfg: Pick<ContainerConfig, 'profileId'>): ProfileSpecInput | null {
+    if (!cfg.profileId) return null;
+    const profile = this.resolveProfileForSpec(cfg.profileId);
+    return profile ? { id: profile.id, agents: profile.agents } : null;
   }
 
   /**
@@ -1142,7 +1199,7 @@ export class ContainerService {
     // that engine, which is what lets the volume be read on a host that never synced.
     await this.requireSyncedTools(scope, resolvedImage);
 
-    await this.ensureAgentVolumes(scope, agents);
+    await this.ensureAgentVolumes(scope, agents, cfg.profileId);
 
     const wanted: string[] = [];
     const workspace = workspaceMountFor(cfg, general);
@@ -1174,6 +1231,7 @@ export class ContainerService {
         container: cfg,
         general,
         agents,
+        profile: this.profileSpecInput(cfg),
         resolvedImage,
         imageType: cfg.image.type,
         instanceId: this.deps.config.instanceId(),
@@ -1245,7 +1303,14 @@ export class ContainerService {
     const mounts = withHistory.flatMap(({ agent }, i) => [
       {
         type: 'volume' as const,
-        source: agentAuthVolumeFor(general.volumePrefix, agent.id),
+        // v0.4: the nested history volume must sit inside the SAME login-set volume the
+        // container mounts — nesting it into the shared one would put this container's
+        // private history into the wrong volume.
+        source: agentLoginVolumeFor(
+          general.volumePrefix,
+          agent.id,
+          loginSetFor(cfg.profileId, this.resolveProfileForSpec(cfg.profileId), agent.id),
+        ),
         target: agentDataDir(home, agent.id),
         readOnly: false,
       },
@@ -1497,7 +1562,106 @@ export class ContainerService {
     const agents = this.tryResolveAgents(cfg);
     await this.ensureHomeWritable(scope, cfg, agents, containerId);
     await this.ensureAgentDirs(scope, cfg, agents, containerId);
+    await this.applyProfileSettings(scope, cfg, containerId);
+    await this.syncProfilePlugins(scope, cfg, containerId);
     await this.seedGitWorkspace(scope, cfg, containerId);
+  }
+
+  /**
+   * v0.4 (#3): make the container's login-set volume carry the plugin FILES the profile's
+   * refs name. Which of them are ON is already decided, exec-free, by the managed settings
+   * `applyProfileSettings` just wrote — this is only the install side.
+   *
+   * Guarded hard: a container without a profileId, without a `claude` slice, or with an
+   * empty `plugins` list sees ZERO execs. Best effort, like everything else in afterStart:
+   * an offline host or a bad ref becomes a container warning and never fails a start.
+   */
+  private async syncProfilePlugins(
+    scope: HostScope,
+    cfg: ContainerConfig,
+    containerId: string,
+  ): Promise<void> {
+    if (!cfg.profileId) return;
+    const profile = this.resolveProfileForSpec(cfg.profileId);
+    if (!profile) return; // applyProfileSettings already warned about the dangling id
+    const agent = profile.agents[MANAGED_SETTINGS_AGENT_ID];
+    if (!agent || agent.plugins.length === 0) return;
+    const warnings = await syncProfilePlugins({
+      backend: scope.backend,
+      containerId,
+      home: containerHomeFor(scope.general),
+      user: cfg.user,
+      agent,
+      loginSet: loginSetFor(cfg.profileId, profile, MANAGED_SETTINGS_AGENT_ID),
+      profileId: cfg.profileId,
+      log: this.deps.log,
+    });
+    if (warnings.length) this.addWarnings(cfg.name, warnings);
+  }
+
+  /**
+   * v0.4 (#2): write the container profile's managed settings into /etc/claude-code.
+   *
+   * Only containers that HAVE a profileId are touched at all — an unprofiled container
+   * must be bit-for-bit the v0.3 container, so it gets zero execs here. A profiled
+   * container always gets exactly one (root) exec: either the composed settings are
+   * written, or a stale file is removed, which is what makes emptying/detaching a profile
+   * actually take effect instead of leaving yesterday's API key behind.
+   *
+   * Best effort, like `seedGitWorkspace`: a failure becomes a container warning and never
+   * fails a start.
+   */
+  private async applyProfileSettings(
+    scope: HostScope,
+    cfg: ContainerConfig,
+    containerId: string,
+  ): Promise<void> {
+    const profile = this.resolveProfileForSpec(cfg.profileId);
+    // A container that HAD a profile and lost it (detached by the user, or force-deleted with
+    // the profile) must have the file REMOVED, not merely left alone: it holds the old API key
+    // and base URL, and managed settings outrank everything the user can set, so skipping the
+    // exec would keep routing that container's traffic through yesterday's provider forever.
+    // `agent: null` makes applyManagedSettings take its removal branch.
+    //
+    // The only containers that see zero execs are those that never had a profile at all:
+    // `porterclaude.profile` is absent from their labels AND from the stored config.
+    // "Did this container ever have a profile?" is answered for free by its own
+    // `porterclaude.profile` label — no probing exec, so a container that never had one
+    // still costs zero execs here. (A RECREATE drops the file with the container layer
+    // anyway; this covers the detached-but-not-yet-recreated container, which keeps running
+    // with the old file until the user acts on its needsRecreate flag.)
+    // Only the detach case needs the lookup: a container that still HAS a profile is going
+    // to be written to anyway, so it never pays for the inspect.
+    if (!cfg.profileId && !(await this.inspectedProfileLabel(scope, containerId))) return;
+    if (cfg.profileId && !profile) {
+      this.addWarnings(cfg.name, [`profile '${cfg.profileId}' no longer exists; its settings were cleared`]);
+    }
+    const warning = await applyManagedSettings({
+      backend: scope.backend,
+      containerId,
+      home: containerHomeFor(scope.general),
+      user: cfg.user,
+      agent: profile?.agents[MANAGED_SETTINGS_AGENT_ID] ?? null,
+      secrets: this.deps.secrets,
+      log: this.deps.log,
+    });
+    if (warning) this.addWarnings(cfg.name, [warning]);
+  }
+
+  /**
+   * The `porterclaude.profile` label of the RUNNING container, or null. Read from the
+   * inspect the backend already serves — never an exec — so asking the question costs
+   * nothing for the overwhelming majority of containers, which have no profile at all.
+   */
+  private async inspectedProfileLabel(scope: HostScope, containerId: string): Promise<string | null> {
+    try {
+      const inspect = await scope.backend.inspectContainer(containerId);
+      const label = inspect?.labels?.[CONTAINER_LABELS.profile];
+      return typeof label === 'string' && label.length > 0 ? label : null;
+    } catch (err) {
+      this.deps.log.debug({ err: (err as Error).message }, 'could not read the profile label of a container');
+      return null;
+    }
   }
 
   /**
@@ -1939,6 +2103,10 @@ export class ContainerService {
           container: cfg,
           general,
           agents,
+          // v0.4: the SAME profile resolution as createContainerFor, otherwise the recomputed
+          // hash of a profiled container never matches its label and it reports needsRecreate
+          // forever. A dangling id keeps the volume stable (see loginSetFor).
+          profile: this.profileSpecInput(cfg),
           resolvedImage,
           imageType: cfg.image.type,
           instanceId: this.deps.config.instanceId(),
@@ -2077,6 +2245,23 @@ export class ContainerService {
       .filter((mount): mount is ContainerConfig['extraMounts'][number] => mount !== null);
 
     const agentsLabel = container.labels[CONTAINER_LABELS.agents];
+    // v0.4: recover the profile so adopting a profiled container keeps its login-set volumes
+    // on the next recreate; a label naming a deleted profile stays as-is (dangling ids render
+    // a warning instead of silently re-sharing the private volume, see resolveProfileForSpec).
+    //
+    // FILTERED through the id rule, like `agentsLabel` below: the stored schema validates
+    // `profileId` strictly, so a container carrying a hand-written or foreign
+    // `porterclaude.profile=My Profile` would make putContainer throw a raw ZodError — the
+    // container would be un-adoptable AND un-startable. An unusable label is simply dropped.
+    const rawProfileLabel = container.labels[CONTAINER_LABELS.profile];
+    const profileLabel =
+      rawProfileLabel !== undefined && PROFILE_ID_RE.test(rawProfileLabel) ? rawProfileLabel : undefined;
+    if (rawProfileLabel !== undefined && profileLabel === undefined) {
+      this.deps.log.warn(
+        { container: name, label: rawProfileLabel },
+        'ignoring an unusable porterclaude.profile label while adopting a container',
+      );
+    }
 
     return {
       name,
@@ -2085,6 +2270,7 @@ export class ContainerService {
       // whose backend listed it
       hostId: this.hostIdForContainer(container, hostId),
       agents: agentsLabel === undefined ? null : agentsLabel.split(',').filter((id) => id.length > 0),
+      profileId: profileLabel === undefined ? null : profileLabel,
       image: recipe ? { type: 'recipe', recipe } : { type: 'custom', ref: container.image },
       workspace,
       env: synthesizeEnv(inspect, general, image),

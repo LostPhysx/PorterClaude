@@ -5,6 +5,7 @@ import { z } from 'zod';
 import { SLUG_RE } from '../util/slug.js';
 import { AgentIdSchema, CONTAINER_AGENTS_ENV } from '../agents/model.js';
 import { HostIdSchema, LEGACY_HOST_ID } from '../hosts/model.js';
+import { ProfileIdSchema } from '../profiles/model.js';
 import type { ContainerState, PortBinding } from '../backends/types.js';
 
 export const ContainerNameSchema = z
@@ -121,6 +122,12 @@ export const ContainerInputSchema = z.object({
   network: z.string().min(1).nullable().default(null),
   /** override the container user (custom images that are not uid 1000) */
   user: z.string().min(1).nullable().default(null),
+  /**
+   * v0.4: the profile this container runs with (null = no profile, the default and the
+   * pre-v0.4 behavior). Changing it changes the mounted login-set volumes, so it always
+   * flips needsRecreate. Validated to a KNOWN profile id by the container service.
+   */
+  profileId: ProfileIdSchema.nullable().default(null),
 });
 
 /** Persisted form: input + bookkeeping. */
@@ -213,6 +220,8 @@ export const CONTAINER_LABELS = {
   agents: 'porterclaude.agents',
   imageType: 'porterclaude.image-type',
   recipe: 'porterclaude.recipe',
+  /** v0.4: the profile id the container runs with (recovered by synthesizeConfig on adoption) */
+  profile: 'porterclaude.profile',
   specHash: 'porterclaude.spec-hash',
   createdAt: 'porterclaude.created-at',
 } as const;

@@ -11,6 +11,7 @@ import { createDockerRouter } from './docker.js';
 import { createHostsRouter } from '../hosts/routes.js';
 import { createCredentialsRouter } from '../hosts/credentialRoutes.js';
 import { createAgentsRouter, createHostAgentsRouter } from '../agents/routes.js';
+import { createProfilesRouter } from '../profiles/routes.js';
 import { createContainersRouter } from '../containers/routes.js';
 import { createImagesRouter } from '../images/routes.js';
 
@@ -26,6 +27,7 @@ import { createImagesRouter } from '../images/routes.js';
  *                                         host id can never shadow them)
  *   /api/credentials                B1
  *   /api/agents                     B1   (definitions)
+ *   /api/profiles                   B1   (v0.4: per-container configuration sets)
  *   /api/settings                   B1   (general/ui/password only — the backend section is gone)
  *   /api/containers                 B2   (flat: container names are unique across hosts)
  *
@@ -49,6 +51,7 @@ export function registerRoutes(app: Express, ctx: AppContext): void {
   app.use('/api/hosts', gate, createHostsRouter(ctx));
   app.use('/api/credentials', gate, createCredentialsRouter(ctx));
   app.use('/api/agents', gate, createAgentsRouter(ctx));
+  app.use('/api/profiles', gate, createProfilesRouter(ctx));
   app.use('/api/settings', gate, createSettingsRouter(ctx));
   app.use('/api/containers', gate, createContainersRouter(ctx));
 }

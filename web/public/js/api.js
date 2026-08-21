@@ -288,6 +288,27 @@ export const api = {
     remove: (id, opts = {}) => del(`/agents/${enc(id)}`, { force: opts.force ? 1 : undefined }),
   },
 
+  // ---- profiles (v0.4) ---------------------------------------------------
+  profiles: {
+    /** @returns {Promise<{profiles:any[]}>} SanitizedProfile[] (no secret value, ever) */
+    list: () => get('/profiles'),
+    /** @returns {Promise<{profile:any}>} */
+    get: (id) => get(`/profiles/${enc(id)}`),
+    /** @param {any} input ProfileInput @returns {Promise<{profile:any}>} */
+    create: (input) => post('/profiles', input),
+    /** ProfileInput. `agents.<id>.envSecrets`: OMIT a key to keep the stored secret, send
+     *  null to clear it, send a plaintext string to replace it. */
+    update: (id, input) => put(`/profiles/${enc(id)}`, input),
+    /** @param {{force?:boolean, removeVolumes?:boolean}} [opts] force=1 strips the profile
+     *  from the containers that still use it (409 without it); removeVolumes=1 additionally
+     *  deletes the profile's PRIVATE login volumes (named/default sets are never touched). */
+    remove: (id, opts = {}) =>
+      del(`/profiles/${enc(id)}`, {
+        force: opts.force ? 1 : undefined,
+        removeVolumes: opts.removeVolumes ? 1 : undefined,
+      }),
+  },
+
   // ---- docker read-only helpers (host scoped) ---------------------------
   docker: {
     info: (hostId) => get(hostPath(hostId, '/docker/info')),
