@@ -24,6 +24,7 @@ const view = (name: string): ContainerView => ({
   hostMissing: false,
   preparing: null,
   agents: null,
+  profileId: null,
   resolvedAgents: ['claude'],
   image: { type: 'recipe', recipe: 'node' },
   workspace: { type: 'volume' },

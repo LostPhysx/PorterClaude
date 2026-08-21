@@ -6,6 +6,18 @@ import request from 'supertest';
 import { makeHarness, TEST_PASSWORD } from './helpers.js';
 import type { TestHarness } from './helpers.js';
 import type { ProfileInput } from '../../src/profiles/model.js';
+import { MANAGED_SETTINGS_PATH } from '../../src/profiles/apply.js';
+import { pluginMarkerPath } from '../../src/profiles/plugins.js';
+import {
+  MAX_PROBES,
+  MAX_PROBE_OUTPUT,
+  REDACTED_OUTPUT,
+  parseJsonPluginList,
+  parseTextPluginList,
+  runVerifyProbes,
+  supportsYesFlag,
+} from '../../src/profiles/verify.js';
+import type { ProbeExec } from '../../src/profiles/verify.js';
 
 const API_KEY = 'sk-live-profile_abcd';
 
@@ -307,5 +319,180 @@ describe('GET/POST/PUT/DELETE /api/profiles', () => {
       .set('Cookie', cookie)
       .send(sampleInput({ id: 'work', name: 'Other' }));
     expect(dup.status).toBe(409);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.4 (#4): the profile verify probe. The derivation is pure and tested directly;
+// `runVerifyProbes` is driven by a scripted exec, so none of this needs docker.
+// ---------------------------------------------------------------------------
+describe('profile verify probe (v0.4 #4)', () => {
+  const PLANTED_SECRET = 'sk-ant-planted-secret-do-not-leak';
+
+  const HELP_WITH_YES = [
+    'Usage: claude plugin install <ref> [options]',
+    '',
+    'Options:',
+    '  -y, --yes    skip the confirmation prompt',
+    '  -h, --help   display help for command',
+  ].join('\n');
+
+  const HELP_WITHOUT_YES = [
+    'Usage: claude plugin install <ref> [options]',
+    '',
+    'Options:',
+    '  -h, --help   display help for command',
+  ].join('\n');
+
+  interface ScriptedExec {
+    version?: { exitCode: number; stdout: string };
+    help?: { exitCode: number; stdout: string };
+    jsonList?: { exitCode: number; stdout: string };
+    textList?: { exitCode: number; stdout: string };
+    settings?: { exitCode: number; stdout: string };
+    marker?: string;
+  }
+
+  /** an exec that answers each of the five probe commands from a script */
+  function scriptedExec(s: ScriptedExec): { exec: ProbeExec; cmds: string[][] } {
+    const cmds: string[][] = [];
+    const exec: ProbeExec = async (cmd) => {
+      cmds.push(cmd);
+      const ok = (r?: { exitCode: number; stdout: string }) => ({
+        exitCode: r?.exitCode ?? 0,
+        stdout: r?.stdout ?? '',
+        stderr: '',
+      });
+      if (cmd[1] === '--version') return ok(s.version ?? { exitCode: 0, stdout: '1.2.3 (Claude Code)' });
+      if (cmd[2] === '--help') return ok(s.help ?? { exitCode: 0, stdout: HELP_WITH_YES });
+      if (cmd[3] === '--json') return ok(s.jsonList ?? { exitCode: 1, stdout: 'unknown option --json' });
+      if (cmd[2] === 'list') return ok(s.textList ?? { exitCode: 0, stdout: '' });
+      if (String(cmd[2]).includes(MANAGED_SETTINGS_PATH)) return ok(s.settings ?? { exitCode: 3, stdout: '' });
+      return ok({ exitCode: 0, stdout: s.marker ?? '' });
+    };
+    return { exec, cmds };
+  }
+
+  it('reads -y/--yes out of the plugin help, and says no when it is absent', () => {
+    expect(supportsYesFlag(HELP_WITH_YES)).toBe(true);
+    expect(supportsYesFlag('  --yes')).toBe(true);
+    expect(supportsYesFlag(HELP_WITHOUT_YES)).toBe(false);
+    // an English "yes" and a longer flag must not be mistaken for the option
+    expect(supportsYesFlag('answer yes when prompted')).toBe(false);
+    expect(supportsYesFlag('  --yes-really  do a thing')).toBe(false);
+  });
+
+  it('parses the installed plugins from --json, from plain text, and gives up on garbage', () => {
+    expect(parseJsonPluginList('{"plugins":[{"name":"fmt","marketplace":"acme"},"lint@corp"]}')).toEqual([
+      'fmt@acme',
+      'lint@corp',
+    ]);
+    expect(parseJsonPluginList('["fmt@acme"]')).toEqual(['fmt@acme']);
+    // not JSON at all, and JSON that is not a list of anything: null = "could not read it"
+    expect(parseJsonPluginList('Installed plugins: fmt@acme')).toBeNull();
+    expect(parseJsonPluginList('42')).toBeNull();
+
+    expect(parseTextPluginList('Installed plugins:\n  - fmt@acme\n  - lint@corp\n')).toEqual(['fmt@acme', 'lint@corp']);
+    // prose and error text must never become a phantom "installed" entry
+    expect(parseTextPluginList('No plugins installed')).toEqual([]);
+    expect(parseTextPluginList('error: unknown command "plugin"\n???\n')).toEqual([]);
+  });
+
+  it('reports only the TOP-LEVEL KEYS of the managed settings and never a value', async () => {
+    const settings = {
+      env: { ANTHROPIC_API_KEY: PLANTED_SECRET, ANTHROPIC_BASE_URL: 'https://relay.example/v1' },
+      enabledPlugins: { 'fmt@acme': true },
+      model: 'some-provider-slug',
+    };
+    const { exec } = scriptedExec({
+      jsonList: { exitCode: 0, stdout: '["fmt@acme"]' },
+      settings: { exitCode: 0, stdout: JSON.stringify(settings) },
+      marker: JSON.stringify({ syncedAt: 'x', installed: ['fmt@acme'] }),
+    });
+
+    const report = await runVerifyProbes({ exec, home: '/home/dev', desiredPlugins: ['fmt@acme'] });
+
+    expect(report.managedSettings).toEqual({
+      present: true,
+      valid: true,
+      keys: ['enabledPlugins', 'env', 'model'],
+    });
+    // THE leak test: neither the value nor the file body may appear anywhere in the report
+    const serialized = JSON.stringify(report);
+    expect(serialized).not.toContain(PLANTED_SECRET);
+    expect(serialized).not.toContain('relay.example');
+    expect(serialized).not.toContain('some-provider-slug');
+    expect(report.probes.some((p) => p.output === REDACTED_OUTPUT)).toBe(true);
+    expect(report.marker).toEqual({ present: true, installed: ['fmt@acme'] });
+    expect(report.ok).toBe(true);
+  });
+
+  it('runs read-only probes only, and caps every recorded output', async () => {
+    const { exec, cmds } = scriptedExec({
+      help: { exitCode: 0, stdout: 'x'.repeat(5_000) },
+      jsonList: { exitCode: 0, stdout: '[]' },
+    });
+    const report = await runVerifyProbes({ exec, home: '/home/dev', desiredPlugins: [] });
+
+    expect(cmds).toEqual([
+      ['claude', '--version'],
+      ['claude', 'plugin', '--help'],
+      ['claude', 'plugin', 'list', '--json'],
+      ['sh', '-c', `[ -f '${MANAGED_SETTINGS_PATH}' ] || exit 3\ncat '${MANAGED_SETTINGS_PATH}'`],
+      ['sh', '-c', `cat '${pluginMarkerPath('/home/dev')}' 2>/dev/null || true`],
+    ]);
+    // nothing may install, uninstall, write or remove
+    const joined = cmds.map((c) => c.join(' ')).join('\n');
+    expect(joined).not.toMatch(/install|uninstall|\brm\b|chmod|chown|mkdir|tee|base64 -d/);
+    expect(report.probes.length).toBeLessThanOrEqual(MAX_PROBES);
+    for (const probe of report.probes) expect(probe.output.length).toBeLessThanOrEqual(MAX_PROBE_OUTPUT + 1);
+  });
+
+  it('is not ok when a desired plugin is missing, and never throws on a failing exec', async () => {
+    const missing = await runVerifyProbes({
+      exec: scriptedExec({ jsonList: { exitCode: 0, stdout: '["other@acme"]' } }).exec,
+      home: '/home/dev',
+      desiredPlugins: ['fmt@acme'],
+    });
+    expect(missing.pluginCommand.installed).toEqual(['other@acme']);
+    expect(missing.missingPlugins).toEqual(['fmt@acme']);
+    expect(missing.ok).toBe(false);
+
+    // an unreadable list is "unknown", not "everything is missing"
+    const unknown = await runVerifyProbes({
+      exec: scriptedExec({ textList: { exitCode: 1, stdout: '' } }).exec,
+      home: '/home/dev',
+      desiredPlugins: ['fmt@acme'],
+    });
+    expect(unknown.pluginCommand.listWorks).toBe(false);
+    expect(unknown.missingPlugins).toEqual([]);
+
+    // a dead engine: every probe throws, and the report still comes back
+    const dead = await runVerifyProbes({
+      exec: async () => {
+        throw new Error('exec failed: container is gone');
+      },
+      home: '/home/dev',
+      desiredPlugins: ['fmt@acme'],
+    });
+    expect(dead.cli.available).toBe(false);
+    expect(dead.ok).toBe(false);
+    expect(dead.warnings.join(' ')).toContain('container is gone');
+  });
+
+  it('answers 404 for an unknown profile and 422 for a body without a container', async () => {
+    const cookie = await login();
+    await request(h.app).post('/api/profiles').set('Cookie', cookie).send(sampleInput());
+
+    const unknown = await request(h.app)
+      .post('/api/profiles/nope/verify')
+      .set('Cookie', cookie)
+      .send({ container: 'web' });
+    expect(unknown.status).toBe(404);
+    expect(unknown.body.error.code).toBe('not_found');
+
+    const noBody = await request(h.app).post('/api/profiles/work/verify').set('Cookie', cookie).send({});
+    expect(noBody.status).toBe(422);
+    expect(noBody.body.error.code).toBe('validation_error');
   });
 });

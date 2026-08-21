@@ -395,6 +395,7 @@ describe('/api/hosts', () => {
       name: 'web',
       hostId: 'local-docker',
       agents: null,
+      profileId: null,
       image: { type: 'recipe', recipe: 'node' },
       workspace: { type: 'volume' },
       env: {},

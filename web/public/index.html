@@ -453,6 +453,31 @@
     </div>
   </div>
 
+  <!-- profile verify probe (owner: F1, js/profiles.js, issue #4) -->
+  <div class="modal fade" id="profile-verify-modal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-lg modal-dialog-scrollable">
+      <div class="modal-content">
+        <div class="modal-header"><h5 class="modal-title" id="profile-verify-modal-title">Verify profile</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+        <div class="modal-body">
+          <label class="form-label" for="pf-verify-container">Container to probe</label>
+          <div class="d-flex gap-2 align-items-start">
+            <select class="form-select form-select-sm" id="pf-verify-container" disabled></select>
+            <button type="button" class="btn btn-sm btn-primary text-nowrap" id="btn-profile-verify-run" disabled>
+              <i class="bi bi-play me-1"></i>Run probe</button>
+          </div>
+          <!-- why the picker is empty / which container is the meaningful one -->
+          <div class="form-text" id="profile-verify-note"></div>
+          <!-- report, spinner or error - all built by js/profiles.js -->
+          <div id="profile-verify-result" class="mt-2"></div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- container create/edit (owner: F1) -->
   <div class="modal fade" id="container-modal" tabindex="-1" aria-hidden="true">
     <div class="modal-dialog modal-lg modal-dialog-scrollable">

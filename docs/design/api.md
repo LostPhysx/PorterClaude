@@ -1152,6 +1152,39 @@ spec hash (a rotated key would demand fleet recreates) and in `docker inspect`. 
 
 Unprofiled containers get no managed-settings file at all — behavior identical to v0.3.
 
+### Known caveats of the managed-settings route (verified against the Claude Code docs)
+
+Managed settings sit at the TOP of the settings hierarchy (managed > local > project > user),
+which is what makes a profile authoritative for every session in its container. Two documented
+behaviours affect this feature and are worth knowing before blaming PorterClaude:
+
+* **Security approval.** Delivering settings that carry hooks, MCP servers or sensitive env
+  (`ANTHROPIC_BASE_URL`, auth tokens — i.e. exactly what a provider profile carries) can make
+  Claude Code show a security approval prompt in an interactive session. In `-p`
+  (non-interactive) runs the settings apply for that run only and the approval is not
+  persisted. A profile is therefore not guaranteed to be silent on first use.
+* **Withheld env on server-fetched settings.** For settings fetched from a settings SERVER,
+  API-routing and credential variables (`ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`,
+  `ANTHROPIC_AUTH_TOKEN`, proxy/TLS, `CLAUDE_CONFIG_DIR`) are withheld from the cache until
+  the server confirms the payload (v2.1.198+). PorterClaude writes a LOCAL file rather than
+  serving one, so this should not apply — but it is the reason to verify rather than assume.
+
+`POST /api/profiles/:id/verify` (below) reports what the installed binary actually does.
+
+### Plugin CLI assumptions
+
+`claude plugin install <ref> -y` / `claude plugin uninstall <ref> -y`, refs of the form
+`name@marketplace`, user scope landing in `~/.claude/plugins`, and the settings keys
+`enabledPlugins` (`{"name@marketplace": true}`) and `extraKnownMarketplaces`
+(`{"<name>": {"source": {"source": "github", "repo": "owner/repo"}}}`) are all documented and
+match what the sync emits. Two things are NOT documented and are probed instead of assumed:
+
+* `claude plugin list --json` — undocumented; the probe reports whether it works, and the sync
+  never depends on it.
+* Marketplace refresh — versions before 2.1.232 do not necessarily refresh a marketplace before
+  installing from it, so an install of `name@marketplace` may need the marketplace to be known
+  already (which is what `extraKnownMarketplaces` declares).
+
 ## Containers changes
 
 * `POST/PUT /api/containers` accept `profileId: string | null`; an unknown id is `422`.
@@ -1170,6 +1203,59 @@ therefore share files but enable their own subsets. Uninstalls run only when the
 private to the profile; shared and default sets never uninstall server-side. Sync is
 idempotent (a marker file in the agent volume; fast path = zero execs), offline-tolerant
 (failures become container warnings and retry on the next start).
+
+## Profile verify probe (issue #4)
+
+v0.4 assumes — from the docs, not from the installed binary — that the `claude` CLI in a
+host's tools volume supports `claude plugin install <ref> -y` and honours
+`/etc/claude-code/managed-settings.json` (`env`, `enabledPlugins`, `extraKnownMarketplaces`).
+Plugin sync fails SOFT, so a build that disagrees produces no error, only plugins that are
+mysteriously absent. This endpoint asks the actual binary, in an actual container:
+
+```
+POST /api/profiles/:id/verify   { "container": "<name>" } -> 200 { report }
+```
+
+```json
+{ "profileId": "work", "container": "web", "agentId": "claude",
+  "loginSet": "team", "loginVolume": "pc-auth-claude_team",
+  "checkedAt": "2026-08-21T10:00:00.000Z",
+  "cli": { "available": true, "version": "1.2.3 (Claude Code)" },
+  "pluginCommand": { "available": true, "supportsYesFlag": true, "listWorks": true,
+                     "supportsJsonList": true, "installed": ["fmt@acme"] },
+  "managedSettings": { "present": true, "valid": true,
+                       "keys": ["enabledPlugins", "env", "model"] },
+  "marker": { "present": true, "installed": ["fmt@acme"] },
+  "desiredPlugins": ["fmt@acme"], "missingPlugins": [],
+  "probes": [ { "cmd": "claude --version", "exitCode": 0, "output": "1.2.3 (Claude Code)" } ],
+  "warnings": [], "ok": true }
+```
+
+* `ok` = `cli.available && pluginCommand.available && nothing desired is missing`.
+* `missingPlugins` is only computed when `pluginCommand.listWorks`; an unreadable listing is
+  reported as *unknown* (empty), never as "everything is missing".
+* `marker` is the server's own plugin sync marker in the login-set volume
+  (`~/.porterclaude/agents/claude/.porterclaude-plugins.json`) — what THIS server installed,
+  as opposed to what the CLI reports.
+
+**Guarantees.**
+
+* **READ ONLY.** The probe runs exactly five commands — `claude --version`,
+  `claude plugin --help`, `claude plugin list --json` (falling back to `claude plugin list`),
+  a `[ -f … ] || exit 3; cat` of the managed settings, and a `cat` of the marker. Nothing
+  installs, uninstalls, writes or removes anything, so a verify is safe on a container
+  somebody is working in. Every exec runs as the CONTAINER USER (never uid 0, the settings
+  file is 0600 owned by that user) with a 15 s timeout; a failed or timed-out probe becomes
+  `available: false` plus a `warnings[]` entry, never a 5xx.
+* **NO SECRETS.** `/etc/claude-code/managed-settings.json` holds decrypted API keys. The
+  report carries only `present`, `valid` (it parses as a JSON object) and its TOP-LEVEL KEY
+  NAMES — never a value, never a nested key, never an excerpt. That probe's `output` is
+  replaced by a fixed redaction placeholder before the report is assembled, so no code path
+  can put the file body into the response.
+* `probes[]` is capped (8 entries) and each `output` is trimmed to 600 characters.
+
+Errors: `404` unknown profile or unknown container, `409` the container is not running or
+does not mount the `claude` agent, `422` a missing/invalid body.
 
 ## Config file (v4)
 

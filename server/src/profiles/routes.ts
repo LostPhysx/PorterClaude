@@ -7,8 +7,12 @@ import { asyncHandler } from '../http/async.js';
 import { parseBody, parseParams, parseQuery } from '../http/validate.js';
 import { DEFAULT_LOGIN_SET, agentLoginVolumeFor, loginSetFor } from '../agents/model.js';
 import { ProfileInputSchema } from './model.js';
+import { verifyProfile } from './verify.js';
 
 const IdParams = z.object({ id: z.string().min(1).max(64) });
+
+/** `POST /api/profiles/:id/verify` — which container to run the read-only probes in. */
+const VerifyBodySchema = z.object({ container: z.string().min(1).max(128) });
 
 /**
  * Query flags. NOT `z.coerce.boolean()`: it is truthy-string coercion, so `?force=0` and
@@ -32,6 +36,7 @@ const ForceQuery = z.object({
  * POST   /api/profiles           ProfileInput -> 201 { profile }
  * GET    /api/profiles/:id       -> { profile } | 404
  * PUT    /api/profiles/:id       ProfileInput (omit a secret key to keep it) -> { profile }
+ * POST   /api/profiles/:id/verify { container } -> { report } (read-only CLI probe, #4)
  * DELETE /api/profiles/:id       -> 204 | 409 { containers: [names] } while in use
  *                                  ?force=1 strips profileId from those containers first;
  *                                  &removeVolumes=1 also deletes the implicit volumes.
@@ -68,6 +73,20 @@ export function createProfilesRouter(ctx: AppContext): Router {
       const { id } = parseParams(IdParams, req);
       const input = parseBody(ProfileInputSchema, req);
       res.json({ profile: await ctx.profiles.update(id, input) });
+    }),
+  );
+
+  /**
+   * v0.4 (#4): ask the claude CLI inside a RUNNING container whether it actually supports
+   * what this profile assumes. Strictly read only, and the response never carries a byte of
+   * the managed settings file beyond its top-level key names (profiles/verify.ts).
+   */
+  router.post(
+    '/:id/verify',
+    asyncHandler(async (req, res) => {
+      const { id } = parseParams(IdParams, req);
+      const { container } = parseBody(VerifyBodySchema, req);
+      res.json({ report: await verifyProfile(ctx, id, container) });
     }),
   );
 

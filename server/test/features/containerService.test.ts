@@ -2104,7 +2104,9 @@ describe('ContainerService profile plugin sync (v0.4 #3)', () => {
     });
     await service.restart('web');
 
-    expect(pluginExecs(calls).map((c) => c.cmd)).toEqual([['claude', 'plugin', 'uninstall', 'old', '-y']]);
+    // the FULL ref, not the bare name: that is the form the plugin docs' own example uses,
+    // and it disambiguates two marketplaces shipping the same plugin name
+    expect(pluginExecs(calls).map((c) => c.cmd)).toEqual([['claude', 'plugin', 'uninstall', 'old@acme', '-y']]);
     expect(decodeScriptPayload(markerWrites(calls)[0]!.cmd[2] as string).installed).toEqual(['fmt@acme']);
   });
 

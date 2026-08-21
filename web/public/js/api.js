@@ -299,6 +299,14 @@ export const api = {
     /** ProfileInput. `agents.<id>.envSecrets`: OMIT a key to keep the stored secret, send
      *  null to clear it, send a plaintext string to replace it. */
     update: (id, input) => put(`/profiles/${enc(id)}`, input),
+    /** v0.4 (#4): run the verify probe of this profile INSIDE a running container and
+     *  return the report (CLI version, plugin-command capabilities, managed settings key
+     *  NAMES, desired vs installed plugins, warnings and the raw probe transcripts).
+     *  404 = unknown profile/container, 409 = container not running or the agent is not
+     *  mounted there, 422 = no `container` in the body.
+     *  @param {string} id profile id @param {string} container container name
+     *  @returns {Promise<{report:any}>} */
+    verify: (id, container) => post(`/profiles/${enc(id)}/verify`, { container }),
     /** @param {{force?:boolean, removeVolumes?:boolean}} [opts] force=1 strips the profile
      *  from the containers that still use it (409 without it); removeVolumes=1 additionally
      *  deletes the profile's PRIVATE login volumes (named/default sets are never touched). */

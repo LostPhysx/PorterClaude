@@ -57,12 +57,29 @@ export interface PluginMarker {
 }
 
 /**
- * The plugin NAME the CLI takes for `uninstall`: a ref is `name` or `name@marketplace`,
- * and a name may itself be npm-scoped (`@acme/tools@market`), so the LAST `@` separates.
+ * The plugin NAME without its marketplace: a ref is `name` or `name@marketplace`, and a
+ * name may itself be npm-scoped (`@acme/tools@market`), so the LAST `@` separates.
+ *
+ * NOT what `uninstall` is called with — see `uninstallArgFor`.
  */
 export function pluginNameOf(ref: string): string {
   const at = ref.lastIndexOf('@');
   return at > 0 ? ref.slice(0, at) : ref;
+}
+
+/**
+ * The argument `claude plugin uninstall` is called with.
+ *
+ * The CLI reference spells the parameter `<name>`, but the plugin docs' own example passes
+ * the FULL `plugin-name@marketplace-name` ref, and the marketplace half appears to be
+ * optional rather than rejected. The full ref is therefore the safer call: it is what the
+ * documented example uses, and it disambiguates two marketplaces shipping the same plugin
+ * name — where a bare name could uninstall the wrong one. Verified per host by the
+ * `POST /api/profiles/:id/verify` probe (issue #4), since this is exactly the kind of CLI
+ * detail that drifts between versions.
+ */
+export function uninstallArgFor(ref: string): string {
+  return ref;
 }
 
 /**
@@ -169,7 +186,7 @@ async function syncLocked(opts: SyncProfilePluginsOptions, desired: string[]): P
       opts.log?.debug({ ref, loginSet: opts.loginSet }, 'plugin dropped from a shared login set without uninstalling');
       continue;
     }
-    const failure = await runPluginCommand(opts, ['claude', 'plugin', 'uninstall', pluginNameOf(ref), '-y']);
+    const failure = await runPluginCommand(opts, ['claude', 'plugin', 'uninstall', uninstallArgFor(ref), '-y']);
     if (failure) {
       // still listed, so the next start retries the uninstall
       warnings.push(`removing the plugin '${ref}' failed${failure}`);

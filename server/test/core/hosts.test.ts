@@ -157,6 +157,7 @@ describe('HostManager CRUD', () => {
       name: 'web',
       hostId: 'a',
       agents: null,
+      profileId: null,
       image: { type: 'recipe', recipe: 'node' },
       workspace: { type: 'volume' },
       env: {},

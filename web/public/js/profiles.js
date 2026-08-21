@@ -42,6 +42,8 @@ export const SERVER_OWNED_SETTINGS_KEYS = Object.freeze([
 let profiles = [];
 /** @type {any|null} the profile open in #profile-modal (null = create) */
 let editing = null;
+/** @type {any|null} the profile open in #profile-verify-modal (#4) */
+let verifying = null;
 let initialised = false;
 
 // ---------------------------------------------------------------------------
@@ -190,6 +192,7 @@ function profileCard(profile) {
     `<div class="small text-secondary mt-1">updated ${escapeHtml(fmtDate(profile.updatedAt))}</div>` +
     '<div class="d-flex flex-wrap gap-1 mt-2">' +
     action('data-profile-edit', 'bi-pencil', 'Edit') +
+    action('data-profile-verify', 'bi-clipboard-check', 'Verify') +
     action('data-profile-delete', 'bi-trash', 'Delete', 'outline-danger') +
     '</div></div></div></div>'
   );
@@ -710,11 +713,328 @@ export async function deleteProfile(profile) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// verify probe (#4)
+// ---------------------------------------------------------------------------
+//
+// POST /api/profiles/:id/verify { container } runs the agent CLI INSIDE a running container
+// and answers a report. The point of the feature is the RAW probe transcript at the bottom
+// of the dialog: the CLI drifts, and a human has to be able to read what it actually said.
+// Every value below is arbitrary CLI text, so nothing here reaches the DOM unescaped.
+
+/** A tri-state capability chip: green true, red false, grey "the server did not say". */
+function flagChip(label, value) {
+  const known = typeof value === 'boolean';
+  const variant = !known ? 'text-bg-secondary' : value ? 'text-bg-success' : 'text-bg-danger';
+  const icon = !known ? 'bi-question-lg' : value ? 'bi-check-lg' : 'bi-x-lg';
+  return (
+    `<span class="badge ${variant} pc-agent-chip">` +
+    `<i class="bi ${icon} me-1"></i>${escapeHtml(label)}</span>`
+  );
+}
+
+/** One label/value line of the report header. */
+function reportRow(label, value) {
+  const text = value === undefined || value === null || value === '' ? '—' : String(value);
+  return (
+    '<div class="row g-2 pc-kv-row small">' +
+    `<div class="col-4 text-secondary">${escapeHtml(label)}</div>` +
+    `<div class="col-8 font-monospace text-break">${escapeHtml(text)}</div>` +
+    '</div>'
+  );
+}
+
+/** A chip per string; `highlight` renders them as failures (the missing plugins). */
+function chipsHtml(values, highlight = false) {
+  const list = Array.isArray(values) ? values.filter((v) => v !== undefined && v !== null) : [];
+  if (!list.length) return '<span class="small text-secondary">none</span>';
+  const variant = highlight ? 'text-bg-danger' : 'text-bg-secondary';
+  return list
+    .map((v) => `<span class="badge ${variant} pc-agent-chip">${escapeHtml(String(v))}</span>`)
+    .join('');
+}
+
+/** One titled block of the report. */
+function reportSection(title, body) {
+  return `<div class="mt-3"><div class="fw-semibold small">${escapeHtml(title)}</div>${body}</div>`;
+}
+
+/** The collapsed transcript of every probe the server ran - monospace, whitespace kept. */
+function probesHtml(report) {
+  const probes = Array.isArray(report && report.probes) ? report.probes : [];
+  if (!probes.length) return '';
+  const body = probes
+    .map((probe) => {
+      const p = probe || {};
+      const hasCode = typeof p.exitCode === 'number';
+      const variant = hasCode && p.exitCode === 0 ? 'text-bg-success' : 'text-bg-danger';
+      const code = hasCode ? String(p.exitCode) : '?';
+      const output = p.output === undefined || p.output === null ? '' : String(p.output);
+      return (
+        '<div class="mb-2">' +
+        `<div class="small"><span class="badge ${variant} pc-agent-chip">exit ${escapeHtml(code)}</span>` +
+        `<code>${escapeHtml(String(p.cmd || ''))}</code></div>` +
+        `<pre class="pc-logs small mb-0">${escapeHtml(output)}</pre>` +
+        '</div>'
+      );
+    })
+    .join('');
+  return (
+    '<details class="mt-3"><summary class="small">' +
+    `Raw probe output (${probes.length} command${probes.length === 1 ? '' : 's'})</summary>` +
+    `<div class="mt-2">${body}</div></details>`
+  );
+}
+
+/**
+ * Render one verify report. Every field is treated as possibly missing: a report with
+ * `cli.available:false` is a legitimate FAIL, not a crash.
+ * @param {any} report
+ * @returns {string}
+ */
+export function verifyReportHtml(report) {
+  const r = report || {};
+  const cli = r.cli || {};
+  const plugin = r.pluginCommand || {};
+  const managed = r.managedSettings || {};
+  const marker = r.marker || {};
+  const warnings = Array.isArray(r.warnings) ? r.warnings : [];
+  const missing = Array.isArray(r.missingPlugins) ? r.missingPlugins : [];
+  const ok = r.ok === true;
+
+  const headline =
+    `<div class="alert ${ok ? 'alert-success' : 'alert-danger'} py-2 mb-0">` +
+    `<i class="bi ${ok ? 'bi-check-circle' : 'bi-exclamation-triangle'} me-1"></i>` +
+    `<span class="fw-semibold">${ok ? 'Profile verified' : 'Verification failed'}</span>` +
+    (warnings.length
+      ? ` <span class="small">${warnings.length} warning${warnings.length === 1 ? '' : 's'}</span>`
+      : '') +
+    '</div>';
+
+  const header =
+    '<div class="mt-3">' +
+    reportRow('Profile', r.profileId) +
+    reportRow('Container', r.container) +
+    reportRow('Agent', r.agentId) +
+    reportRow('Login set', r.loginSet) +
+    reportRow('Login volume', r.loginVolume) +
+    reportRow('Checked at', r.checkedAt ? fmtDate(r.checkedAt) : null) +
+    '</div>';
+
+  const cliSection = reportSection(
+    'CLI',
+    '<div class="mt-1">' +
+      flagChip('available', cli.available) +
+      `<span class="small">version <code>${escapeHtml(String(cli.version || 'unknown'))}</code></span>` +
+      '</div>',
+  );
+
+  const pluginSection = reportSection(
+    'claude plugin',
+    '<div class="mt-1">' +
+      flagChip('available', plugin.available) +
+      flagChip('--yes flag', plugin.supportsYesFlag) +
+      flagChip('list works', plugin.listWorks) +
+      flagChip('json list', plugin.supportsJsonList) +
+      '</div>' +
+      '<div class="small text-secondary mt-1">reported by <code>plugin list</code></div>' +
+      `<div>${chipsHtml(plugin.installed)}</div>`,
+  );
+
+  // KEY NAMES ONLY - the server never sends the values and the UI never asks for them.
+  const managedSection = reportSection(
+    'Managed settings',
+    '<div class="mt-1">' +
+      flagChip('present', managed.present) +
+      flagChip('valid JSON', managed.valid) +
+      '</div>' +
+      `<div class="mt-1">${chipsHtml(managed.keys)}</div>` +
+      '<div class="form-text">key names only &mdash; a value is never read back.</div>',
+  );
+
+  const pluginsSection = reportSection(
+    'Plugins',
+    '<div class="small text-secondary mt-1">wanted by the profile</div>' +
+      `<div>${chipsHtml(r.desiredPlugins)}</div>` +
+      '<div class="small text-secondary mt-2">installed in the login set</div>' +
+      `<div>${chipsHtml(marker.installed)}</div>` +
+      (missing.length
+        ? `<div class="small text-danger mt-2">missing</div><div>${chipsHtml(missing, true)}</div>`
+        : '') +
+      `<div class="mt-2">${flagChip('install marker', marker.present)}</div>`,
+  );
+
+  const warningsSection = warnings.length
+    ? reportSection(
+      'Warnings',
+      '<ul class="small mb-0 mt-1">' +
+        warnings.map((w) => `<li>${escapeHtml(String(w))}</li>`).join('') +
+        '</ul>',
+    )
+    : '';
+
+  return (
+    headline + header + cliSection + pluginSection + managedSection + pluginsSection +
+    warningsSection + probesHtml(report)
+  );
+}
+
+/** Paint the result area of the verify dialog. */
+function setVerifyResult(html) {
+  const el = byId('profile-verify-result');
+  if (el) el.innerHTML = html || '';
+}
+
+/**
+ * A failed probe stays INSIDE the dialog (a raw toast dump of a CLI transcript is
+ * unreadable). 404/409/422 get their own sentence; anything else falls back to the envelope
+ * message, exactly like setFormError does for the edit form.
+ * @param {any} err ApiError
+ * @param {string} container
+ */
+function setVerifyError(err, container) {
+  const name = escapeHtml(String(container || ''));
+  const message = escapeHtml((err && err.message) || 'the probe failed');
+  let text;
+  if (err && err.status === 409) {
+    text =
+      `The probe needs a <strong>running</strong> container with the agent mounted: ` +
+      `<code>${name}</code> cannot be probed right now.` +
+      `<div class="small mt-1">${message}</div>`;
+  } else if (err && err.status === 404) {
+    text =
+      `Nothing to probe: the profile or the container <code>${name}</code> is gone.` +
+      `<div class="small mt-1">${message}</div>`;
+  } else if (err && err.status === 422) {
+    text = `The request was rejected.<div class="small mt-1">${message}</div>`;
+  } else {
+    text = `Could not run the probe.<div class="small mt-1">${message}</div>`;
+  }
+  setVerifyResult(`<div class="alert alert-warning py-2 mb-0">${text}</div>`);
+}
+
+/**
+ * Fill the container picker of the verify dialog. The probe only makes sense in a RUNNING
+ * container (the server answers 409 otherwise), so a stopped one is not offered at all -
+ * with a sentence saying so instead of an empty select.
+ *
+ * containers.js already imports THIS module (getProfiles/profileOptionsHtml), so its cache
+ * is unreachable from here without an import cycle: the flat list endpoint is the same data.
+ * @param {any} profile
+ * @returns {Promise<void>}
+ */
+async function loadVerifyContainers(profile) {
+  const select = byId('pf-verify-container');
+  const note = byId('profile-verify-note');
+  const run = byId('btn-profile-verify-run');
+  if (!select) return;
+  select.disabled = true;
+  if (run) run.disabled = true;
+  select.innerHTML = '<option value="">loading…</option>';
+  if (note) note.textContent = '';
+  /** @type {any[]} */
+  let list = [];
+  try {
+    const res = await api.containers.list();
+    list = Array.isArray(res && res.containers) ? res.containers : [];
+  } catch (err) {
+    select.innerHTML = '<option value="">unavailable</option>';
+    if (note) {
+      note.textContent = `Could not list the containers: ${(err && err.message) || 'unknown error'}`;
+    }
+    return;
+  }
+  const running = list.filter((c) => c && c.status === 'running');
+  if (!running.length) {
+    select.innerHTML = '<option value="">no running container</option>';
+    if (note) {
+      note.textContent = list.length
+        ? 'The probe runs the agent CLI inside a container, so one has to be running. Start a container using this profile first.'
+        : 'There is no container yet - create one with this profile and start it.';
+    }
+    return;
+  }
+  // the profile's own containers first: that is what "verify this profile" means
+  const inUse = Array.isArray(profile && profile.inUse) ? profile.inUse.map(String) : [];
+  const byName = (a, b) => String(a.name || '').localeCompare(String(b.name || ''));
+  const mine = running.filter((c) => inUse.includes(String(c.name))).sort(byName);
+  const others = running.filter((c) => !inUse.includes(String(c.name))).sort(byName);
+  select.innerHTML = mine
+    .concat(others)
+    .map((c) => {
+      const name = String(c.name || '');
+      const label = inUse.includes(name) ? `${name} — uses this profile` : name;
+      return `<option value="${escapeHtml(name)}">${escapeHtml(label)}</option>`;
+    })
+    .join('');
+  select.disabled = false;
+  if (run) run.disabled = false;
+  if (note) {
+    note.textContent = mine.length
+      ? ''
+      : 'No running container uses this profile - probing another one still shows what its agent CLI supports.';
+  }
+}
+
+/**
+ * POST /api/profiles/:id/verify -> render the report (or the error) into the dialog.
+ * @returns {Promise<void>}
+ */
+export async function runVerify() {
+  if (!verifying) return;
+  const select = byId('pf-verify-container');
+  const run = byId('btn-profile-verify-run');
+  const container = select ? String(select.value || '') : '';
+  if (!container) {
+    setVerifyResult('<div class="alert alert-warning py-2 mb-0">Pick a running container to probe.</div>');
+    return;
+  }
+  if (run) run.disabled = true;
+  setVerifyResult(
+    '<div class="d-flex align-items-center gap-2 small text-secondary">' +
+      '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span>' +
+      `Probing ${escapeHtml(container)}…</div>`,
+  );
+  try {
+    const res = await api.profiles.verify(verifying.id, container);
+    setVerifyResult(verifyReportHtml(res && res.report ? res.report : null));
+  } catch (err) {
+    setVerifyError(err, container);
+  } finally {
+    if (run) run.disabled = false;
+  }
+}
+
+/**
+ * Show #profile-verify-modal for one profile: container picker, empty result area.
+ * @param {any} profile SanitizedProfile
+ */
+export function openVerifyModal(profile) {
+  const modalEl = byId('profile-verify-modal');
+  if (!profile || !modalEl || typeof bootstrap === 'undefined') return;
+  verifying = profile;
+  const title = byId('profile-verify-modal-title');
+  if (title) title.textContent = `Verify ${profile.name || profile.id}`;
+  setVerifyResult(
+    '<div class="small text-secondary">Pick a running container and run the probe: it reports the ' +
+      'agent CLI version, what <code>claude plugin</code> supports, the managed settings written ' +
+      'into the container and which plugins are actually installed.</div>',
+  );
+  bootstrap.Modal.getOrCreateInstance(modalEl).show();
+  void loadVerifyContainers(profile);
+}
+
 function onProfilesListClick(event) {
   const editBtn = event.target.closest('[data-profile-edit]');
   if (editBtn) {
     const profile = getProfile(editBtn.getAttribute('data-profile-edit'));
     if (profile) openProfileModal(profile);
+    return;
+  }
+  const verifyBtn = event.target.closest('[data-profile-verify]');
+  if (verifyBtn) {
+    const profile = getProfile(verifyBtn.getAttribute('data-profile-verify'));
+    if (profile) openVerifyModal(profile);
     return;
   }
   const deleteBtn = event.target.closest('[data-profile-delete]');
@@ -741,6 +1061,12 @@ const profilesPanel = {
     if (form) form.addEventListener('submit', (e) => { void saveProfile(e); });
     const modalEl = byId('profile-modal');
     if (modalEl) modalEl.addEventListener('hidden.bs.modal', () => { editing = null; });
+    const verifyRun = byId('btn-profile-verify-run');
+    if (verifyRun) verifyRun.addEventListener('click', () => { void runVerify(); });
+    const verifyEl = byId('profile-verify-modal');
+    if (verifyEl) {
+      verifyEl.addEventListener('hidden.bs.modal', () => { verifying = null; setVerifyResult(''); });
+    }
 
     renderProfiles();
   },

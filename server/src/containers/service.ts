@@ -162,6 +162,20 @@ interface HostScope {
   backend: DockerBackend;
 }
 
+/**
+ * A RUNNING container plus everything an exec into it needs (`resolveExecTarget`). The
+ * `general` settings are its host's, so callers can derive `$HOME` and the volume names
+ * without reaching into the HostManager themselves.
+ */
+export interface ContainerExecTarget {
+  containerId: string;
+  config: ContainerConfig;
+  /** what the container REALLY mounts (label/env), null for a v0.1 container that says nothing */
+  containerAgents: string[] | null;
+  backend: DockerBackend;
+  general: GeneralConfig;
+}
+
 /** One host's live state, gathered once per list()/reconcile() call. */
 interface HostScan {
   host: HostConfig;
@@ -847,6 +861,20 @@ export class ContainerService {
       hostId: config.hostId,
       containerAgents: await this.containerAgents(scope, container),
     };
+  }
+
+  /**
+   * v0.4 (#4): `requireRunningContainer` PLUS the host scope, for the callers that have to
+   * exec inside the container themselves (profiles/verify.ts). ContainerFilesService reaches
+   * the same pair through its private `resolve()`; this is that helper made public, because
+   * `deps.hosts` is not reachable from outside the service.
+   *
+   * Same throws as `requireRunningContainer`: notFound / conflict('not running').
+   */
+  async resolveExecTarget(name: string): Promise<ContainerExecTarget> {
+    const { containerId, config, hostId, containerAgents } = await this.requireRunningContainer(name);
+    const scope = this.scope(hostId);
+    return { containerId, config, containerAgents, backend: scope.backend, general: scope.general };
   }
 
   /**

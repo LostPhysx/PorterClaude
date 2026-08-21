@@ -123,6 +123,7 @@ describe('AgentRegistry', () => {
       name: 'web',
       hostId: 'local',
       agents: ['claude', 'mycoder'],
+      profileId: null,
       image: { type: 'recipe', recipe: 'node' },
       workspace: { type: 'volume' },
       env: {},
